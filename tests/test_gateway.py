@@ -55,12 +55,50 @@ def test_single_healthy_profile_serves_request(pool_env):
     assert result.profile_id == "a"
 
 
-def test_no_profiles_returns_503(pool_env):
+def test_no_profiles_returns_503_not_a_rate_limit(pool_env):
+    # An empty CONFIG is not a quota condition: no amount of waiting adds a
+    # Profile. Only a pool emptied by exhaustion/cooldown/draining earns the
+    # 429/rate_limit_error treatment — see
+    # test_quota_blocked_pool_returns_429_rate_limit_error.
     save_pool(Pool(profiles=[]))
     gw = Gateway(transport=lambda req: fake_response(200))
     result = gw.handle("POST", "/v1/messages", {}, b"{}")
     assert result.status == 503
-    assert result.error == "no_eligible_profile"
+    assert result.error == "no_usable_profile"
+
+
+def test_no_eligible_profile_client_payload_is_rate_limit_error_not_overloaded(pool_env):
+    # daemon.py's _proxy_error_payload is what actually decides the JSON
+    # `type` the client sees. no_eligible_profile must map to
+    # rate_limit_error/429 (an empty pool, a local quota condition) while
+    # every other synthesized 503 keeps mapping to overloaded_error — a real
+    # upstream 503/529 passthrough never reaches this function at all (it
+    # has result.error is None and streams the provider's own body back
+    # verbatim), so it is unaffected by construction and isn't re-tested
+    # here.
+    import claude_unlimited.daemon as daemon_module
+
+    empty_pool_result = gateway_module.GatewayResult(status=429, headers={}, body_chunks=None,
+                                                       profile_id=None, error="no_eligible_profile")
+    payload = daemon_module._proxy_error_payload(empty_pool_result)
+    assert payload["error"]["type"] == "rate_limit_error"
+    assert "No eligible Profile" in payload["error"]["message"]
+
+    # rotation_attempts_exhausted is ALSO a quota-shaped outcome (every
+    # attempt rotated away because accounts were unusable), so it must not
+    # be dressed as provider overload either.
+    exhausted = gateway_module.GatewayResult(status=429, headers={}, body_chunks=None,
+                                               profile_id=None, error="rotation_attempts_exhausted")
+    assert daemon_module._proxy_error_payload(exhausted)["error"]["type"] == "rate_limit_error"
+
+    # But a pool with nothing usable for a NON-quota reason keeps the old
+    # mapping: telling the user "rate limited" when the credential is dead
+    # sends them away to wait for something that will never change.
+    unusable = gateway_module.GatewayResult(status=503, headers={}, body_chunks=None,
+                                              profile_id=None, error="no_usable_profile")
+    unusable_payload = daemon_module._proxy_error_payload(unusable)
+    assert unusable_payload["error"]["type"] == "overloaded_error"
+    assert "will not fix itself by waiting" in unusable_payload["error"]["message"]
 
 
 def test_rotates_transparently_on_quota_exhausted_without_client_seeing_it(pool_env):
@@ -198,24 +236,28 @@ def test_disabled_profile_never_selected(pool_env):
     save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=False)]))
     gw = Gateway(transport=lambda req: fake_response(200))
     result = gw.handle("POST", "/v1/messages", {}, b"{}")
-    assert result.status == 503
+    assert result.status == 503  # disabled is not a quota problem
 
 
 def test_non_automatic_profile_not_auto_selected_when_no_current(pool_env):
     save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=False, enabled=True)]))
     gw = Gateway(transport=lambda req: fake_response(200))
     result = gw.handle("POST", "/v1/messages", {}, b"{}")
-    assert result.status == 503
+    assert result.status == 503  # not automatic is not a quota problem
 
 
-def test_all_profiles_exhausted_returns_503_not_infinite_loop(pool_env):
+def test_all_profiles_exhausted_returns_429_not_infinite_loop(pool_env):
+    # Renamed from test_all_profiles_exhausted_returns_503_not_infinite_loop:
+    # the "not infinite loop" guarantee is unchanged, only the status this
+    # no_eligible_profile outcome carries.
     save_pool(Pool(profiles=[
         Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
         Profile(id="b", name="B", kind="oauth", priority=2, automatic=True, enabled=True),
     ]))
     gw = Gateway(transport=lambda req: fake_response(429, {"anthropic-ratelimit-unified-5h-status": "rejected"}))
     result = gw.handle("POST", "/v1/messages", {}, b"{}")
-    assert result.status == 503
+    assert result.status == 429
+    assert result.error == "no_eligible_profile"
 
 
 def test_transport_network_error_rotates_to_next_profile_instead_of_crashing(pool_env):
@@ -245,11 +287,14 @@ def test_transport_network_error_rotates_to_next_profile_instead_of_crashing(poo
     assert len(calls) == 2
 
 
-def test_transport_network_error_on_every_profile_returns_503_not_unhandled_exception(pool_env):
+def test_transport_network_error_on_every_profile_returns_429_not_unhandled_exception(pool_env):
+    # Renamed from ..._returns_503_...: the "not an unhandled exception"
+    # guarantee is unchanged, only the status this no_eligible_profile
+    # outcome carries now.
     save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=True)]))
     gw = Gateway(transport=lambda req: (_ for _ in ()).throw(ConnectionRefusedError("refused")))
     result = gw.handle("POST", "/v1/messages", {}, b"{}")
-    assert result.status == 503
+    assert result.status == 429
     assert result.error == "no_eligible_profile"
 
 
@@ -299,7 +344,10 @@ def test_reauthenticating_a_profile_clears_stuck_auth_invalid_state(pool_env):
     assert gw.runtime_snapshot()["a"].state == gateway_module.ProfileState.AUTH_INVALID
 
     still_stuck = gw.handle("POST", "/v1/messages", {}, b"{}")
-    assert still_stuck.status == 503  # re-attempting with no change does NOT self-heal
+    # AUTH_INVALID is emphatically NOT a rate limit: it needs the user to
+    # re-authenticate, and a 429 would send the client off to wait instead.
+    assert still_stuck.status == 503
+    assert still_stuck.error == "no_usable_profile"
     assert transport.calls == 1  # AUTH_INVALID profiles aren't even retried
 
     class FakeSecretStoreWithSet(FakeSecretStore):
@@ -1439,3 +1487,187 @@ def test_a_preventive_refresh_stays_responsive(pool_env, monkeypatch):
     except gw_mod.oauth_login.OAuthLoginError:
         pass
     assert gw._refresh_check_not_before["a"] - now[0] == Gateway._REFRESH_CHECK_COOLDOWN_SECONDS
+
+
+_TRANSIENT_429 = {"x-should-retry": "true"}  # no ratelimit windows, no retry-after
+
+
+def test_transient_429_fails_over_to_next_profile_without_benching_it(pool_env):
+    """The regression guard for the trade made in observation.classify: a
+    429 that is not about this account's quota must not bench the Profile
+    (that was the 30-minute stall on a healthy account) AND must not
+    swallow every client retry either. It rotates for THIS request while
+    leaving the Profile eligible for the next one."""
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
+        Profile(id="b", name="B", kind="oauth", priority=2, automatic=True, enabled=True),
+    ]))
+    served = []
+
+    def transport(req):
+        # 'a' is priority 1 so it is tried first and answers the transient shape.
+        if "tok-a" in str(req.headers):
+            served.append("a")
+            return fake_response(429, dict(_TRANSIENT_429))
+        served.append("b")
+        return fake_response(200, {"anthropic-ratelimit-unified-5h-utilization": "0.1"})
+
+    gw = Gateway(transport=transport)
+    result = gw.handle("POST", "/v1/messages", {}, b"{}")
+
+    assert result.status == 200, "should have failed over to the healthy profile"
+    assert served == ["a", "b"], f"expected one attempt each, got {served}"
+    assert gw.runtime_snapshot()["a"].state == ProfileState.ELIGIBLE, "must NOT be benched"
+
+
+def test_transient_429_relays_real_response_when_nothing_to_fail_over_to(pool_env):
+    """With no other candidate, rotating would replace Anthropic's real
+    error with our synthesized no_eligible_profile one and tell the user
+    less than the truth. Relay it instead, still without benching."""
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
+    ]))
+    calls = []
+
+    def transport(req):
+        calls.append(1)
+        return fake_response(429, dict(_TRANSIENT_429))
+
+    gw = Gateway(transport=transport)
+    result = gw.handle("POST", "/v1/messages", {}, b"{}")
+
+    assert result.status == 429
+    assert result.error is None, "the real upstream response is relayed, not synthesized"
+    assert len(calls) == 1, "must not loop the upstream"
+    assert gw.runtime_snapshot()["a"].state == ProfileState.ELIGIBLE
+
+
+def test_far_off_deadline_omits_retry_after_rather_than_lying(pool_env):
+    """Retry-After is a promise that the request will succeed after it. A 7d
+    exhaustion clamped to 1800 would send the client back in 30 minutes to
+    an account still dead for six more days, so the header is omitted
+    instead. See _MAX_TRUTHFUL_RETRY_AFTER_SECONDS."""
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
+    ]))
+    far = datetime.now(timezone.utc) + timedelta(days=7)
+
+    def transport(req):
+        return fake_response(429, {"anthropic-ratelimit-unified-5h-status": "rejected",
+                                    "anthropic-ratelimit-unified-5h-reset": str(int(far.timestamp()))})
+
+    gw = Gateway(transport=transport)
+    gw.handle("POST", "/v1/messages", {}, b"{}")       # exhausts the only profile
+    result = gw.handle("POST", "/v1/messages", {}, b"{}")  # now the pool is empty
+
+    assert result.status == 429
+    assert result.error == "no_eligible_profile"
+    assert "retry-after" not in result.headers
+
+
+def test_quota_blocked_pool_returns_429_rate_limit_error(pool_env):
+    """The counterpart to test_no_profiles_returns_503_not_a_rate_limit: when
+    the pool IS empty for a quota reason, 429/rate_limit_error is correct and
+    a truthful Retry-After comes with it."""
+    soon = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+    def transport(req):
+        return fake_response(429, {"anthropic-ratelimit-unified-5h-status": "rejected",
+                                    "anthropic-ratelimit-unified-5h-reset": str(int(soon.timestamp()))})
+
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True)]))
+    gw = Gateway(transport=transport)
+    gw.handle("POST", "/v1/messages", {}, b"{}")           # exhaust it
+    result = gw.handle("POST", "/v1/messages", {}, b"{}")  # pool now quota-empty
+
+    assert result.status == 429
+    assert result.error == "no_eligible_profile"
+    assert 0 < int(result.headers["retry-after"]) <= 1800
+
+
+def test_only_draining_profile_actually_serves_a_request(pool_env):
+    """router.choose has a unit test for the DRAINING fallback; this is the
+    one that proves a real request gets served end-to-end by it, which is the
+    whole point of the change."""
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True,
+                switch_threshold=50.0),
+    ]))
+    gw = Gateway(transport=lambda req: fake_response(
+        200, {"anthropic-ratelimit-unified-5h-utilization": "0.9"}))  # 90% > 50% threshold
+
+    assert gw.handle("POST", "/v1/messages", {}, b"{}").status == 200
+    assert gw.runtime_snapshot()["a"].state == ProfileState.DRAINING
+    assert gw.handle("POST", "/v1/messages", {}, b"{}").status == 200, \
+        "a DRAINING profile must still serve when it is the only one left"
+
+
+def test_transient_429_can_fail_over_onto_a_draining_profile(pool_env):
+    """The two halves of the fix have to compose: the failover target is
+    chosen by the same choose() that knows about the DRAINING fallback."""
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
+        Profile(id="b", name="B", kind="oauth", priority=2, automatic=True, enabled=True,
+                switch_threshold=50.0),
+    ]))
+    served = []
+
+    def transport(req):
+        if "tok-a" in str(req.headers):
+            served.append("a")
+            return fake_response(429, {"x-should-retry": "true"})
+        served.append("b")
+        return fake_response(200, {"anthropic-ratelimit-unified-5h-utilization": "0.9"})
+
+    gw = Gateway(transport=transport)
+    gw.handle("POST", "/v1/messages", {}, b"{}")   # drives b to DRAINING
+    served.clear()
+    gw._current_profile_id = "a"
+    result = gw.handle("POST", "/v1/messages", {}, b"{}")
+
+    assert result.status == 200
+    assert served == ["a", "b"]
+    assert gw.runtime_snapshot()["b"].state == ProfileState.DRAINING
+
+
+def test_pinned_session_never_rotates_on_a_transient_429(pool_env):
+    """Pinning exists precisely so a session is not silently moved to another
+    account. The transient-429 failover must respect that."""
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
+        Profile(id="b", name="B", kind="oauth", priority=2, automatic=True, enabled=True),
+    ]))
+    served = []
+
+    def transport(req):
+        served.append("a" if "tok-a" in str(req.headers) else "b")
+        return fake_response(429, {"x-should-retry": "true"})
+
+    gw = Gateway(transport=transport)
+    result = gw.handle("POST", "/v1/messages", {}, b"{}", forced_profile_id="a")
+
+    assert served == ["a"], f"pinned request must not touch another account, got {served}"
+    assert result.status == 429
+
+
+def test_transient_429_failover_is_capped_at_one_hop(pool_env):
+    """A provider-wide blip must not fan a single request across every
+    account the user owns. One hop, then relay the truth."""
+    save_pool(Pool(profiles=[
+        Profile(id=x, name=x.upper(), kind="oauth", priority=i + 1, automatic=True, enabled=True)
+        for i, x in enumerate(["a", "b", "c"])
+    ]))
+    served = []
+
+    def transport(req):
+        for name in ("a", "b", "c"):
+            if f"tok-{name}" in str(req.headers):
+                served.append(name)
+        return fake_response(429, {"x-should-retry": "true"})
+
+    gw = Gateway(transport=transport)
+    gw._secret_store = FakeSecretStore({"a": "tok-a", "b": "tok-b", "c": "tok-c"})
+    result = gw.handle("POST", "/v1/messages", {}, b"{}")
+
+    assert len(served) <= 2, f"expected at most one failover hop, touched {served}"
+    assert result.status == 429

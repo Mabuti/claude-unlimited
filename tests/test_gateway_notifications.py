@@ -122,7 +122,11 @@ def test_no_eligible_profile_after_previous_fires_needs_attention(pool_env, noti
         Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=False, switch_threshold=98.0),
     ], settings=_all_notifications_settings()))
     result = gw.handle("POST", "/v1/messages", {}, b"{}")
+    # This pool is empty because the only Profile was DISABLED, which is not
+    # a quota condition -- so it keeps the original 503. The needs_attention
+    # notification fires either way, which is what this test is about.
     assert result.status == 503
+    assert result.error == "no_usable_profile"
     assert any("No eligible Profile" in m for _, m in notify_calls)
 
 

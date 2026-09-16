@@ -39,6 +39,46 @@ def test_rotates_away_from_draining_current_profile():
     assert decision.reason == "rotated"
 
 
+def test_draining_is_a_last_resort_not_a_ban():
+    # Regression for the empty-pool bug: a DRAINING Profile (past its
+    # switch_threshold) is the ONLY thing left in the pool. Refusing it
+    # forever, even here, is what turned one exhausted Profile plus one
+    # falsely-cooled-down Profile into a permanently empty pool. DRAINING
+    # must be selectable once nothing ELIGIBLE remains, tagged with a
+    # distinct reason so a caller can tell this apart from a normal
+    # rotation.
+    pool = PoolSnapshot(profiles=[rt("a", state=ProfileState.DRAINING)], current_profile_id=None)
+    decision = choose(pool, NOW)
+    assert decision.profile_id == "a"
+    assert decision.reason == "drained_fallback"
+
+
+def test_draining_still_ignored_when_an_eligible_profile_exists():
+    # The fallback must never outrank a genuinely eligible Profile — it
+    # only fires when the ELIGIBLE list is empty.
+    pool = PoolSnapshot(profiles=[
+        rt("a", priority=1, state=ProfileState.DRAINING),
+        rt("b", priority=2, state=ProfileState.ELIGIBLE),
+    ], current_profile_id=None)
+    decision = choose(pool, NOW)
+    assert decision.profile_id == "b"
+    assert decision.reason == "rotated"
+
+
+def test_no_eligible_profile_when_everything_is_exhausted_or_cooldown():
+    # Neither EXHAUSTED nor COOLDOWN is a DRAINING fallback candidate — an
+    # account that hard-refused (EXHAUSTED) or is on a short-lived
+    # backoff (COOLDOWN) is not "close to a soft threshold", so the
+    # fallback must not reach for it.
+    pool = PoolSnapshot(profiles=[
+        rt("a", state=ProfileState.EXHAUSTED),
+        rt("b", state=ProfileState.COOLDOWN),
+    ], current_profile_id=None)
+    decision = choose(pool, NOW)
+    assert decision.profile_id is None
+    assert decision.reason == "no_eligible_profile"
+
+
 def test_tie_break_by_priority_lower_wins():
     pool = PoolSnapshot(profiles=[rt("a", priority=3), rt("b", priority=1)], current_profile_id=None)
     decision = choose(pool, NOW)

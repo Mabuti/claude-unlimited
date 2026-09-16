@@ -61,6 +61,32 @@ def test_429_without_rejected_status_is_short_rate_limit():
     assert obs.retry_after_seconds == 12.0
 
 
+def test_429_with_healthy_5h_status_and_no_retry_after_is_unknown_not_short_rate_limit():
+    # Regression for the "healthy account gets benched" bug: Anthropic sent
+    # a 429 with NO Retry-After but WITH a 5h-status of "allowed" (measured
+    # at 5% utilization) — a real quota/rate-limit 429 always carries either
+    # a rejected window or a Retry-After to back off for. Getting neither,
+    # with an affirmatively-healthy window present, means this 429 is not
+    # about this Profile's quota at all. Falling through to
+    # ShortRateLimit(None) here is what put a 5%-utilized Team account into
+    # an escalating COOLDOWN (up to 30 minutes) for no reason the headers
+    # support.
+    headers = {"anthropic-ratelimit-unified-5h-status": "allowed"}
+    obs = classify(429, headers, NOW)
+    assert isinstance(obs, Unknown)
+    assert obs.status_code == 429
+
+
+def test_429_with_no_ratelimit_headers_at_all_is_still_short_rate_limit():
+    # The opposite of the case above: headers genuinely absent (no unified
+    # status of any kind, no Retry-After) must keep behaving exactly as
+    # before — ShortRateLimit(None), so the Router's existing escalating
+    # cooldown still applies to a plain, headerless 429.
+    obs = classify(429, {}, NOW)
+    assert isinstance(obs, ShortRateLimit)
+    assert obs.retry_after_seconds is None
+
+
 def test_429_7d_rejected_with_5h_allowed_is_still_quota_exhausted():
     # A Profile can have 5h headroom left while its weekly cap is spent.
     # `status_5h or status_7d` would pick the truthy "allowed" and never look
@@ -119,3 +145,41 @@ def test_malformed_header_values_degrade_to_unknown_not_a_crash():
     headers = {"anthropic-ratelimit-unified-5h-utilization": "not-a-number"}
     obs = classify(200, headers, NOW)
     assert isinstance(obs, Unknown)
+
+
+def test_429_headerless_with_should_retry_hint_is_unknown_not_cooldown():
+    """The shape measured 2026-09-15 against a healthy OAuth account: 429,
+    no unified-ratelimit window at all, no Retry-After, but
+    x-should-retry: true. Must NOT bench the Profile -- the old behaviour
+    escalated this into a 30-minute COOLDOWN and emptied the pool."""
+    obs = classify(429, {"x-should-retry": "true"}, NOW)
+    assert isinstance(obs, Unknown)
+    assert obs.status_code == 429
+
+
+def test_429_rejected_window_beats_should_retry_hint():
+    """A rejected window is authoritative even if the retry hint is set."""
+    obs = classify(429, {"x-should-retry": "true",
+                         "anthropic-ratelimit-unified-5h-status": "rejected",
+                         "anthropic-ratelimit-unified-5h-reset": "1787191800"}, NOW)
+    assert isinstance(obs, QuotaExhausted)
+
+
+def test_429_retry_after_beats_should_retry_hint():
+    """An explicit Retry-After is a real backoff instruction; honour it."""
+    obs = classify(429, {"x-should-retry": "true", "retry-after": "42"}, NOW)
+    assert isinstance(obs, ShortRateLimit)
+    assert obs.retry_after_seconds == 42
+
+
+def test_should_retry_header_survives_the_response_header_filter():
+    """classify() only ever sees headers that proxy.filter_response_headers
+    let through. The fix is inert if x-should-retry is filtered out before
+    it arrives -- which is exactly what happened before it was added to
+    ALLOWED_HEADERS, so this guards the wiring, not just the logic."""
+    from claude_unlimited.proxy import filter_response_headers
+
+    filtered = filter_response_headers({"X-Should-Retry": "true", "x-irrelevant": "drop me"})
+    assert filtered.get("x-should-retry") == "true"
+    assert "x-irrelevant" not in filtered
+    assert isinstance(classify(429, filtered, NOW), Unknown)

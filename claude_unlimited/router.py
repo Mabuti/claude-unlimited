@@ -34,7 +34,7 @@ from .observation import (
 
 class ProfileState(str, Enum):
     ELIGIBLE = "eligible"
-    DRAINING = "draining"  # threshold crossed; finish in-flight, no new requests
+    DRAINING = "draining"  # threshold crossed; deprioritised, but still usable as a last resort (see choose)
     EXHAUSTED = "exhausted"  # explicit hard quota
     COOLDOWN = "cooldown"  # short rate-limit or provider-unavailable, temporary
     AUTH_INVALID = "auth_invalid"  # needs user action
@@ -75,24 +75,59 @@ class PoolSnapshot:
 @dataclass(frozen=True)
 class RoutingDecision:
     profile_id: Optional[str]
-    reason: str  # "sticky" | "rotated" | "no_eligible_profile"
+    reason: str  # "sticky" | "rotated" | "drained_fallback" | "no_eligible_profile"
 
 
-def choose(pool: PoolSnapshot, now: datetime) -> RoutingDecision:
+def choose(pool: PoolSnapshot, now: datetime, exclude: Optional[set] = None) -> RoutingDecision:
+    """exclude: Profiles this caller has already tried for THIS request and
+    must not be handed again. It exists so the Gateway can ask for "the
+    next one after these" without reimplementing the ordering rules --
+    which it previously did, and which drifted from this function the
+    moment stickiness was involved (a sticky current Profile at priority
+    10 vs an untried one at priority 1: the copy returned the wrong one).
+    One ordering, one place."""
+    exclude = exclude or set()
     current = _find(pool, pool.current_profile_id)
-    if current is not None and current.state == ProfileState.ELIGIBLE:
+    if (current is not None and current.state == ProfileState.ELIGIBLE
+            and current.profile_id not in exclude):
         return RoutingDecision(profile_id=current.profile_id, reason="sticky")
 
     candidates = [
         p
         for p in pool.profiles
         if p.state == ProfileState.ELIGIBLE and (p.automatic or p.profile_id == pool.current_profile_id)
+        and p.profile_id not in exclude
     ]
-    if not candidates:
-        return RoutingDecision(profile_id=None, reason="no_eligible_profile")
+    if candidates:
+        candidates.sort(key=lambda p: (p.priority, _reset_sort_key(p)))
+        return RoutingDecision(profile_id=candidates[0].profile_id, reason="rotated")
 
-    candidates.sort(key=lambda p: (p.priority, _reset_sort_key(p)))
-    return RoutingDecision(profile_id=candidates[0].profile_id, reason="rotated")
+    # No ELIGIBLE candidate anywhere in the pool. DRAINING means "past its
+    # switch_threshold, stop routing NEW requests here while something
+    # better exists" -- it was never meant to be a ban. Refusing to ever
+    # fall back onto a DRAINING Profile once it is the ONLY thing left
+    # just empties the pool and answers every request with
+    # no_eligible_profile, even though the DRAINING Profile itself may
+    # still have real headroom: switch_threshold is deliberately
+    # conservative (e.g. 80%) precisely so there is slack left over for
+    # exactly this situation. Same automatic/current filter and the same
+    # priority/reset ordering as the ELIGIBLE branch above -- only the
+    # source state differs -- and a distinct reason so callers/tests can
+    # tell "we had something better" (rotated) apart from "we had nothing
+    # better" (drained_fallback). EXHAUSTED/COOLDOWN/AUTH_INVALID/DISABLED
+    # stay unselectable: those mean the account itself refused or can't be
+    # used, not "getting close to a soft threshold."
+    draining_candidates = [
+        p
+        for p in pool.profiles
+        if p.state == ProfileState.DRAINING and (p.automatic or p.profile_id == pool.current_profile_id)
+        and p.profile_id not in exclude
+    ]
+    if draining_candidates:
+        draining_candidates.sort(key=lambda p: (p.priority, _reset_sort_key(p)))
+        return RoutingDecision(profile_id=draining_candidates[0].profile_id, reason="drained_fallback")
+
+    return RoutingDecision(profile_id=None, reason="no_eligible_profile")
 
 
 def observe(pool: PoolSnapshot, profile_id: str, observation: Observation, now: datetime) -> PoolSnapshot:

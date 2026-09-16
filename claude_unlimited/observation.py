@@ -79,6 +79,14 @@ ALLOWED_HEADERS = (
     "anthropic-ratelimit-unified-reset",
     "anthropic-ratelimit-unified-overage-status",
     "retry-after",
+    # Not a quota field. Anthropic sets x-should-retry: true on a 429 it
+    # considers transient and wants retried, and omits it on one that will
+    # keep failing (a spend cap, a billing gate). classify() needs it to
+    # tell those two apart when NO unified-ratelimit window is present at
+    # all -- see the 429 branch. It rides in the response allowlist too
+    # (proxy.RESPONSE_HEADER_ALLOWLIST is built from this tuple), which is
+    # correct: the client wants that hint as much as we do.
+    "x-should-retry",
 )
 
 
@@ -115,6 +123,50 @@ def classify(status_code: int, headers: dict[str, str], now: datetime) -> Observ
             resets_at = _parse_reset(headers.get("anthropic-ratelimit-unified-7d-reset"))
             return QuotaExhausted(resets_at=resets_at)
         retry_after = _parse_float(headers.get("retry-after"))
+        if retry_after is None and status_5h is None and status_7d is None \
+                and headers.get("x-should-retry", "").strip().lower() == "true":
+            # A 429 with NO unified-ratelimit window at all and no
+            # Retry-After, but an explicit x-should-retry: true.
+            #
+            # What was actually measured on 2026-09-15, stated separately
+            # because they were separate requests: (a) an OAuth account
+            # answered a plain request with 200 and
+            # 5h-utilization: 0.05, so it had quota; (b) a different
+            # request on that same account came back 429 with
+            # x-should-retry: true, zero ratelimit headers and the body
+            # {"type":"rate_limit_error","message":"Error"}; (c) the
+            # escalating cooldown that (b) triggered emptied the pool.
+            # (a) is evidence the account had headroom around that time.
+            # It is NOT proof that (b) was unrelated to quota, and this
+            # branch should not be read as settling that.
+            #
+            # The inference we DO make is narrower: x-should-retry: true
+            # is the server asking for a retry, and a spend cap or a hard
+            # quota does not ask to be retried -- it keeps failing. So
+            # this shape is too weak a signal to bench an account on for
+            # up to 30 minutes. Treating it as Unknown leaves Router state
+            # untouched; the Gateway then moves this request to one other
+            # account if it can, and relays the real response if it
+            # cannot (see handle()). If Anthropic's use of the header ever
+            # changes, the failure mode is a retry that could have been a
+            # bench -- recoverable, unlike the reverse.
+            #
+            # A headerless 429 WITHOUT the hint is unchanged: it still
+            # falls through to ShortRateLimit and its escalating backoff.
+            return Unknown(status_code=429)
+        if retry_after is None and (status_5h is not None or status_7d is not None):
+            # Neither window is "rejected" (handled above), yet at least one
+            # of them is present and says something OTHER than "rejected",
+            # and Anthropic sent no Retry-After. The window header is the
+            # account-scoped quota signal, and here it is present and not
+            # rejecting -- so whatever this 429 is about, the server is not
+            # claiming THIS account is out of quota. Benching it for up to
+            # 30 minutes on that basis is what this branch prevents.
+            # Unknown leaves Router state untouched (see router._apply).
+            # Note this is weaker than the rejected-window check above,
+            # which is authoritative; this one is an inference from an
+            # absence, and is deliberately the last thing tried.
+            return Unknown(status_code=429)
         return ShortRateLimit(retry_after_seconds=retry_after)
 
     if status_code == 529 or status_code == 503:

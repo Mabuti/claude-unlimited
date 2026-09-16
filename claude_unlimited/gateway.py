@@ -37,6 +37,44 @@ from .upstream import UpstreamResponse
 from .upstream import send as real_send
 
 MAX_ROTATION_ATTEMPTS = 4  # bounded — never loop the whole pool forever on a bad run
+# Above this we omit Retry-After rather than send a number we know is wrong.
+_MAX_TRUTHFUL_RETRY_AFTER_SECONDS = 1800
+# A transient 429 may move a request to ONE other account, not walk the pool.
+# Without this, a provider-wide blip fans a single request across every account
+# the user owns, and each client retry starts the walk over.
+_MAX_TRANSIENT_FAILOVERS_PER_REQUEST = 1
+
+
+def _pool_retry_after_seconds(pool: PoolSnapshot, now: datetime) -> Optional[int]:
+    """Best-effort Retry-After for a no_eligible_profile response: the
+    soonest deadline already sitting on the snapshot -- a COOLDOWN
+    Profile's cooldown_until, or a DRAINING/EXHAUSTED Profile's resets_at.
+    Nothing here is a new signal; it is exactly what choose() and
+    recover_expired_cooldowns() already track, read back so a client (or
+    Claude Code's own retry loop) gets a concrete number instead of
+    guessing when to come back. None when no Profile carries a known
+    deadline (e.g. the pool is empty, or everything left is
+    AUTH_INVALID/DISABLED) -- callers must not invent a value in that
+    case."""
+    deadlines = []
+    for p in pool.profiles:
+        if p.state == ProfileState.COOLDOWN and p.cooldown_until is not None:
+            deadlines.append(p.cooldown_until)
+        elif p.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING) and p.resets_at is not None:
+            deadlines.append(p.resets_at)
+    if not deadlines:
+        return None
+    soonest = min(deadlines)
+    seconds = int((soonest - now).total_seconds())
+    # Retry-After means "this request will keep failing until then". It is a
+    # promise, not a hint, so it is either TRUE or absent -- never clamped.
+    # Clamping a 7-day exhaustion to 1800 would tell the client to come back
+    # in half an hour to a Profile that stays exhausted for six more days,
+    # which is a worse answer than saying nothing and letting it use its own
+    # backoff. Above the ceiling we omit the header entirely.
+    if seconds > _MAX_TRUTHFUL_RETRY_AFTER_SECONDS:
+        return None
+    return max(1, seconds)
 
 
 def _client_label(headers: dict) -> str:
@@ -503,6 +541,15 @@ class Gateway:
         now = datetime.now(timezone.utc)
         attempted: set[str] = set()
         previous_profile_id = self._current_profile_id
+        # Set by the transient-429 failover below. Deliberately a FLAG and not
+        # a cached profile id: caching the target meant iteration N picked a
+        # Profile, iteration N+1 reloaded the pool and re-ran choose(), and
+        # then threw that fresh decision away in favour of the stale id --
+        # so a concurrent request that exhausted the target in between sent
+        # this one straight at a dead account. The flag only says "exclude
+        # what I already tried"; choose() decides, against current state.
+        retry_excluding_attempted = False
+        transient_failovers = 0
 
         for _ in range(MAX_ROTATION_ATTEMPTS):
             with self._lock:
@@ -524,6 +571,12 @@ class Gateway:
                     notifications.notify_if_enabled("quota_reset", "Claude Unlimited",
                                                       f"{name} is available again.", pool.settings)
 
+            if retry_excluding_attempted:
+                retry_excluding_attempted = False
+                decision = choose(snapshot, now, exclude=attempted)
+                if decision.profile_id is not None:
+                    decision = RoutingDecision(profile_id=decision.profile_id, reason="transient_failover")
+
             if decision.profile_id is None or decision.profile_id in attempted:
                 if forced_profile_id is not None:
                     activity.record("error", "Pinned Profile unavailable — request rejected",
@@ -538,7 +591,36 @@ class Gateway:
                     notifications.notify_if_enabled("needs_attention", "Claude Unlimited",
                                                       "No eligible Profile is available — a request was rejected.",
                                                       pool.settings)
-                return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
+                # 429, not 503: an empty pool (every account exhausted or
+                # cooling down) is a quota condition local to this daemon,
+                # not the provider being overloaded. Claude Code treats
+                # 503/overloaded_error as transient capacity and silently
+                # retries for minutes before surfacing anything — measured
+                # as a ~12-minute hang ending in "Repeated 529 Overloaded
+                # errors" for what was actually "your quota is gone."
+                # daemon.py maps this status + the no_eligible_profile
+                # marker to {"type": "rate_limit_error"} for the client.
+                # 429/rate_limit_error ONLY when the pool is empty for a
+                # QUOTA reason -- something is exhausted, draining or cooling
+                # down, i.e. "come back later" is the honest answer and a
+                # Retry-After means something. When every Profile is instead
+                # AUTH_INVALID, disabled, or there are none configured at
+                # all, "rate limited" is simply false: the account needs
+                # re-authentication or the user needs to add one, and
+                # nothing improves by waiting. Those keep the original 503
+                # mapping untouched -- deliberately NOT "improved" here,
+                # because that path was never measured and guessing at it is
+                # how this branch got its first bug.
+                quota_blocked = any(
+                    rt.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING, ProfileState.COOLDOWN)
+                    for rt in snapshot.profiles
+                )
+                if not quota_blocked:
+                    return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
+                                          error="no_usable_profile")
+                retry_after_seconds = _pool_retry_after_seconds(snapshot, now)
+                result_headers = {"retry-after": str(retry_after_seconds)} if retry_after_seconds is not None else {}
+                return GatewayResult(status=429, headers=result_headers, body_chunks=None, profile_id=None,
                                       error="no_eligible_profile")
 
             profile = pool.get(decision.profile_id)
@@ -708,6 +790,33 @@ class Gateway:
                     activity.record("rotation", f"{profile.name} hit its quota", meta="rotating to next eligible profile")
                     continue
 
+            if (isinstance(observation, Unknown) and observation.status_code == 429
+                    and forced_profile_id is None
+                    and transient_failovers < _MAX_TRANSIENT_FAILOVERS_PER_REQUEST
+                    and choose(snapshot, now, exclude=attempted).profile_id is not None):
+                # A 429 that classify() judged NOT to be about this
+                # account's quota (see observation.classify) deliberately
+                # leaves Router state alone, so this Profile is never
+                # benched for it. That fixes the 30-minute bench on a
+                # healthy account -- but on its own it would mean a
+                # persistently-degraded Profile swallows every one of the
+                # client's retries and never fails over, which is strictly
+                # worse than the behaviour it replaced. So: do not bench
+                # it, but do move THIS request on to the next untried
+                # Profile. Only headers/status have arrived, no body byte
+                # has reached the caller, so retrying elsewhere is safe --
+                # same reasoning as the QuotaExhausted rotation above.
+                # When nothing else could serve it, fall through instead
+                # and relay Anthropic's real response.
+                retry_excluding_attempted = True
+                transient_failovers += 1
+                with self._lock:
+                    self._mark_profile_idle(profile.id)
+                resp.connection.close()
+                activity.record("rotation", f"{profile.name} returned a transient 429",
+                                 meta="not a quota signal — trying the next profile, not benching this one")
+                continue
+
             if forced_profile_id is None:
                 # A pinned session's requests must never move the shared
                 # rotation pointer or fire a "Rotated" notification — other
@@ -754,7 +863,12 @@ class Gateway:
         activity.record("error", "Rotation attempts exhausted without a usable Profile")
         notifications.notify_if_enabled("needs_attention", "Claude Unlimited",
                                           "Rotation attempts exhausted — no usable Profile was found.", pool.settings)
-        return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
+        # 429, not 503, for the same reason as no_eligible_profile above: you
+        # only get here by every attempt rotating away, which means accounts
+        # were unusable -- not that Anthropic was overloaded. Returning 503
+        # here would hand the client an "API at capacity" it silently retries
+        # for minutes, which is exactly the hang this change removes.
+        return GatewayResult(status=429, headers={}, body_chunks=None, profile_id=None,
                               error="rotation_attempts_exhausted")
 
     def _maybe_check_oauth_credential(self, p: Profile, rt: ProfileRuntime) -> Optional[ProfileState]:

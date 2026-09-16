@@ -261,6 +261,55 @@ def _profile_to_public_dict(p, runtime=None, usage=None, in_use_now=False) -> di
     }
 
 
+def _proxy_error_payload(result) -> dict:
+    """Maps a GatewayResult that has .error set to the client-facing JSON
+    body. Pulled out of _handle_proxy_request so the mapping is testable
+    on its own (see test_gateway.py) without spinning up a real HTTP
+    server.
+
+    no_eligible_profile / rotation_attempts_exhausted get their own branch,
+    deliberately NOT the shared
+    "overloaded_error if status == 503 else api_error" ternary below: an
+    empty pool (every account exhausted or cooling down) is this daemon
+    running out of accounts, not Anthropic being overloaded, and gateway.py
+    now answers it with 429 rather than 503 for exactly that reason. Giving
+    it rate_limit_error here matches that 429 with the correct error
+    `type` for a client that inspects it. Every OTHER synthesized error
+    (forced-profile misconfiguration, unreachable upstream, oversized
+    body, rotation attempts exhausted) keeps the original status-based
+    ternary untouched -- and a genuine upstream 503/529 passthrough never
+    reaches this function at all, since that response has result.error is
+    None and is streamed back verbatim, body and all, by the caller."""
+    if result.error in ("no_eligible_profile", "rotation_attempts_exhausted"):
+        return {
+            "type": "error",
+            "error": {
+                "type": "rate_limit_error",
+                "message": "[claude-unlimited] No eligible Profile is available right now — "
+                           "every configured account is exhausted or cooling down.",
+            },
+        }
+    _FORCED_PROFILE_ERROR_MESSAGES = {
+        "forced_profile_missing": "[claude-unlimited] The Profile this session is pinned to no longer exists.",
+        "forced_profile_disabled": "[claude-unlimited] The Profile this session is pinned to is disabled.",
+        "forced_profile_needs_reauth": "[claude-unlimited] The Profile this session is pinned to needs re-authentication.",
+        "upstream_unreachable": "[claude-unlimited] Could not reach Anthropic for the Profile this session is pinned to.",
+        "no_usable_profile": "[claude-unlimited] No usable Profile — every account is disabled or needs "
+                              "re-authentication. This will not fix itself by waiting.",
+    }
+    message = (
+        "[claude-unlimited] The request body is too large to forward."
+        if result.error == "bad_request"
+        else _FORCED_PROFILE_ERROR_MESSAGES.get(
+            result.error, "[claude-unlimited] No eligible Profile is available right now.")
+    )
+    return {
+        "type": "error",
+        "error": {"type": "overloaded_error" if result.status == 503 else "api_error",
+                  "message": message},
+    }
+
+
 class _DashboardHandler(BaseHTTPRequestHandler):
     server_version = "ClaudeUnlimited/0.1"
 
@@ -271,12 +320,22 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
     # ---- shared request handling ----
 
-    def _send_json(self, status: int, payload) -> None:
+    def _send_json(self, status: int, payload, *, extra_headers: Optional[dict] = None) -> None:
+        # extra_headers exists for the no_eligible_profile 429 (see
+        # _proxy_error_payload / gateway._pool_retry_after_seconds), which
+        # is the one error response with a Retry-After worth telling the
+        # client. Filtered the same way the streaming success path
+        # filters result.headers below: never forward hop-by-hop framing
+        # headers this method already sets itself.
         body = json.dumps(payload).encode()
         self.send_response(status)
         for k, v in _security_headers().items():
             self.send_header(k, v)
         self.send_header("Content-Type", "application/json")
+        for k, v in (extra_headers or {}).items():
+            if k.lower() in ("connection", "transfer-encoding", "content-length", "content-type"):
+                continue
+            self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -997,23 +1056,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         result = _gateway.handle(method, path, inbound_headers, body, forced_profile_id=forced_profile_id)
 
         if result.error is not None:
-            _FORCED_PROFILE_ERROR_MESSAGES = {
-                "forced_profile_missing": "[claude-unlimited] The Profile this session is pinned to no longer exists.",
-                "forced_profile_disabled": "[claude-unlimited] The Profile this session is pinned to is disabled.",
-                "forced_profile_needs_reauth": "[claude-unlimited] The Profile this session is pinned to needs re-authentication.",
-                "upstream_unreachable": "[claude-unlimited] Could not reach Anthropic for the Profile this session is pinned to.",
-            }
-            message = (
-                "[claude-unlimited] The request body is too large to forward."
-                if result.error == "bad_request"
-                else _FORCED_PROFILE_ERROR_MESSAGES.get(
-                    result.error, "[claude-unlimited] No eligible Profile is available right now.")
-            )
-            self._send_json(result.status, {
-                "type": "error",
-                "error": {"type": "overloaded_error" if result.status == 503 else "api_error",
-                          "message": message},
-            })
+            payload = _proxy_error_payload(result)
+            self._send_json(result.status, payload, extra_headers=result.headers)
             return
 
         self.send_response(result.status)
