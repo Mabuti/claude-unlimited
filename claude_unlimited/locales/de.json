@@ -442,5 +442,22 @@
   "settings.parity.add_row": "+ Modell hinzufügen",
   "settings.parity.delete_row": "Dieses Modell entfernen",
   "settings.parity.last_row": "Behalte mindestens ein Modell in der Liste.",
-  "settings.parity.picker_note": "Die Auswahl von Claude Code kann höchstens die vier Standardstufen (Fable, Opus, Sonnet, Haiku) umbenennen; zusätzliche Zeilen werden bereitgestellt und sind per id nutzbar, erscheinen dort aber möglicherweise nicht. Starte deine cu code-Sitzung neu, um die Auswahl zu aktualisieren."
+  "settings.parity.picker_note": "Die Auswahl von Claude Code kann höchstens die vier Standardstufen (Fable, Opus, Sonnet, Haiku) umbenennen; zusätzliche Zeilen werden bereitgestellt und sind per id nutzbar, erscheinen dort aber möglicherweise nicht. Starte deine cu code-Sitzung neu, um die Auswahl zu aktualisieren.",
+  "settings.launchers.title": "Startbefehle",
+  "settings.launchers.sub": "Ausführbare Datei und Argumente, mit denen jede CLI gestartet wird",
+  "settings.launchers.used_by_prefix": "Verwendet von",
+  "settings.launchers.save_failed": "Startbefehl konnte nicht gespeichert werden",
+  "settings.launchers.claude": "Claude Code",
+  "settings.launchers.codex": "Codex",
+  "settings.port.title": "Port",
+  "settings.port.sub": "Der TCP-Port, auf dem dieses Dashboard und der Proxy lauschen",
+  "settings.port.label": "Listen-Port",
+  "settings.port.apply_btn": "Übernehmen",
+  "settings.port.current_prefix": "Lauscht derzeit auf Port",
+  "settings.port.restart_warning": "Übernehmen startet den Daemon neu",
+  "settings.port.no_change": "Bereits auf diesem Port",
+  "settings.port.foreground_saved": "Gespeichert — wird beim nächsten Start des Daemons angewendet",
+  "settings.port.moving_prefix": "Dashboard wird zu Port",
+  "settings.port.give_up_prefix": "Dashboard auf dem neuen Port nicht erreichbar. Manuell öffnen:",
+  "settings.port.manual_link_prefix": "Falls das nicht automatisch geschieht, öffne es manuell:"
 }

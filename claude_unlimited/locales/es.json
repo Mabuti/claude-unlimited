@@ -442,5 +442,22 @@
   "settings.parity.add_row": "+ Añadir modelo",
   "settings.parity.delete_row": "Eliminar este modelo",
   "settings.parity.last_row": "Mantén al menos un modelo en la lista.",
-  "settings.parity.picker_note": "El selector de Claude Code puede reetiquetar como máximo los cuatro niveles estándar (Fable, Opus, Sonnet, Haiku); las filas adicionales se sirven y se pueden usar por id, pero pueden no aparecer allí. Reinicia tu sesión cu code para actualizar el selector."
+  "settings.parity.picker_note": "El selector de Claude Code puede reetiquetar como máximo los cuatro niveles estándar (Fable, Opus, Sonnet, Haiku); las filas adicionales se sirven y se pueden usar por id, pero pueden no aparecer allí. Reinicia tu sesión cu code para actualizar el selector.",
+  "settings.launchers.title": "Comandos de inicio",
+  "settings.launchers.sub": "El ejecutable y los argumentos usados para iniciar cada CLI",
+  "settings.launchers.used_by_prefix": "Usado por",
+  "settings.launchers.save_failed": "No se pudo guardar el comando de inicio",
+  "settings.launchers.claude": "Claude Code",
+  "settings.launchers.codex": "Codex",
+  "settings.port.title": "Puerto",
+  "settings.port.sub": "El puerto TCP en el que escuchan este panel y el proxy",
+  "settings.port.label": "Puerto de escucha",
+  "settings.port.apply_btn": "Aplicar",
+  "settings.port.current_prefix": "Escuchando actualmente en el puerto",
+  "settings.port.restart_warning": "Aplicar reinicia el daemon",
+  "settings.port.no_change": "Ya está en ese puerto",
+  "settings.port.foreground_saved": "Guardado — se aplicará la próxima vez que se inicie el daemon",
+  "settings.port.moving_prefix": "Moviendo el panel al puerto",
+  "settings.port.give_up_prefix": "No se pudo alcanzar el panel en el nuevo puerto. Ábrelo manualmente:",
+  "settings.port.manual_link_prefix": "Si esto no ocurre automáticamente, ábrelo manualmente:"
 }

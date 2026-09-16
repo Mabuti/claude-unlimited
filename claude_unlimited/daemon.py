@@ -26,6 +26,7 @@ import os
 import platform
 import secrets
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -59,7 +60,16 @@ from . import project_usage
 from . import session_tokens
 from . import updater
 from . import usage_history
-from .config import APP_DIR, DEFAULT_SWITCH_THRESHOLD, UPDATE_MODES, ensure_app_dir, load_pool, update_settings
+from . import config
+from .config import (
+    APP_DIR,
+    DEFAULT_SWITCH_THRESHOLD,
+    UPDATE_MODES,
+    ensure_app_dir,
+    load_pool,
+    set_port,
+    update_settings,
+)
 from .gateway import Gateway
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -468,7 +478,19 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
         if path == "/api/settings":
             pool = load_pool()
-            self._send_json(200, {"settings": asdict(pool.settings)})
+            self._send_json(200, {
+                "settings": asdict(pool.settings),
+                # Derived from config.LAUNCHER_KINDS by iteration, read off
+                # the module (not a name bound at import time) so a registry
+                # entry added at runtime shows up with no daemon.py edit
+                # (plan §3.1) — a literal list here would defeat that.
+                "launcher_kinds": [asdict(lk) for lk in config.LAUNCHER_KINDS],
+                # The port this daemon is ACTUALLY listening on right now,
+                # which is not always settings.port: port 0 resolves to an
+                # OS-assigned one (tests), and a just-changed setting only
+                # takes effect on the next start/restart.
+                "running_port": self.server.server_address[1],
+            })
             return
 
         if path == "/api/locales":
@@ -872,6 +894,130 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     daemon_installer.start()  # atomic stop+start via the service manager
                 except daemon_installer.DaemonInstallerError:
                     pass
+
+            threading.Thread(target=_do_restart, daemon=True).start()
+            return
+
+        if path == "/api/settings/port":
+            # Side-effecting on purpose, not a PATCH /api/settings field
+            # (plan §3.5): changing the port can restart the process, and the
+            # sequence below is the whole design — validate, no-op check,
+            # THEN a preflight bind before anything is persisted, so a bad
+            # port can never leave the user locked out.
+            try:
+                body = self._read_json_body()
+                new_port = int(body.get("port"))
+            except (TypeError, ValueError):
+                self._send_json(400, {
+                    "error": "invalid_port",
+                    "message": "port must be an integer between 1024 and 65535.",
+                })
+                return
+            if not (1024 <= new_port <= 65535):
+                self._send_json(400, {
+                    "error": "invalid_port",
+                    "message": "port must be between 1024 and 65535 — anything below 1024 "
+                               "needs privileges this daemon does not run with.",
+                })
+                return
+
+            running_port = self.server.server_address[1]
+            if new_port == running_port:
+                self._send_json(200, {"changed": False, "port": new_port})
+                return
+
+            # Preflight: actually bind the candidate port on a throwaway
+            # socket, deliberately WITHOUT SO_REUSEADDR (a reused-address
+            # bind can succeed against a port something else is actively
+            # holding, which would defeat this entirely), then close it
+            # again. This is the lockout guard the whole endpoint exists
+            # for — failing here means NOTHING below runs, so a bad port
+            # never gets persisted and the daemon never loses its own port
+            # for one it then can't take.
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                probe.bind((LOOPBACK_HOST, new_port))
+            except OSError:
+                self._send_json(409, {
+                    "error": "port_in_use",
+                    "message": f"Port {new_port} is already in use on this machine — "
+                               "nothing was changed.",
+                })
+                return
+            finally:
+                probe.close()
+
+            # Only past the preflight do we touch disk. validated_settings_
+            # changes / update_settings refuse "port" outright (see
+            # config.py), so this goes through the dedicated narrow helper
+            # instead of the generic PATCH path.
+            set_port(new_port)
+
+            # Cheap pre-check only: this is the one thing we can still learn
+            # BEFORE responding. Whether install() itself succeeds cannot be
+            # known yet — see below.
+            service = daemon_installer.status()
+
+            if not service["installed"]:
+                # A foreground daemon can't restart itself — same refusal as
+                # POST /api/process/restart above. The setting is already
+                # saved; say so plainly rather than implying nothing happened.
+                self._send_json(200, {
+                    "changed": True,
+                    "port": new_port,
+                    "service_updated": False,
+                    "restarting": False,
+                    "message": "Port saved. A foreground daemon can't restart itself, so "
+                               "this takes effect the next time it starts.",
+                })
+                return
+
+            # Respond BEFORE regenerating the unit / restarting: on every
+            # platform daemon_installer.install() restarts the service
+            # SYNCHRONOUSLY as its last step (systemd `restart`, launchd
+            # bootout+bootstrap, Task Scheduler start) — so calling it here,
+            # before responding, kills this process's own listener out from
+            # under the in-flight request and the client sees a connection
+            # reset on what would otherwise be the success path. Doing the
+            # restart in the background thread below, after the response is
+            # already on the wire, is the only way the client gets an answer
+            # at all. Same reasoning as the /api/process/restart thread above.
+            #
+            # Because install() now runs after we've already answered, its
+            # success or failure can no longer be reported to this request —
+            # there is no client left listening on the old connection once
+            # the restart happens. A failure is recorded via activity instead
+            # (below), the same way _restart_for_update reports a failed
+            # restart it can no longer respond to.
+            self._send_json(200, {
+                "changed": True,
+                "port": new_port,
+                "service_updated": True,
+                "restarting": True,
+            })
+
+            def _do_restart() -> None:
+                # Snapshot first, same as /api/process/restart: the
+                # replacement process reads this back so usage percentages
+                # and state survive rather than the Dashboard coming back
+                # blank.
+                _gateway._persist()
+                try:
+                    # install() regenerates the unit for new_port AND
+                    # restarts the service — it is the only restart call
+                    # needed here. Do NOT also call daemon_installer.start():
+                    # that would be a second, redundant restart.
+                    daemon_installer.install(new_port)
+                except daemon_installer.DaemonInstallerError as exc:
+                    # The response already promised a restart; nothing can
+                    # un-promise that to a client that's gone. Record it
+                    # rather than swallow it, so a failed restart is at
+                    # least visible in the activity log instead of just
+                    # leaving the daemon quietly still on the old port.
+                    activity.record(
+                        "error", "Port change saved but the service restart failed",
+                        meta=f"still listening on {running_port}, wanted {new_port} ({exc})",
+                    )
 
             threading.Thread(target=_do_restart, daemon=True).start()
             return
@@ -1527,7 +1673,26 @@ def _oauth_refresh_loop() -> None:
 
 
 def run_foreground(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> None:
-    server = make_server(host, port)
+    try:
+        server = make_server(host, port)
+    except OSError:
+        # Startup bind failure recovery (plan §3.6): the preflight in
+        # POST /api/settings/port closes this window for a change made
+        # through the Dashboard, but a hand-edited config.json or a port
+        # freed since then can still land here. Name the exact file and key
+        # to edit rather than silently falling back to another port — a
+        # daemon on an unexpected port is worse than one that is plainly
+        # down. cli.py's own EADDRINUSE handling (for the interactive
+        # `claude-unlimited start` path) prints alongside this, not instead
+        # of it — a systemd/launchd/Task Scheduler restart has no terminal
+        # to show that message on, only this process's own stderr/journal.
+        print(
+            f"\nCouldn't bind {host}:{port}. If this came from settings.port, edit the "
+            f'"port" key in {config.CONFIG_FILE} to a free port, or override it for this '
+            "run with --port.",
+            file=sys.stderr,
+        )
+        raise
     # Offline load (cache, else vendored snapshot) — synchronous but reads
     # one small local file, so startup never waits on the network. No fetch
     # happens here at all: refreshing is driven by `code` session launches

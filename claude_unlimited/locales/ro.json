@@ -442,5 +442,22 @@
   "settings.parity.add_row": "+ Adaugă model",
   "settings.parity.delete_row": "Elimină acest model",
   "settings.parity.last_row": "Păstrează cel puțin un model în listă.",
-  "settings.parity.picker_note": "Selectorul din Claude Code poate reeticheta cel mult cele patru niveluri standard (Fable, Opus, Sonnet, Haiku); rândurile suplimentare sunt servite și utilizabile după id, dar pot să nu apară acolo. Repornește sesiunea cu code pentru a reîmprospăta selectorul."
+  "settings.parity.picker_note": "Selectorul din Claude Code poate reeticheta cel mult cele patru niveluri standard (Fable, Opus, Sonnet, Haiku); rândurile suplimentare sunt servite și utilizabile după id, dar pot să nu apară acolo. Repornește sesiunea cu code pentru a reîmprospăta selectorul.",
+  "settings.launchers.title": "Comenzi de lansare",
+  "settings.launchers.sub": "Executabilul și argumentele folosite pentru a porni fiecare CLI",
+  "settings.launchers.used_by_prefix": "Folosit de",
+  "settings.launchers.save_failed": "Comanda de lansare nu a putut fi salvată",
+  "settings.launchers.claude": "Claude Code",
+  "settings.launchers.codex": "Codex",
+  "settings.port.title": "Port",
+  "settings.port.sub": "Portul TCP pe care ascultă acest panou și proxy-ul",
+  "settings.port.label": "Port de ascultare",
+  "settings.port.apply_btn": "Aplică",
+  "settings.port.current_prefix": "Ascultă în prezent pe portul",
+  "settings.port.restart_warning": "Aplicarea repornește daemonul",
+  "settings.port.no_change": "Deja pe acel port",
+  "settings.port.foreground_saved": "Salvat — se aplică la următoarea pornire a daemonului",
+  "settings.port.moving_prefix": "Se mută panoul pe portul",
+  "settings.port.give_up_prefix": "Panoul nu a putut fi accesat pe noul port. Deschide-l manual:",
+  "settings.port.manual_link_prefix": "Dacă acest lucru nu se întâmplă automat, deschide-l manual:"
 }

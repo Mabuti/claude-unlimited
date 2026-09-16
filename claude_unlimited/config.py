@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import threading
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -43,6 +44,100 @@ def accounts_roots() -> tuple:
 CONFIG_LOCK = threading.Lock()
 
 DEFAULT_SWITCH_THRESHOLD = 98.0
+
+
+def _default_port() -> int:
+    """daemon.py owns DEFAULT_PORT (4317) and already imports this module at
+    its own top level, so importing daemon back at config.py's top level
+    would be circular — daemon.py's `from .config import ...` would run
+    against a config module that hasn't finished defining itself yet.
+    Deferred to call time, this only runs once daemon.py exists to import
+    from, whichever module happened to be imported first."""
+    from .daemon import DEFAULT_PORT
+
+    return DEFAULT_PORT
+
+
+@dataclass(frozen=True)
+class LauncherKind:
+    """One entry in LAUNCHER_KINDS: everything the config layer and the
+    dashboard need to know about a downstream CLI without hardcoding its
+    name anywhere else."""
+
+    kind: str
+    label_key: str  # locales/*.json key for the dashboard's row label
+    default_command: str  # what launch_argv() falls back to when unconfigured
+    used_by: str  # the claude-unlimited command that shells out to it
+
+
+# The single registry of downstream CLIs (plan configurable-launchers-and-
+# port.plan.md §3.1). Adding a future one is one entry here plus one locale
+# key — never a new hardcoded name at a call site.
+LAUNCHER_KINDS = (
+    LauncherKind(kind="claude", label_key="settings.launchers.claude",
+                 default_command="claude", used_by="claude-unlimited code"),
+    LauncherKind(kind="codex", label_key="settings.launchers.codex",
+                 default_command="codex", used_by="claude-unlimited add-codex-account"),
+)
+
+_LAUNCHER_KINDS_BY_NAME = {lk.kind: lk for lk in LAUNCHER_KINDS}
+
+
+def _split_command(text: str) -> list:
+    """Splits a stored launcher command string into argv the way the
+    running platform actually quotes paths (plan §3.2).
+
+    POSIX: shlex.split(text, posix=True) — normal shell quoting.
+    Windows: shlex.split(text, posix=True) mangles a bare backslash in
+    something like `C:\\Users\\x\\claude.cmd`, eating it instead of keeping
+    it literal, so Windows uses posix=False and then strips one matched
+    pair of surrounding quotes from each token by hand, since posix=False
+    leaves them in place. Unbalanced quotes raise ValueError from shlex
+    itself in both modes — validated_settings_changes lets that propagate
+    so an unparseable command never reaches disk."""
+    if os.name == "nt":
+        return [_strip_matched_quotes(tok) for tok in shlex.split(text, posix=False)]
+    return shlex.split(text, posix=True)
+
+
+def _strip_matched_quotes(token: str) -> str:
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
+        return token[1:-1]
+    return token
+
+
+def launch_argv(kind: str) -> list:
+    """The argv to launch `kind` with: the user's configured command, split
+    once, or the registry default when nothing (or only whitespace) is
+    configured. argv[0] is the executable; the rest are extra args the
+    caller decides whether to honor (see cli.code())."""
+    registered = _LAUNCHER_KINDS_BY_NAME.get(kind)
+    default_command = registered.default_command if registered else kind
+    try:
+        text = (load_pool().settings.launchers.get(kind) or "").strip()
+    except Exception:
+        text = ""
+    return _split_command(text or default_command)
+
+
+def resolve_port(explicit: Optional[int]) -> int:
+    """Port precedence (plan §3.4): explicit --port flag > CLAUDE_UNLIMITED_PORT
+    env > settings.port > DEFAULT_PORT. argparse's own `default=` can't tell
+    "flag omitted" from "flag given but happened to equal the default", so
+    every --port subparser passes `default=None` and every reader calls this
+    instead of reading args.port directly."""
+    if explicit is not None:
+        return explicit
+    env = os.environ.get("CLAUDE_UNLIMITED_PORT")
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass  # not a number; fall through to settings/default rather than crash
+    try:
+        return load_pool().settings.port
+    except Exception:
+        return _default_port()
 
 
 @dataclass
@@ -105,6 +200,19 @@ class Settings:
     # — the config file keeps its old shape until the user's next save writes
     # the list, so no on-load rewrite is needed.
     model_parity: object = field(default_factory=dict)
+    # {kind: "command string"} for kinds in LAUNCHER_KINDS, e.g.
+    # {"claude": "claude --dangerously-skip-permissions"}. A kind missing here,
+    # or mapped to "" / whitespace, falls back to that kind's default_command —
+    # see launch_argv(). Free-form per PATCH /api/settings (validated by
+    # _validated_launchers); NOT the port (see port below).
+    launchers: dict = field(default_factory=dict)
+    # The daemon's listen port. Readable via GET /api/settings but NOT
+    # writable via PATCH /api/settings — changing it restarts the process, so
+    # it goes through the dedicated POST /api/settings/port instead (plan
+    # §3.5). validated_settings_changes rejects it explicitly rather than
+    # letting the generic "unknown field" message send someone to the wrong
+    # endpoint.
+    port: int = field(default_factory=_default_port)
 
 
 @dataclass
@@ -169,6 +277,8 @@ def load_pool() -> Pool:
         notify_quota_reset=bool(settings_data.get("notify_quota_reset", False)),
         notify_needs_attention=bool(settings_data.get("notify_needs_attention", True)),
         model_parity=settings_data.get("model_parity") or {},
+        launchers=dict(settings_data.get("launchers") or {}),
+        port=int(settings_data["port"]) if settings_data.get("port") is not None else _default_port(),
     )
 
     return Pool(
@@ -197,8 +307,28 @@ def save_pool(pool: Pool) -> None:
 _SETTINGS_FIELDS = {
     "update_mode", "language", "notifications_enabled", "notify_update_available",
     "notify_approaching_threshold", "notify_rotated", "notify_quota_reset", "notify_needs_attention",
-    "model_parity",
+    "model_parity", "launchers",
+    # "port" is deliberately absent: it is readable but not PATCHable (see
+    # validated_settings_changes and Settings.port above).
 }
+
+
+def _validated_launchers(raw) -> dict:
+    """Validates a `settings.launchers` payload: every key must be a
+    LAUNCHER_KINDS entry and every value must be a string that parses under
+    _split_command, so a bad quote can never reach disk. An empty string is
+    valid — see launch_argv()'s fallback to the registry default."""
+    if not isinstance(raw, dict):
+        raise ValueError("launchers must be an object of {kind: command string}")
+    cleaned: dict = {}
+    for kind, command in raw.items():
+        if kind not in _LAUNCHER_KINDS_BY_NAME:
+            raise ValueError(f"launchers has an unknown CLI kind: {kind!r}")
+        if not isinstance(command, str):
+            raise ValueError(f"launchers[{kind!r}] must be a string")
+        _split_command(command)  # raises ValueError on unbalanced quotes
+        cleaned[kind] = command
+    return cleaned
 
 
 def _validated_model_row_fields(where, row, entry):
@@ -282,6 +412,15 @@ def validated_settings_changes(changes: dict) -> dict:
     """Validates a settings payload. Shared by PATCH /api/settings and by
     bundle import, so an imported bundle cannot set something the API would
     have refused."""
+    if "port" in changes:
+        # Named explicitly, ahead of the generic unknown-field check below,
+        # so the message points at the right endpoint instead of just
+        # saying "port" is unrecognized (plan §3.5: changing the port
+        # restarts the daemon, so it isn't a plain field write).
+        raise ValueError(
+            "port cannot be changed via PATCH /api/settings — it restarts the daemon, so use "
+            "POST /api/settings/port instead."
+        )
     unknown = set(changes) - _SETTINGS_FIELDS
     if unknown:
         raise ValueError(f"Cannot change settings fields: {sorted(unknown)}")
@@ -290,6 +429,8 @@ def validated_settings_changes(changes: dict) -> dict:
         raise ValueError(f"update_mode must be one of {UPDATE_MODES}")
     if "model_parity" in changes:
         changes["model_parity"] = _validated_model_parity(changes["model_parity"])
+    if "launchers" in changes:
+        changes["launchers"] = _validated_launchers(changes["launchers"])
     if "language" in changes:
         from . import i18n
 
@@ -303,5 +444,19 @@ def update_settings(**changes) -> Settings:
     with CONFIG_LOCK:
         pool = load_pool()
         pool.settings = replace(pool.settings, **changes)
+        save_pool(pool)
+        return pool.settings
+
+
+def set_port(port: int) -> Settings:
+    """The one write path for settings.port. update_settings() can't be it —
+    validated_settings_changes rejects "port" outright, on purpose, so a
+    PATCH or a bundle import can never move it (see Settings.port and
+    validated_settings_changes above). POST /api/settings/port is the only
+    caller, and only after its own range check and bind preflight, so no
+    validation is duplicated here."""
+    with CONFIG_LOCK:
+        pool = load_pool()
+        pool.settings = replace(pool.settings, port=port)
         save_pool(pool)
         return pool.settings

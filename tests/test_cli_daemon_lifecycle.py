@@ -136,6 +136,141 @@ def test_code_custom_port_is_forwarded_everywhere(monkeypatch):
     assert cli.os.environ["ANTHROPIC_BASE_URL"] == f"http://{cli.LOOPBACK_HOST}:5000"
 
 
+def test_code_status_line_args_receives_exactly_the_users_args_when_unconfigured(monkeypatch):
+    """No configured launcher (config.launch_argv("claude") == ["claude"]) must
+    produce argv byte-identical to the pre-ticket formula
+    ["claude", *_status_line_args(port, claude_args), *claude_args]: the
+    combined list fed to _status_line_args is exactly claude_args, nothing
+    merged in ahead of it."""
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/claude")
+    monkeypatch.setattr(cli, "launch_argv", lambda kind: ["claude"])
+    monkeypatch.setattr(cli, "_probe_health", lambda host, port, timeout=1.0: True)
+    monkeypatch.setattr(cli, "_fetch_placeholder_token", lambda host, port: "tok-abc")
+    captured_combined = []
+
+    def fake_status_line_args(port, combined):
+        captured_combined.append(list(combined))
+        return ["--settings", '{"fake":true}']
+
+    monkeypatch.setattr(cli, "_status_line_args", fake_status_line_args)
+    exec_calls = []
+    monkeypatch.setattr(cli.os, "execvp", lambda cmd, args: exec_calls.append((cmd, args)))
+
+    assert cli.main(["code", "--model", "opus"]) == 0
+
+    assert captured_combined == [["--model", "opus"]]  # no configured extra args merged in
+    (binary, argv), = exec_calls
+    assert argv == ["claude", "--settings", '{"fake":true}', "--model", "opus"]
+    assert binary == cli._resolve_launcher("claude")
+
+
+def test_code_merges_configured_extra_args_ahead_of_the_users_own(monkeypatch):
+    """A configured launcher's extra args (e.g. --dangerously-skip-permissions)
+    go into `combined` before the user's own, and `combined` — not just the
+    user's args — is what _status_line_args inspects (plan §3.3)."""
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/my-claude")
+    monkeypatch.setattr(cli, "launch_argv", lambda kind: ["my-claude", "--dangerously-skip-permissions"])
+    monkeypatch.setattr(cli, "_probe_health", lambda host, port, timeout=1.0: True)
+    monkeypatch.setattr(cli, "_fetch_placeholder_token", lambda host, port: "tok-abc")
+    captured_combined = []
+
+    def fake_status_line_args(port, combined):
+        captured_combined.append(list(combined))
+        return []  # simulate the configured extra args already containing --settings
+
+    monkeypatch.setattr(cli, "_status_line_args", fake_status_line_args)
+    exec_calls = []
+    monkeypatch.setattr(cli.os, "execvp", lambda cmd, args: exec_calls.append((cmd, args)))
+
+    assert cli.main(["code", "--model", "opus"]) == 0
+
+    assert captured_combined == [["--dangerously-skip-permissions", "--model", "opus"]]
+    (binary, argv), = exec_calls
+    assert argv == ["my-claude", "--dangerously-skip-permissions", "--model", "opus"]
+    assert binary == cli._resolve_launcher("my-claude")
+
+
+def test_code_which_check_uses_the_configured_executable_only(monkeypatch):
+    """The shutil.which existence check must probe the configured executable
+    alone — never a string containing the extra args too (plan §3.3)."""
+    monkeypatch.setattr(cli, "launch_argv", lambda kind: ["my-claude", "--dangerously-skip-permissions"])
+    which_calls = []
+    monkeypatch.setattr(cli.shutil, "which", lambda name: which_calls.append(name) or None)
+
+    assert cli.main(["code"]) == 1
+    assert which_calls == ["my-claude"]
+
+
+def test_add_account_which_check_and_login_use_configured_executable_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "CLAUDE_ACCOUNTS_DIR", tmp_path / "claude-accounts")
+    monkeypatch.setattr(cli, "launch_argv", lambda kind: ["my-claude", "--dangerously-skip-permissions"])
+    which_calls = []
+    monkeypatch.setattr(cli.shutil, "which", lambda name: which_calls.append(name) or "/usr/bin/my-claude")
+    run_calls = []
+
+    def fake_run_tool(argv, **kw):
+        run_calls.append(argv)
+        return cli.subprocess.CompletedProcess(argv, 1)  # bail right after capturing
+
+    monkeypatch.setattr(cli, "_run_tool", fake_run_tool)
+
+    assert cli.add_account() == 1
+    assert which_calls == ["my-claude"]
+    assert run_calls == [["my-claude", "auth", "login"]]  # never the extra --dangerously-skip-permissions
+
+
+def test_add_codex_account_which_check_and_login_use_configured_executable_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "CODEX_ACCOUNTS_DIR", tmp_path / "codex-accounts")
+    monkeypatch.setattr(cli, "launch_argv", lambda kind: ["my-codex", "--some-flag"])
+    which_calls = []
+    monkeypatch.setattr(cli.shutil, "which", lambda name: which_calls.append(name) or "/usr/bin/my-codex")
+    run_calls = []
+
+    def fake_run_tool(argv, **kw):
+        run_calls.append(argv)
+        return cli.subprocess.CompletedProcess(argv, 1)
+
+    monkeypatch.setattr(cli, "_run_tool", fake_run_tool)
+
+    assert cli.add_codex_account() == 1
+    assert which_calls == ["my-codex"]
+    assert run_calls == [["my-codex", "login"]]  # never the extra --some-flag
+
+
+def test_reauth_which_check_and_login_use_configured_executable_only(monkeypatch, tmp_path):
+    from claude_unlimited.config import Pool, Profile
+
+    monkeypatch.setattr(cli, "CLAUDE_ACCOUNTS_DIR", tmp_path / "claude-accounts")
+    monkeypatch.setattr(cli, "launch_argv", lambda kind: ["my-claude", "--dangerously-skip-permissions"])
+    which_calls = []
+    monkeypatch.setattr(cli.shutil, "which", lambda name: which_calls.append(name) or "/usr/bin/my-claude")
+    monkeypatch.setattr(cli, "load_pool", lambda: Pool(profiles=[Profile(id="a", name="A", kind="oauth")]))
+    monkeypatch.setattr(cli, "_fetch_live_profiles", lambda host, port: None)
+    run_calls = []
+
+    def fake_run_tool(argv, **kw):
+        run_calls.append(argv)
+        return cli.subprocess.CompletedProcess(argv, 1)
+
+    monkeypatch.setattr(cli, "_run_tool", fake_run_tool)
+
+    assert cli.reauth(cli.DEFAULT_PORT) == 1
+    assert which_calls == ["my-claude"]
+    assert run_calls == [["my-claude", "auth", "login"]]
+
+
+def test_install_port_precedence_env_var_used_when_no_explicit_flag(monkeypatch):
+    """Confirms install's --port reader goes through resolve_port(): with no
+    --port flag, CLAUDE_UNLIMITED_PORT wins over DEFAULT_PORT (plan §3.4)."""
+    calls = []
+    monkeypatch.setattr(daemon_installer, "install", lambda port: calls.append(port))
+    _serving(monkeypatch, None, __version__)
+    monkeypatch.setenv("CLAUDE_UNLIMITED_PORT", "6001")
+
+    assert cli.main(["install"]) == 0
+    assert calls == [6001]
+
+
 def test_status_not_installed(monkeypatch, capsys):
     monkeypatch.setattr(daemon_installer, "status", lambda: {"installed": False, "running": False, "pid": None})
     assert cli.main(["status"]) == 0

@@ -1,6 +1,14 @@
 import json
 
-from claude_unlimited.config import Pool, Profile, save_pool, load_pool, DEFAULT_SWITCH_THRESHOLD, CONFIG_FILE
+from claude_unlimited.config import (
+    Pool, Profile, Settings, save_pool, load_pool, DEFAULT_SWITCH_THRESHOLD, CONFIG_FILE, _default_port,
+)
+
+
+def test_settings_launchers_and_port_defaults():
+    s = Settings()
+    assert s.launchers == {}
+    assert s.port == _default_port()
 
 
 def test_profile_defaults():
@@ -53,6 +61,32 @@ def test_save_and_load_pool_roundtrip(tmp_path, monkeypatch):
     # reconstruction would silently reset to its default on every load.
     assert loaded.profiles[0] == pool.profiles[0]
     assert loaded.profiles[1] == pool.profiles[1]
+
+
+def test_launchers_and_port_round_trip_through_save_and_load(tmp_path, monkeypatch):
+    monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
+    monkeypatch.setattr("claude_unlimited.config.CONFIG_FILE", tmp_path / "config.json")
+
+    pool = Pool(settings=Settings(launchers={"claude": "claude --dangerously-skip-permissions"}, port=9999))
+    save_pool(pool)
+
+    loaded = load_pool()
+    assert loaded.settings.launchers == {"claude": "claude --dangerously-skip-permissions"}
+    assert loaded.settings.port == 9999
+
+
+def test_config_without_launchers_or_port_keys_loads_with_backward_compatible_defaults(tmp_path, monkeypatch):
+    # Every config.json written before this ticket has no "launchers"/"port"
+    # key under settings at all — load_pool() must not KeyError on it.
+    monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
+    cfg_file = tmp_path / "config.json"
+    monkeypatch.setattr("claude_unlimited.config.CONFIG_FILE", cfg_file)
+    cfg_file.write_text(json.dumps({"profiles": [], "settings": {"update_mode": "manual"}}))
+
+    loaded = load_pool()
+    assert loaded.settings.launchers == {}
+    assert loaded.settings.port == _default_port()
+    assert loaded.settings.update_mode == "manual"
 
 
 def test_save_pool_writes_atomically_no_leftover_tmp_file(tmp_path, monkeypatch):

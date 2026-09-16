@@ -104,7 +104,13 @@ def build_export_bundle(
         payload["profiles"] = exported
 
     if include_settings:
-        payload["settings"] = asdict(pool.settings)
+        # `port` is deliberately withheld. It describes THIS machine's daemon,
+        # not a preference worth carrying: a bundle that moved the port would
+        # silently relocate the dashboard on whatever box imported it, and the
+        # import side has no way to know the new port is free. Changing it is
+        # POST /api/settings/port, which preflights the bind first.
+        payload["settings"] = {k: v for k, v in asdict(pool.settings).items()
+                               if k != "port"}
 
     if include_activity:
         payload["activity"] = [asdict(e) for e in activity_module.list_events(limit=activity_module.MAX_EVENTS)]
@@ -243,7 +249,12 @@ def apply_import(
         # picks which model every codex request runs on, which is what Codex
         # quota is spent on (docs/adr/0007). Importing that unchecked would let
         # a bundle silently change someone's spending.
-        incoming = {k: v for k, v in parsed.settings.items() if k in Settings.__dataclass_fields__}
+        # `port` is dropped rather than rejected: a bundle written by hand, or
+        # by a build that still exported it, must still import cleanly instead
+        # of 400-ing on a key the user never chose to send. See the export side
+        # for why it is not a portable setting.
+        incoming = {k: v for k, v in parsed.settings.items()
+                    if k in Settings.__dataclass_fields__ and k != "port"}
         incoming = validated_settings_changes(incoming)
 
         with CONFIG_LOCK:

@@ -442,5 +442,22 @@
   "settings.parity.add_row": "+ Add model",
   "settings.parity.delete_row": "Remove this model",
   "settings.parity.last_row": "Keep at least one model in the list.",
-  "settings.parity.picker_note": "Claude Code's picker can relabel at most the four standard tiers (Fable, Opus, Sonnet, Haiku); extra rows are served and usable by id, but may not appear there. Restart your cu code session to refresh the picker."
+  "settings.parity.picker_note": "Claude Code's picker can relabel at most the four standard tiers (Fable, Opus, Sonnet, Haiku); extra rows are served and usable by id, but may not appear there. Restart your cu code session to refresh the picker.",
+  "settings.launchers.title": "Launch commands",
+  "settings.launchers.sub": "The executable and arguments used to start each CLI",
+  "settings.launchers.used_by_prefix": "Used by",
+  "settings.launchers.save_failed": "Couldn't save launch command",
+  "settings.launchers.claude": "Claude Code",
+  "settings.launchers.codex": "Codex",
+  "settings.port.title": "Port",
+  "settings.port.sub": "The TCP port this dashboard and proxy listen on",
+  "settings.port.label": "Listen port",
+  "settings.port.apply_btn": "Apply",
+  "settings.port.current_prefix": "Currently listening on port",
+  "settings.port.restart_warning": "Applying restarts the daemon",
+  "settings.port.no_change": "Already on that port",
+  "settings.port.foreground_saved": "Saved — applies the next time the daemon starts",
+  "settings.port.moving_prefix": "Moving the dashboard to port",
+  "settings.port.give_up_prefix": "Couldn't reach the dashboard on the new port. Open it manually:",
+  "settings.port.manual_link_prefix": "If this doesn't happen automatically, open it manually:"
 }

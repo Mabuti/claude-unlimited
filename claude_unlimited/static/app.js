@@ -185,6 +185,7 @@ async function setLanguage(code, { persist } = { persist: true }) {
   _strings = strings;
   applyTranslations();
   renderNotifList();
+  renderLauncherRows();
   const updateModeSelect = document.getElementById('updateModeSelect');
   if (updateModeSelect && updateModeSelect._cuRenderValue) {
     updateModeSelect._cuOptions = UPDATE_MODE_OPTIONS();
@@ -2314,12 +2315,14 @@ function wireUpdateButtons() {
 
 async function loadSettings() {
   try {
-    const { settings } = await api('/api/settings');
+    const { settings, launcher_kinds, running_port } = await api('/api/settings');
     document.getElementById('updateModeSelect').dataset.value = settings.update_mode;
     document.getElementById('updateModeSelect')._cuOptions = UPDATE_MODE_OPTIONS();
     document.getElementById('updateModeSelect')._cuRenderValue();
     setToggleState(document.getElementById('notifMasterToggle'), settings.notifications_enabled);
     renderNotifList(settings);
+    renderLauncherRows(launcher_kinds, settings.launchers);
+    initPortControl(running_port != null ? running_port : settings.port);
     refreshUpdateState();
   } catch (e) {
     // leave defaults if this fails
@@ -2388,6 +2391,155 @@ function renderNotifList(settings) {
       toggle.classList.toggle('off', !next);
     });
   });
+}
+
+// ---- Launch commands (Settings) ----
+//
+// Rows are built by looping over `launcher_kinds` from GET /api/settings —
+// never a hand-written block per CLI kind. Adding a future entry to the
+// server-side registry makes a new row appear here with zero HTML/JS changes.
+
+let _lastLauncherKinds = [];
+let _lastLauncherValues = {};
+
+function renderLauncherRows(launcherKinds, launcherValues) {
+  if (launcherKinds) _lastLauncherKinds = launcherKinds;
+  if (launcherValues) _lastLauncherValues = launcherValues;
+  const el = document.getElementById('launcherRows');
+  if (!el || !_lastLauncherKinds.length) return;
+  el.innerHTML = _lastLauncherKinds.map((kind, i) => `
+    <div class="field-row">
+      <div class="field-text">
+        <div class="field-title">${esc(t(kind.label_key))}</div>
+        <div class="field-help">${esc(t('settings.launchers.used_by_prefix'))} <span class="mono">${esc(kind.used_by)}</span></div>
+      </div>
+      <div style="flex:1;min-width:220px;max-width:380px;">
+        <input class="text-input mono launcher-input" data-kind="${esc(kind.kind)}" placeholder="${esc(kind.default_command)}" value="${esc(_lastLauncherValues[kind.kind] || '')}">
+      </div>
+    </div>
+    ${i < _lastLauncherKinds.length - 1 ? '<div class="divider"></div>' : ''}
+  `).join('');
+  el.querySelectorAll('.launcher-input').forEach((input) => {
+    input.addEventListener('blur', () => saveLauncherCommand(input));
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+    });
+  });
+}
+
+async function saveLauncherCommand(input) {
+  const kind = input.dataset.kind;
+  const next = Object.assign({}, _lastLauncherValues, { [kind]: input.value });
+  try {
+    await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ launchers: next }) });
+    _lastLauncherValues = next;
+    showToast('success', t('toast.settings_saved'), '');
+  } catch (e) {
+    // A 400 (e.g. unbalanced quotes) must surface the server's own message,
+    // not a generic failure — e.message is body.message from api().
+    showToast('error', t('settings.launchers.save_failed'), e.message);
+  }
+}
+
+// ---- Port (Settings) ----
+
+function initPortControl(currentPort) {
+  const input = document.getElementById('portInput');
+  const sub = document.getElementById('portCurrentSub');
+  if (!input || !sub || currentPort == null) return;
+  input.value = currentPort;
+  sub.textContent = `${t('settings.port.current_prefix')} ${currentPort} — ${t('settings.port.restart_warning')}`;
+}
+
+function setPortMessage(text, isError, linkUrl) {
+  const el = document.getElementById('portMessage');
+  if (!el) return;
+  if (!text) {
+    el.style.display = 'none';
+    el.textContent = '';
+    return;
+  }
+  el.style.display = '';
+  el.style.color = isError ? 'var(--bad)' : 'var(--text-dim)';
+  if (linkUrl) {
+    // innerHTML only when a link is supplied, and only ever with a URL WE
+    // built (window.location.hostname plus a port the server already
+    // validated as an integer 1024-65535) — never with anything a user
+    // typed — so esc() here is belt-and-braces, not load-bearing.
+    el.innerHTML = `${esc(text)} <a href="${esc(linkUrl)}">${esc(linkUrl)}</a>`;
+  } else {
+    el.textContent = text;
+  }
+}
+
+// Delay before navigating the tab to the new origin, in milliseconds.
+//
+// A cross-origin health probe was tried here before and cannot work: the
+// dashboard's CSP is `connect-src 'self'`, and a different port is a
+// different origin, so a `fetch()` against the new port's /health is
+// blocked by the browser on every attempt regardless of whether the new
+// daemon has actually come up — this is why the port-change UI always used
+// to report failure even on a successful restart. The same CSP rules out
+// the obvious alternatives too: `img-src 'self'` blocks an <img> probe the
+// same way, and with no `frame-src` directive an <iframe> falls back to
+// `default-src 'self'` and is blocked as well. None of that is a bug to
+// route around — it is a deliberate control on an unauthenticated loopback
+// control plane, and it is not being loosened just to make this redirect
+// smarter. Top-level navigation (window.location) is not covered by
+// connect-src / img-src / frame-src at all, so a plain delayed navigation
+// is the only thing that can actually move the tab.
+//
+// The delay itself is sized off the real restart cost rather than any kind
+// of polling: daemon_installer.install() drives a systemd (or
+// platform-equivalent) restart of this daemon — stop, regenerate the unit
+// for the new port, start — which takes roughly 1-3 seconds end to end.
+// 2500ms sits past the common case without making every port change feel
+// sluggish. If the daemon is unusually slow this time, the browser's own
+// "can't connect" page is what the user lands on — the clickable URL shown
+// below (via setPortMessage's `linkUrl`) is already on screen before that
+// happens, so it isn't a dead end: reload that link once the daemon is up.
+const PORT_MOVE_DELAY_MS = 2500;
+
+async function applyPortSetting() {
+  const input = document.getElementById('portInput');
+  const btn = document.getElementById('portApplyBtn');
+  if (!input || !btn) return;
+  const port = Number(input.value);
+  setPortMessage('', false);
+  btn.classList.add('btn-disabled');
+  try {
+    const result = await api('/api/settings/port', { method: 'POST', body: JSON.stringify({ port }) });
+    if (result.changed === false) {
+      showToast('success', t('settings.port.no_change'), '');
+      btn.classList.remove('btn-disabled');
+      return;
+    }
+    if (result.restarting) {
+      // Long-lived state shown inline (not a toast, which would vanish
+      // before the redirect fires) with the destination URL visible and
+      // clickable the whole time it waits — see PORT_MOVE_DELAY_MS above
+      // for why this is a plain delayed navigation rather than a poll.
+      const hostname = window.location.hostname;
+      const newUrl = `http://${hostname}:${port}${window.location.pathname}${window.location.search}`;
+      setPortMessage(
+        `${t('settings.port.moving_prefix')} ${port}… ${t('settings.port.manual_link_prefix')}`,
+        false,
+        newUrl,
+      );
+      setTimeout(() => { window.location.href = newUrl; }, PORT_MOVE_DELAY_MS);
+      return;
+    }
+    // restarting === false: not installed as a service (foreground daemon) —
+    // persisted, but only takes effect on next start.
+    showToast('success', t('settings.port.foreground_saved'), '');
+    initPortControl(port);
+    btn.classList.remove('btn-disabled');
+  } catch (e) {
+    // 400 invalid_port / 409 port_in_use: surface the server's message
+    // inline, keep the typed value so it can be corrected, no success toast.
+    setPortMessage(e.message, true);
+    btn.classList.remove('btn-disabled');
+  }
 }
 
 async function toggleNotificationsMaster() {
@@ -3095,6 +3247,7 @@ document.getElementById('autostartToggle').addEventListener('click', toggleAutos
 document.getElementById('regenTokenBtn').addEventListener('click', regeneratePlaceholderToken);
 document.getElementById('killProcessBtn').addEventListener('click', killProcess);
 document.getElementById('restartProcessBtn').addEventListener('click', restartProcess);
+document.getElementById('portApplyBtn').addEventListener('click', applyPortSetting);
 document.getElementById('testNotificationBtn').addEventListener('click', sendTestNotification);
 
 // Overview: theme, chart-type, refresh

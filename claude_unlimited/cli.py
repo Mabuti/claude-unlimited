@@ -35,7 +35,7 @@ from . import daemon_installer
 from . import i18n
 from . import updater
 from . import profiles as profile_repo
-from .config import CLAUDE_ACCOUNTS_DIR, CODEX_ACCOUNTS_DIR, ensure_app_dir, load_pool
+from .config import CLAUDE_ACCOUNTS_DIR, CODEX_ACCOUNTS_DIR, ensure_app_dir, load_pool, launch_argv, resolve_port
 from .daemon import DEFAULT_PORT, LOOPBACK_HOST, run_foreground
 
 # The escalation ladder for stopping a process. SIGKILL is Unix-only — even
@@ -1339,7 +1339,12 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -
         updater.ensure_cli_aliases()
     except Exception:
         pass
-    if not shutil.which("claude"):
+    # The which-check must look for the CONFIGURED executable, not a
+    # hardcoded "claude" — otherwise this check can pass while the launch
+    # below fails (plan §3.3). Extra configured args never apply here; only
+    # the executable does.
+    claude_exe = launch_argv("claude")[0]
+    if not shutil.which(claude_exe):
         print("Claude Code CLI (`claude`) not found on PATH. Install/update Claude Code first.", file=sys.stderr)
         return 1
 
@@ -1408,7 +1413,17 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -
     # stdout's buffer (whenever stdout isn't a TTY) would vanish.
     sys.stdout.flush()
     sys.stderr.flush()
-    argv = ["claude", *_status_line_args(port, claude_args), *claude_args]
+    # base[0] is the configured executable (or "claude" if unconfigured);
+    # base[1:] are the user's configured extra args, e.g.
+    # "--dangerously-skip-permissions". `combined` — not claude_args alone —
+    # is what _status_line_args inspects, so a configured --settings
+    # suppresses the status-line injection exactly as a typed one does (plan
+    # §3.3). With nothing configured, base == ["claude"] and this is
+    # byte-identical to the old `argv = ["claude", *_status_line_args(...), *claude_args]`.
+    base = launch_argv("claude")
+    exe, extra = base[0], base[1:]
+    combined = [*extra, *claude_args]
+    argv = [exe, *_status_line_args(port, combined), *combined]
     if os.name == "nt":
         # Windows has no real exec: os.execvp spawns a child and exits the
         # parent, so the shell regains the console while claude's TUI is still
@@ -1417,7 +1432,7 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -
         return _run_tool(argv).returncode
     # POSIX: replace this process image outright — the TUI takes over the
     # terminal and there is no lingering parent. Never returns on success.
-    os.execvp(_resolve_launcher("claude"), argv)
+    os.execvp(_resolve_launcher(exe), argv)
     return 0  # unreachable: execvp replaces this process on success
 
 
@@ -1514,7 +1529,8 @@ def add_account() -> int:
     terminal."""
     _banner()
 
-    if not shutil.which("claude"):
+    claude_exe = launch_argv("claude")[0]
+    if not shutil.which(claude_exe):
         print("`claude` was not found on PATH — this command drives the real Claude Code CLI directly.",
               file=sys.stderr)
         return 1
@@ -1526,8 +1542,11 @@ def add_account() -> int:
     print("Claude Code session, so it will NOT log out or affect any other account already signed")
     print("into `claude` on this machine.\n")
 
+    # The configured EXECUTABLE only — never any configured extra args.
+    # `auth login` is a login subcommand; a user's --model or
+    # --dangerously-skip-permissions is meaningless-to-harmful here (plan §3.3).
     login_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_dir)}
-    login_proc = _run_tool(["claude", "auth", "login"], env=login_env)
+    login_proc = _run_tool([claude_exe, "auth", "login"], env=login_env)
     if login_proc.returncode != 0:
         print("\n`claude auth login` did not complete successfully.", file=sys.stderr)
         return 1
@@ -1581,7 +1600,8 @@ def add_codex_account() -> int:
     secret_store via openai_credential.py, rather than leaving the
     credential in the plaintext file `codex login` writes."""
     _banner()
-    if not shutil.which("codex"):
+    codex_exe = launch_argv("codex")[0]
+    if not shutil.which(codex_exe):
         print("Codex CLI (`codex`) was not found on PATH — this command drives it directly for the "
               "one-time login step. Install it first: https://github.com/openai/codex", file=sys.stderr)
         return 1
@@ -1597,8 +1617,9 @@ def add_codex_account() -> int:
     # Linux `codex login` needs DISPLAY/WAYLAND_DISPLAY/DBUS to open a browser,
     # and Windows needs USERPROFILE/APPDATA/SystemRoot for TLS. CODEX_HOME is
     # what isolates the login; nothing else needs stripping.
+    # The configured EXECUTABLE only — never any configured extra args (plan §3.3).
     login_env = {**os.environ, "CODEX_HOME": str(config_dir)}
-    login_proc = _run_tool(["codex", "login"], env=login_env)
+    login_proc = _run_tool([codex_exe, "login"], env=login_env)
     if login_proc.returncode != 0:
         print("\n`codex login` did not complete successfully.", file=sys.stderr)
         return 1
@@ -1687,7 +1708,8 @@ def reauth(port: int) -> int:
     freshly-logged-in account back to this Profile by account_uuid and
     refuses to overwrite it if a different account was used by mistake."""
     _banner()
-    if not shutil.which("claude"):
+    claude_exe = launch_argv("claude")[0]
+    if not shutil.which(claude_exe):
         print("`claude` was not found on PATH — this command drives the real Claude Code CLI directly.",
               file=sys.stderr)
         return 1
@@ -1749,8 +1771,9 @@ def reauth(port: int) -> int:
     print("Claude Code session, so it will NOT log out or affect any other account already signed")
     print("into `claude` on this machine.\n")
 
+    # The configured EXECUTABLE only — never any configured extra args (plan §3.3).
     login_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_dir)}
-    login_proc = _run_tool(["claude", "auth", "login"], env=login_env)
+    login_proc = _run_tool([claude_exe, "auth", "login"], env=login_env)
     if login_proc.returncode != 0:
         print("\n`claude auth login` did not complete successfully.", file=sys.stderr)
         return 1
@@ -1793,8 +1816,14 @@ def main(argv=None) -> int:
         epilog="Also available as `cu` — every command works under both names "
                "(e.g. `cu code`, `cu status`, `cu doctor`).")
     sub = parser.add_subparsers(dest="cmd")
+    # Every --port below defaults to None, not DEFAULT_PORT: argparse's own
+    # default can't tell "flag omitted" from "flag given but happened to
+    # equal the default", so main() resolves the real value below through
+    # config.resolve_port(), which is what applies the
+    # explicit-flag > CLAUDE_UNLIMITED_PORT env > settings.port > DEFAULT_PORT
+    # precedence (plan §3.4).
     start_p = sub.add_parser("start", help="run the daemon in the foreground")
-    start_p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    start_p.add_argument("--port", type=int, default=None)
     sub.add_parser("status", help="check whether the daemon is running")
     sub.add_parser("doctor", help="verify installation and configuration")
     sub.add_parser("add-account", aliases=["ac"],
@@ -1805,14 +1834,14 @@ def main(argv=None) -> int:
                          "session and add it as a codex-kind Profile")
     reauth_p = sub.add_parser("reauth", help="re-authenticate an OAuth Profile that needs it "
                                               "(defaults to whichever ones the daemon reports as needing it)")
-    reauth_p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    reauth_p.add_argument("--port", type=int, default=None)
     desktop_p = sub.add_parser("desktop", help="configure the Claude desktop app to use the pool, then launch it")
-    desktop_p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    desktop_p.add_argument("--port", type=int, default=None)
     desktop_p.add_argument("--revert", action="store_true",
                             help="restore the desktop app's previous configuration and exit")
 
     code_p = sub.add_parser("code", help="start the daemon if needed, then launch `claude` routed through it")
-    code_p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    code_p.add_argument("--port", type=int, default=None)
     code_p.add_argument("--profile", metavar="NAME_OR_ID", default=None,
                          help="pin this session to one Profile by name or id, skipping the interactive picker")
     # Deliberately no positional for claude's own args: nargs=REMAINDER
@@ -1821,22 +1850,22 @@ def main(argv=None) -> int:
     # against code_p's options first). parse_known_args() below is what
     # lets unrecognized arguments fall through to `claude` untouched.
     install_p = sub.add_parser("install", help="register the daemon to start automatically on login")
-    install_p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    install_p.add_argument("--port", type=int, default=None)
     sub.add_parser("uninstall", help="stop the daemon from starting automatically on login")
     sub.add_parser("service-start", help="start the installed background daemon now")
     sub.add_parser("service-stop", help="stop the installed background daemon")
     restart_p = sub.add_parser("restart", help="stop and start the daemon, service-managed or not")
-    restart_p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    restart_p.add_argument("--port", type=int, default=None)
     purge_parser = sub.add_parser(
         "purge",
         help="remove Claude Unlimited and everything it created, including stored credentials")
     purge_parser.add_argument("--yes", action="store_true",
                                help="skip the confirmation prompt")
-    purge_parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    purge_parser.add_argument("--port", type=int, default=None)
 
     args, unknown = parser.parse_known_args(argv)
     if args.cmd == "start":
-        return start(args.port)
+        return start(resolve_port(args.port))
     if args.cmd == "status":
         return status()
     if args.cmd == "doctor":
@@ -1846,13 +1875,13 @@ def main(argv=None) -> int:
     if args.cmd in ("add-codex-account", "aca"):
         return add_codex_account()
     if args.cmd == "reauth":
-        return reauth(args.port)
+        return reauth(resolve_port(args.port))
     if args.cmd == "code":
-        return code(args.port, unknown, profile_arg=args.profile)
+        return code(resolve_port(args.port), unknown, profile_arg=args.profile)
     if args.cmd == "desktop":
-        return desktop_revert() if args.revert else desktop(args.port)
+        return desktop_revert() if args.revert else desktop(resolve_port(args.port))
     if args.cmd == "install":
-        return install(args.port)
+        return install(resolve_port(args.port))
     if args.cmd == "uninstall":
         return uninstall()
     if args.cmd == "service-start":
@@ -1860,9 +1889,9 @@ def main(argv=None) -> int:
     if args.cmd == "service-stop":
         return service_stop()
     if args.cmd == "restart":
-        return restart(args.port)
+        return restart(resolve_port(args.port))
     if args.cmd == "purge":
-        return purge(args.port, assume_yes=args.yes)
+        return purge(resolve_port(args.port), assume_yes=args.yes)
 
     parser.print_help()
     return 0

@@ -1161,6 +1161,14 @@
       </div>
     </div>
 
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="settings.launchers.title">Launch commands</div>
+        <div class="section-sub" data-i18n="settings.launchers.sub">The executable and arguments used to start each CLI</div>
+      </div>
+      <div class="section-body" id="launcherRows"></div>
+    </div>
+
     <div class="section" id="modelParitySection" style="display:none">
       <div class="section-head with-actions">
         <div class="section-title" data-i18n="settings.parity.title">Models parity</div>
@@ -1257,6 +1265,26 @@
 
     <div class="section">
       <div class="section-head">
+        <div class="section-title" data-i18n="settings.port.title">Port</div>
+        <div class="section-sub" data-i18n="settings.port.sub">The TCP port this dashboard and proxy listen on</div>
+      </div>
+      <div class="section-body">
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.port.label">Listen port</div>
+            <div class="field-sub" id="portCurrentSub"></div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input class="text-input mono" id="portInput" type="number" min="1024" max="65535" step="1" style="max-width:120px;text-align:right;">
+            <div class="btn primary" id="portApplyBtn" data-i18n="settings.port.apply_btn">Apply</div>
+          </div>
+        </div>
+        <div class="field-sub" id="portMessage" style="display:none;"></div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
         <div class="section-title" data-i18n="settings.network.title">Network</div>
         <div class="section-sub" data-i18n="settings.network.sub">Manual one-time setup — never edited automatically</div>
       </div>
@@ -1280,7 +1308,7 @@
             <div class="field-sub" data-i18n="settings.network.shell_sub">Add to your shell profile so any terminal's <span class="mono">claude</span> routes through the daemon</div>
           </div>
           <div class="code-row">
-            <code id="shellLine" class="mono">export ANTHROPIC_BASE_URL="http://127.0.0.1:4317"</code>
+            <code id="shellLine" class="mono">export ANTHROPIC_BASE_URL="http://…"</code>
             <div class="copy-btn" data-copy-target="shellLine">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-i18n="settings.network.copy">Copy</span>
