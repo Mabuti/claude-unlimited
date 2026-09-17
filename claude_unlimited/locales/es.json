@@ -299,7 +299,7 @@
   "help.cmd.code": "Inicia el daemon si aún no está en ejecución, luego lanza claude enrutado a través de tu grupo. Con más de un perfil habilitado, te pregunta cuál usar en esta sesión (o Cuentas rotativas para el comportamiento automático por defecto) — usa --profile <nombre> para omitir la pregunta, o ejecútalo de forma no interactiva para el mismo comportamiento por defecto. Cualquier otro argumento adicional pasa directamente a claude. También repara el acceso directo cu si una actualización lo dejó sin crear. El ejecutable que lanza es el que tenga configurado Ajustes → Comandos de inicio para Claude Code.",
   "help.cmd.status": "Indica si el daemon está instalado como servicio en segundo plano y en ejecución, y su pid.",
   "help.service.title": "Servicio en segundo plano",
-  "help.service.sub": "Inicio automático del daemon al iniciar sesión — lo mismo que controla Configuración → Daemon",
+  "help.service.sub": "Inicio automático del daemon al iniciar sesión — lo mismo que controla Ajustes → Daemon",
   "help.cmd.install": "Registra el daemon para que se inicie automáticamente al iniciar sesión (launchd en macOS, systemd --user en Linux, Programador de tareas en Windows) y lo inicia ahora.",
   "help.cmd.uninstall": "Detiene el inicio automático del daemon al iniciar sesión.",
   "help.cmd.service_start": "Inicia ahora mismo el daemon en segundo plano ya instalado.",
