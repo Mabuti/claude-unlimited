@@ -123,6 +123,11 @@ catch people out:
 - **Account management lives in the dashboard**, not in new CLI flags.
 - **Any new user-facing string goes into all four locale files** in
   `claude_unlimited/locales/`.
+- **A user-facing command, flag or Settings control ships with its Help
+  entry.** The dashboard's Help view documents every subcommand and every
+  settings surface, in all four locales;
+  `tests/test_help_view_covers_the_cli.py` fails when it falls behind.
+  Internal changes — a routing fix, a refactor — need nothing.
 - **Commit messages follow Conventional Commits** — release notes are
   generated from them.
 - **Never commit credentials, tokens, or personal data**, including in tests,
