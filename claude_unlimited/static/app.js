@@ -569,6 +569,8 @@ async function loadStatus() {
     if (uptimeChip) uptimeChip.textContent = 'up ' + formatDuration(s.uptime_seconds);
     const hostChip = document.getElementById('hostChip');
     if (hostChip) hostChip.textContent = window.location.host || 'claude.unlimited:4317';
+    const helpDesktopUrl = document.getElementById('help_desktop_url');
+    if (helpDesktopUrl) helpDesktopUrl.textContent = window.location.origin || 'http://127.0.0.1:4317';
   } catch (e) {
     _lastStatus = null;
   }

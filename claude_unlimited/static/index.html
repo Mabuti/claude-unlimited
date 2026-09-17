@@ -1444,7 +1444,7 @@
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.doctor">Checks your install, Keychain access, and configuration — run this first, and any time something seems off.</div>
+          <div class="field-sub" data-i18n="help.cmd.doctor">Checks your install, Keychain access, and configuration — run this first, and any time something seems off. It also repairs the cu shortcut if an update left it missing.</div>
         </div>
         <div class="divider"></div>
         <div class="cmd-row">
@@ -1468,7 +1468,7 @@
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.add_codex_account">Opens your browser, logs into a ChatGPT/Codex account through an isolated session, and adds it as a Profile routed through GPT models — mirrors add-account exactly. Never affects any account already signed into `codex` on this machine, so it's safe to run again for each additional account.</div>
+          <div class="field-sub" data-i18n="help.cmd.add_codex_account">Opens your browser, logs into a ChatGPT/Codex account through an isolated session, and adds it as a Profile routed through GPT models — mirrors add-account exactly. Never affects any account already signed into `codex` on this machine, so it's safe to run again for each additional account. The executable it launches is whatever Settings → Launch commands has for Codex.</div>
         </div>
         <div class="divider"></div>
         <div class="cmd-row">
@@ -1491,7 +1491,7 @@
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.start">Runs the daemon in this terminal (Ctrl-C to stop) — good for a first look before installing it as a background service. Default port 4317.</div>
+          <div class="field-sub" data-i18n="help.cmd.start">Runs the daemon in this terminal (Ctrl-C to stop) — good for a first look before installing it as a background service. Without --port it uses CLAUDE_UNLIMITED_PORT if set, then the port saved in Settings, then 4317. code, reauth, restart, install, desktop and purge take --port too, for pointing at a daemon that isn't on the usual one.</div>
         </div>
       </div>
     </div>
@@ -1510,7 +1510,7 @@
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.code">Starts the daemon if it isn't already running, then launches claude routed through your pool. Any extra arguments pass straight through to claude.</div>
+          <div class="field-sub" data-i18n="help.cmd.code">Starts the daemon if it isn't already running, then launches claude routed through your pool. With more than one enabled Profile, prompts you to pick one for this session (or Rotated accounts for the default automatic behavior) — pass --profile &lt;name&gt; to skip the prompt, or run non-interactively for the same default. Any other extra arguments pass straight through to claude. It also repairs the cu shortcut if an update left it missing. The executable it launches is whatever Settings → Launch commands has for Claude Code.</div>
         </div>
         <div class="divider"></div>
         <div class="cmd-row">
@@ -1602,12 +1602,13 @@
         <div class="cmd-row">
           <div class="code-row">
             <code id="cmd-purge">cu purge</code>
+            <span class="cmd-optional">[--yes]</span>
             <div class="copy-btn" data-copy-target="cmd-purge">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.purge">Removes Claude Unlimited and everything it created.</div>
+          <div class="field-sub" data-i18n="help.cmd.purge">Removes Claude Unlimited and everything it created — stored credentials, config, usage history, the app and its virtualenv, and the service registration. Asks for confirmation, unless you pass --yes. Your own ~/.claude setup is never touched.</div>
         </div>
       </div>
     </div>
@@ -1666,7 +1667,7 @@
         <div class="section-title" data-i18n="help.more.title">Where everything else happens</div>
       </div>
       <div class="section-body">
-        <div class="field-sub" data-i18n="help.more.body">Adding and removing Profiles, thresholds, priority, budget caps, Export/Import, and notifications are all managed right here in the Dashboard — not on the command line. The commands above are only for the daemon's own lifecycle.</div>
+        <div class="field-sub" data-i18n="help.more.body">Adding and removing Profiles, thresholds, priority, budget caps, Export/Import, notifications, the launch command for each CLI, and the port this dashboard listens on are all managed right here in the Dashboard — not on the command line. The commands above are only for the daemon's own lifecycle.</div>
       </div>
     </div>
   </div>
