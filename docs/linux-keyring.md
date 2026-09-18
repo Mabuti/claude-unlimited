@@ -85,12 +85,12 @@ Save as `~/.local/bin/claude-unlimited-keyring-unlock`, `chmod +x` it, and repla
 # instance that loads the keyring LOCKED and wins the org.freedesktop.secrets
 # name. Measured, not theoretical.
 set -u
-# --- REPLACE THIS with your own non-interactive password source. ---
-# It must print the keyring password and nothing else. Examples:
+# --- Defaults to a 0600 file holding just the password (see section 4 to
+# create it). Any command that prints the keyring password and nothing else
+# works instead — swap in your password manager's CLI if you have one:
 #   PASSWORD_CMD='pass show gnome-keyring/login'
-#   PASSWORD_CMD='cat ~/.config/keyring-password'   # chmod 600 that file
 # Never use secret-tool here: it reads the keyring this script unlocks.
-PASSWORD_CMD='echo REPLACE_ME'
+PASSWORD_CMD='cat ~/.config/claude-unlimited/keyring-password'
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
 locked() { busctl --user call org.freedesktop.secrets /org/freedesktop/secrets/collection/login \
@@ -101,7 +101,6 @@ if [ "$(locked)" = "false" ]; then echo "login keyring already unlocked"; exit 0
 # Fetch the password BEFORE touching anything. If the source fails, exit without
 # killing the keyring — otherwise Restart=on-failure on the daemon unit would
 # re-run this every 2s and hammer gnome-keyring forever.
-case "$PASSWORD_CMD" in *REPLACE_ME*) echo "FAILED: set PASSWORD_CMD first — refusing to create a keyring with a placeholder password" >&2; exit 1;; esac
 pw="$(eval "$PASSWORD_CMD" 2>/dev/null | tr -d '\n')"
 if [ -z "$pw" ]; then echo "FAILED: PASSWORD_CMD printed nothing" >&2; exit 1; fi
 
@@ -236,12 +235,22 @@ merged in at load time regardless of what the main unit file says.
 
 ### 4. First run — this creates the keyring
 
-On a fresh distro there is no `login` keyring yet and no password. That is fine: pick a
-password, put it in whatever `PASSWORD_CMD` reads from, and run the script **once by
-hand**. `gnome-keyring-daemon --unlock` creates the login keyring with the supplied
-password when none exists, so the first run bootstraps it; every later run just unlocks
-it. The script refuses to run while `PASSWORD_CMD` is still the placeholder, so it can
-never create a keyring with `REPLACE_ME` as the password.
+On a fresh distro there is no `login` keyring yet and no password. Create the file the
+default `PASSWORD_CMD` reads from before the first run:
+
+```bash
+mkdir -p ~/.config/claude-unlimited
+(umask 077; head -c 32 /dev/urandom | base64 | tr -d '\n' > ~/.config/claude-unlimited/keyring-password)
+```
+
+That file is the keyring's password from now on — keep it with the same care as
+`~/.claude`. It's deliberately outside `~/.claude-unlimited/`, which `purge` deletes, so
+a purge-and-reinstall doesn't orphan the keyring. If it's ever lost, the keyring can't be
+unlocked: delete `~/.local/share/keyrings/login.keyring` and re-add every account.
+
+Then run the script **once by hand**. `gnome-keyring-daemon --unlock` creates the login
+keyring with the supplied password when none exists, so the first run bootstraps it;
+every later run just unlocks it.
 
 ```bash
 chmod 700 ~/.local/bin/claude-unlimited-keyring-unlock
@@ -261,12 +270,14 @@ systemctl --user enable --now claude-unlimited-keyring-unlock.service
 2. Install the tool (`./install.sh` from your checkout). This is what creates
    `claude-unlimited.service`; the drop-in below has nothing to attach to before this.
 3. Save the script, the unit, and the drop-in (sections 1–3).
-4. Run the script once by hand (section 4) — creates and unlocks the keyring.
-5. `daemon-reload`, `enable --now` the unlock unit, then verify (next section).
-6. `claude-unlimited add-account`. On WSL the browser will not open by itself — paste
+4. Create the password file (section 4) — `mkdir -p ~/.config/claude-unlimited` and
+   write a random password to `~/.config/claude-unlimited/keyring-password`.
+5. Run the script once by hand (section 4) — creates and unlocks the keyring.
+6. `daemon-reload`, `enable --now` the unlock unit, then verify (next section).
+7. `claude-unlimited add-account`. On WSL the browser will not open by itself — paste
    the URL it prints into a Windows browser and paste the code back.
 
-Doing `add-account` before step 4 is what produces the "choose a password for a new
+Doing `add-account` before step 5 is what produces the "choose a password for a new
 keyring" dialog — and a password you set in a dialog is one nothing can supply at boot.
 
 ## Verifying it works without rebooting

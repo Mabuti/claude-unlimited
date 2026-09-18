@@ -296,6 +296,11 @@ browser; under WSL it may not. If nothing opens, copy the URL the login command 
 into a Windows browser and finish there — `add-account` then asks for the authorization
 code in the terminal.
 
+If a "Choose password for new keyring" dialog (or similar) appears when you run
+`add-account`, cancel it and go back to step 3 — the keyring doesn't exist yet, and a
+password typed into that dialog is one nothing can supply at boot. After your next
+reboot, every account will look exhausted (see [Troubleshooting](#troubleshooting)).
+
 **Updating:** `git pull` in the checkout, then `./install.sh` again. `claude-unlimited
 restart` on its own only restarts the code that's already installed. And read
 [Updates](#updates) before touching that setting — the built-in updater follows the
