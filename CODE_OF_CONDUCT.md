@@ -41,7 +41,7 @@ individual is officially representing the project in public spaces.
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the project maintainers by opening a
-[private security advisory](https://github.com/DevDock-AI/claude-unlimited/security/advisories/new),
+[private security advisory](https://github.com/Mabuti/claude-unlimited/security/advisories/new),
 which is the most private reporting channel available on this repository.
 
 All complaints will be reviewed and investigated promptly and fairly. Project
