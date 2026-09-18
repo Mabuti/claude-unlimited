@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-GITHUB_OWNER = "DevDock-AI"
+GITHUB_OWNER = "Mabuti"
 GITHUB_REPO = "claude-unlimited"
 RELEASES_LATEST_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 COMMIT_REF_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/commits/{{ref}}"

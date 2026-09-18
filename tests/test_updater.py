@@ -253,10 +253,22 @@ def test_install_refuses_without_a_virtualenv(tmp_path):
 def test_update_source_is_hardcoded_not_configurable():
     """A compromised config file must not be able to point the updater at a
     different repository."""
-    assert updater.CLONE_URL == "https://github.com/DevDock-AI/claude-unlimited.git"
-    assert updater.RELEASES_LATEST_URL.startswith("https://api.github.com/repos/DevDock-AI/claude-unlimited/")
+    assert updater.CLONE_URL == "https://github.com/Mabuti/claude-unlimited.git"
+    assert updater.RELEASES_LATEST_URL.startswith("https://api.github.com/repos/Mabuti/claude-unlimited/")
     source = Path(updater.__file__).read_text()
     assert "load_pool" not in source and "update_settings" not in source
+
+
+def test_updater_never_references_upstream_devdock():
+    """Guards against a future upstream merge silently reintroducing the
+    original owner into a constant, a derived URL, or the User-Agent header —
+    which would let an upstream release replace a fork install again."""
+    source = Path(updater.__file__).read_text()
+    assert "DevDock-AI" not in source
+    assert updater.GITHUB_OWNER == "Mabuti"
+    assert "DevDock-AI" not in updater.RELEASES_LATEST_URL
+    assert "DevDock-AI" not in updater.COMMIT_REF_URL
+    assert "DevDock-AI" not in updater.CLONE_URL
 
 
 # ---- mode policy ----
