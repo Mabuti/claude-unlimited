@@ -30,7 +30,7 @@ the session — the account underneath you changes and nothing else does. Often 
 dashboard's activity log is the only place you'll find out it happened.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![CI](https://github.com/DevDock-AI/claude-unlimited/actions/workflows/ci.yml/badge.svg)](https://github.com/DevDock-AI/claude-unlimited/actions/workflows/ci.yml)
+[![CI](https://github.com/Mabuti/claude-unlimited/actions/workflows/ci.yml/badge.svg)](https://github.com/Mabuti/claude-unlimited/actions/workflows/ci.yml)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Backend dependencies](https://img.shields.io/badge/backend%20dependencies-1-brightgreen)
@@ -211,7 +211,7 @@ credentials are stored with Windows DPAPI instead of the Keychain.
 > every OS-specific piece (credential storage, the background service, the installer) is
 > implemented and covered by tests, and it *should* work fine — but it hasn't had the same
 > real-world mileage, so treat it as "should be fine, not guaranteed." If anything's off,
-> please [open an issue](https://github.com/DevDock-AI/claude-unlimited/issues).
+> please [open an issue](https://github.com/Mabuti/claude-unlimited/issues).
 
 Don't want it starting on login? Turn it off in **Settings → Daemon**, or run
 `claude-unlimited uninstall`. It keeps running either way until you stop it.
