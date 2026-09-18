@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="${CLAUDE_UNLIMITED_REPO:-https://github.com/DevDock-AI/claude-unlimited.git}"
+REPO_URL="${CLAUDE_UNLIMITED_REPO:-https://github.com/Mabuti/claude-unlimited.git}"
 REPO_BRANCH="${CLAUDE_UNLIMITED_BRANCH:-main}"
 INSTALL_ROOT="$HOME/.local/share/claude-unlimited"
 BIN_DIR="$HOME/.local/bin"
@@ -105,7 +105,11 @@ fi
 # click away rather than a command the reader has to find. Started detached:
 # this makes it usable right now, while `claude-unlimited install` is what
 # makes it come back on login.
-PORT="${CLAUDE_UNLIMITED_PORT:-4317}"
+# Resolve the port the same way the CLI does — explicit env var, then the port
+# saved in Settings, then the default — using the package just installed. A
+# bare "${CLAUDE_UNLIMITED_PORT:-4317}" here silently moved a saved port back
+# to 4317 on every re-run, since an explicit --port outranks the setting.
+PORT="$("$INSTALL_ROOT/venv/bin/python" -c 'from claude_unlimited.config import resolve_port; print(resolve_port(None))' 2>/dev/null || echo "${CLAUDE_UNLIMITED_PORT:-4317}")"
 # Digits only. It reaches a URL and a command line, and every expansion here is
 # quoted, but validating the shape is cheaper than reasoning about whether
 # every future use stays quoted.

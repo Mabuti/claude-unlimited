@@ -64,6 +64,10 @@ Every user-facing string lives in `claude_unlimited/locales/*.json` as a flat `k
 
 Adding a whole new language is one file: copy `en.json` to `<code>.json` and translate it. No registration step — the available set is derived from the files present.
 
+## The Help view
+
+A user-facing command, flag, or Settings control ships with its Help entry. The dashboard's Help view (`data-view-panel="help"` in `claude_unlimited/static/index.html`, strings under `help.*` in every locale) documents every subcommand and every Settings section, and `tests/test_help_view_covers_the_cli.py` fails when it falls behind. What the test enforces: every subcommand in `cli.py`'s argparse tree has a Help row and every row is a real subcommand; every Settings section is named in the Help text or listed in the test's exemption constant with a reason; and each string's locale value matches its inline English fallback in `index.html`. Flags are covered by prose in the command's row, which the test does not check — that part is on you. Internal changes — a routing fix, a refactor — need nothing.
+
 ## Commit messages
 
 [Conventional Commits](https://www.conventionalcommits.org). The subject line

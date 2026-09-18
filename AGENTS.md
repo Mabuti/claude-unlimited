@@ -39,7 +39,7 @@ Yes, and here is what that claim rests on — verify any of it yourself:
 ## Installing
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Mabuti/claude-unlimited/main/install.sh | bash
 claude-unlimited doctor
 ```
 

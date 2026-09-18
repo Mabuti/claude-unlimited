@@ -8,6 +8,9 @@ Claude Unlimited pools your Claude (Pro · Max), ChatGPT/Codex, and Anthropic AP
 into one continuous supply for Claude Code. When an account runs dry, the next one takes
 over on the very next request — same session, same context, same terminal. You keep typing.
 
+*This is a fork of [DevDock-AI/claude-unlimited](https://github.com/DevDock-AI/claude-unlimited)
+carrying configurable launch commands, a configurable listen port, and a WSL install path.*
+
 <br>
 
 <table>
@@ -51,6 +54,7 @@ dashboard's activity log is the only place you'll find out it happened.
 | **[Features](#features)** | What you get |
 | **[How it works](#how-it-works)** | The flow, and why nothing leaves your machine |
 | **[Install](#install)** | One line |
+| **[Installing under WSL](#installing-under-wsl)** | Read this first if that's you |
 | **[<img src="docs/logos/claude.png" height="14" alt=""> Add a Claude subscription](#add-a-claude-subscription)** | One command |
 | **[<img src="docs/logos/openai.png" height="14" alt=""> Add a ChatGPT / Codex subscription](#add-a-chatgpt--codex-subscription)** | One command |
 | **[Add an API key](#add-an-api-key)** | Dashboard only |
@@ -180,19 +184,22 @@ Pick your system, copy the **one line**, paste, done. It installs everything it 
 **🍎 macOS & 🐧 Linux** — paste into a terminal:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Mabuti/claude-unlimited/main/install.sh | bash
 ```
+
+**Under WSL?** Read [Installing under WSL](#installing-under-wsl) instead of pasting that —
+it's the same install, with three things WSL doesn't give you handled in order.
 
 **🪟 Windows** — press **Win + R** (or open **Command Prompt**), paste, press Enter:
 
 ```bat
-powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/Mabuti/claude-unlimited/main/install.ps1 | iex"
 ```
 
 **🪟 Windows, already in PowerShell?** — paste this shorter version instead:
 
 ```powershell
-irm https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Mabuti/claude-unlimited/main/install.ps1 | iex
 ```
 
 Then run `claude-unlimited code` and you're routed. On Windows, run the installer from an
@@ -229,7 +236,7 @@ says so rather than pretending it succeeded.
 Prefer to read it first, or install from a checkout?
 
 ```bash
-git clone https://github.com/DevDock-AI/claude-unlimited.git
+git clone https://github.com/Mabuti/claude-unlimited.git
 cd claude-unlimited
 ./install.sh
 ```
@@ -237,6 +244,62 @@ cd claude-unlimited
 Requires **Python 3.10+**, **git**, and the **`claude`** CLI on your `PATH`.
 
 </details>
+
+### Installing under WSL
+
+Under WSL, systemd is off by default, nothing unlocks the login keyring at sign-in, and
+`add-account` may not be able to open a browser. The install is the same; these steps
+handle those three, in the order they have to happen. Commands are for Ubuntu/Debian.
+
+**Before you start.** Inside WSL:
+
+```bash
+sudo apt update && sudo apt install python3 python3-venv git gnome-keyring libsecret-tools
+export PATH="$HOME/.local/bin:$PATH"   # the installer's own check needs this on a fresh distro
+```
+
+plus the `claude` CLI on your PATH inside WSL — and `codex`, if you'll pool Codex accounts.
+
+**1. Enable systemd.** The background service is a `systemd --user` unit. Add to
+`/etc/wsl.conf` (needs `sudo`):
+
+```ini
+[boot]
+systemd=true
+```
+
+then `wsl --shutdown` from a Windows prompt and reopen. Without it the installer still
+runs, but only for that terminal session, and says so.
+
+**2. Install from a checkout**, not the one-liner, so that updating is a `git pull` away:
+
+```bash
+git clone https://github.com/Mabuti/claude-unlimited.git
+cd claude-unlimited
+./install.sh
+```
+
+The dashboard usually won't open by itself under WSL (no `xdg-open` on a stock distro) —
+open the printed URL in a Windows browser. And read `doctor`'s "Secret store: OK" narrowly: it means the
+backend imports, not that a keyring is running. Step 3 is still required.
+
+**3. Make the keyring unlock itself.** Credentials live in the Linux Secret Service, and
+after every reboot the login keyring comes up locked — which looks like every account
+being exhausted (see [Troubleshooting](#troubleshooting)). Follow
+[`docs/linux-keyring.md`](docs/linux-keyring.md) end to end: it creates the keyring on
+first run, installs the unlock script, the unit that runs it before the daemon, and the
+drop-in that re-checks on every daemon start, and shows how to test it short of a reboot.
+It needs the daemon installed first, which is why it comes after step 2.
+
+**4. Add your accounts.** `add-account` and `add-codex-account` say they open your
+browser; under WSL it may not. If nothing opens, copy the URL the login command prints
+into a Windows browser and finish there — `add-account` then asks for the authorization
+code in the terminal.
+
+**Updating:** `git pull` in the checkout, then `./install.sh` again. `claude-unlimited
+restart` on its own only restarts the code that's already installed. And read
+[Updates](#updates) before touching that setting — the built-in updater follows the
+upstream project, not this fork.
 
 ---
 
@@ -449,7 +512,8 @@ says so when it happens. Nothing else in `env` is touched, and no file is modifi
   menu to edit, test, disable, or remove.
 - **Activity** — every rotation, session, and config change, filterable and exportable.
 - **Settings** — updates, [models parity](#which-gpt-model-runs-your-claude-model),
-  auto-start, process controls, notifications, export/import, language.
+  auto-start, process controls, the launch command for each CLI, the listen port,
+  notifications, export/import, language.
 - **Help** — every CLI command, explained.
 
 Numbers update live, without refreshing. Usage bars shift amber then red as an account
@@ -497,6 +561,12 @@ notification** there to confirm they reach you.
 
 ## Updates
 
+> **On this fork:** the updater still watches the upstream project's releases, so
+> "a release is found" means an *upstream* release. Set **Settings → Updates** to
+> **Fully manual** — the default is *Auto-download only* — and don't press
+> **Download & install now**: it would replace this fork with upstream. Updates to the
+> fork are `git pull` then `./install.sh` in your checkout.
+
 Claude Unlimited checks for new releases on its own and does exactly what you
 tell it to in **Settings → Updates**:
 
@@ -527,7 +597,8 @@ push access, is honest. That's a deliberate, documented limit.
 ## Command reference
 
 Every command is daemon lifecycle or account authentication. **Everything else — accounts,
-thresholds, priority, budget caps, export/import — lives in the dashboard.** The same list
+thresholds, priority, budget caps, export/import, launch commands, the listen port — lives
+in the dashboard.** The same list
 is in the dashboard under **Help**.
 
 Every command below also works under the short alias **`cu`** — e.g. `cu code`, `cu status`.
@@ -553,11 +624,11 @@ Every command below also works under the short alias **`cu`** — e.g. `cu code`
 
 | Command | What it's for |
 |---|---|
-| `claude-unlimited code` | **The one you'll use.** Launches `claude` routed through your pool. |
+| `claude-unlimited code` | **The one you'll use.** Launches `claude` routed through your pool — or whatever **Settings → Launch commands** has in its place. Also repairs the `cu` shortcut if an update dropped it. |
 | `claude-unlimited code --profile <name>` | Pin the session to one account instead of rotating. |
 | `claude-unlimited desktop` | Route the Claude **desktop app** through your pool, then launch it. `--revert` undoes it. |
 | `claude-unlimited status` | Is the daemon installed and running, and its pid. |
-| `claude-unlimited start` | Run the daemon in this terminal (Ctrl-C to stop). |
+| `claude-unlimited start` | Run the daemon in this terminal (Ctrl-C to stop). `--port` overrides for this run only; otherwise `CLAUDE_UNLIMITED_PORT` if set, then the port saved in Settings. |
 
 </details>
 
@@ -585,7 +656,7 @@ Auto-start on login — the same thing **Settings → Daemon** controls.
 
 | Command | What it's for |
 |---|---|
-| `claude-unlimited purge` | Removes everything: stored credentials, config, usage history, the app and its virtualenv, the CLI symlink, and the service registration. If the Claude desktop app was routed through the pool, its own settings are restored first. Asks for confirmation first. `~/.claude` is never touched. |
+| `claude-unlimited purge` | Removes everything: stored credentials, config, usage history, the app and its virtualenv, the CLI symlink, and the service registration. If the Claude desktop app was routed through the pool, its own settings are restored first. Asks for confirmation first, unless you pass `--yes`. `~/.claude` is never touched. |
 
 Credentials are deleted from your OS keystore *before* the config goes, since
 the config is the only record of which Profiles exist.
@@ -642,7 +713,39 @@ was skipped.
 <summary><b>Port 4317 is taken</b></summary>
 <br>
 
-`claude-unlimited start --port 4400` — and point `ANTHROPIC_BASE_URL` at the same port.
+Save the port you want as the setting, then install with no flag so the service reads it.
+The dashboard won't "change" to the port it's already on, so start it on a scratch port
+for this one step:
+
+```bash
+claude-unlimited start --port 4401        # scratch port; dashboard at http://127.0.0.1:4401/
+#   → Settings → Port → 4400 → Apply
+#   Ctrl-C
+claude-unlimited install                  # no flag: reads the saved port
+```
+
+You'll see either *Saved — applies the next time the daemon starts* (no service registered
+yet) or *Moving the dashboard to port 4400* (a service was already registered and has just
+been rewritten). Ctrl-C the scratch daemon either way; `install` is then harmless.
+
+Or skip the dashboard: put `{"settings": {"port": 4400}}` in `~/.claude-unlimited/config.json`
+— create the file if it doesn't exist, merge into `settings` if it does — and run
+`claude-unlimited install`.
+
+Every later command resolves to the saved port, unless `CLAUDE_UNLIMITED_PORT` is set,
+which wins. `--port` on its own is for that one run and isn't remembered. Once the service
+is installed, **Settings → Port** does the restart and the unit rewrite for you.
+</details>
+
+<details>
+<summary><b>After a reboot, every request fails "exhausted" and <code>cu reauth</code> says nothing needs re-auth (Linux / WSL)</b></summary>
+<br>
+
+On Linux and WSL the usual cause is that the login keyring is locked and nothing unlocked
+it at sign-in, so the daemon can't read its tokens. It treats that as the accounts cooling
+down, not as an auth problem — which is why `reauth` finds nothing to do. Fix:
+[`docs/linux-keyring.md`](docs/linux-keyring.md). Stop the daemon before restarting the
+keyring, or it can come back locked again.
 </details>
 
 ---
@@ -669,10 +772,14 @@ Full threat model and vulnerability reporting: [`SECURITY.md`](SECURITY.md).
 
 ## Requirements
 
-- **macOS, Linux, or Windows** — macOS is verified on real hardware; the Linux and Windows
-  backends are a real but **unverified first cut**
+- **macOS, Linux, or Windows** — macOS is verified on real hardware upstream; this fork
+  runs day-to-day under **WSL (Ubuntu)**. Other Linux desktops and Windows are a real but
+  less-exercised path
   ([details](docs/adr/0005-windows-linux-backends-unverified-first-cut.md)).
-- **Python 3.10+**, **git**, and the **`claude`** CLI.
+- **Python 3.10+** (with `venv`), **git**, and the **`claude`** CLI — plus **`codex`** if
+  you'll pool Codex accounts.
+- On Linux: **`libsecret-tools`** and a running Secret Service provider. Under WSL that means
+  **`gnome-keyring`** plus the unlock unit from [`docs/linux-keyring.md`](docs/linux-keyring.md).
 
 ## A note on Terms of Service
 
