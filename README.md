@@ -260,16 +260,17 @@ export PATH="$HOME/.local/bin:$PATH"   # the installer's own check needs this on
 
 plus the `claude` CLI on your PATH inside WSL — and `codex`, if you'll pool Codex accounts.
 
-**1. Enable systemd.** The background service is a `systemd --user` unit. Add to
-`/etc/wsl.conf` (needs `sudo`):
+**1. Check systemd is on.** The background service is a `systemd --user` unit. Recent
+Ubuntu WSL images ship `/etc/wsl.conf` with it already enabled; check, and add this if
+it's missing (needs `sudo`):
 
 ```ini
 [boot]
 systemd=true
 ```
 
-then `wsl --shutdown` from a Windows prompt and reopen. Without it the installer still
-runs, but only for that terminal session, and says so.
+If you had to add it, `wsl --shutdown` from a Windows prompt and reopen. Without it the
+installer still runs, but only for that terminal session, and says so.
 
 **2. Install from a checkout**, not the one-liner, so that updating is a `git pull` away:
 
@@ -278,6 +279,12 @@ git clone https://github.com/Mabuti/claude-unlimited.git
 cd claude-unlimited
 ./install.sh
 ```
+
+If the output says **Install failed** — typically *Failed to connect to user scope bus* —
+stop there, even though the installer carries on to its normal closing lines. That means
+the service wasn't registered and step 3 has nothing to attach to. Check
+`systemctl --user is-system-running`, fix step 1 if it isn't `running`, then
+`claude-unlimited install` before going on.
 
 The dashboard usually won't open by itself under WSL (no `xdg-open` on a stock distro) —
 open the printed URL in a Windows browser. And read `doctor`'s "Secret store: OK" narrowly: it means the
@@ -302,9 +309,8 @@ password typed into that dialog is one nothing can supply at boot. After your ne
 reboot, every account will look exhausted (see [Troubleshooting](#troubleshooting)).
 
 **Updating:** `git pull` in the checkout, then `./install.sh` again. `claude-unlimited
-restart` on its own only restarts the code that's already installed. And read
-[Updates](#updates) before touching that setting — the built-in updater follows the
-upstream project, not this fork.
+restart` on its own only restarts the code that's already installed. Read
+[Updates](#updates) before touching that setting.
 
 ---
 
@@ -566,11 +572,11 @@ notification** there to confirm they reach you.
 
 ## Updates
 
-> **On this fork:** the updater still watches the upstream project's releases, so
-> "a release is found" means an *upstream* release. Set **Settings → Updates** to
-> **Fully manual** — the default is *Auto-download only* — and don't press
-> **Download & install now**: it would replace this fork with upstream. Updates to the
-> fork are `git pull` then `./install.sh` in your checkout.
+> **On this fork:** the updater points at this repository, which has no releases yet,
+> so **Settings → Updates** reports *No releases published yet* and the install button
+> does nothing. Until a release is tagged here, updates are `git pull` then `./install.sh`
+> in your checkout. The default mode, *Auto-download only*, stages a verified copy but
+> never installs without a click — **Fully manual** is a preference, not a safety fix.
 
 Claude Unlimited checks for new releases on its own and does exactly what you
 tell it to in **Settings → Updates**:
