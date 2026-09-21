@@ -308,9 +308,11 @@ If a "Choose password for new keyring" dialog (or similar) appears when you run
 password typed into that dialog is one nothing can supply at boot. After your next
 reboot, every account will look exhausted (see [Troubleshooting](#troubleshooting)).
 
-**Updating:** `git pull` in the checkout, then `./install.sh` again. `claude-unlimited
-restart` on its own only restarts the code that's already installed. Read
-[Updates](#updates) before touching that setting.
+**Updating:** From a checkout, `git pull` then `./install.sh` again —
+`claude-unlimited restart` on its own only restarts the code that's already installed.
+Or let the in-app updater handle it under **Settings → Updates**, which replaces
+`~/.local/share/claude-unlimited/app` instead. Read [Updates](#updates) before touching
+that setting.
 
 ---
 
@@ -572,11 +574,14 @@ notification** there to confirm they reach you.
 
 ## Updates
 
-> **On this fork:** the updater points at this repository, which has no releases yet,
-> so **Settings → Updates** reports *No releases published yet* and the install button
-> does nothing. Until a release is tagged here, updates are `git pull` then `./install.sh`
-> in your checkout. The default mode, *Auto-download only*, stages a verified copy but
-> never installs without a click — **Fully manual** is a preference, not a safety fix.
+> **On this fork:** the updater points at this repository (Mabuti/claude-unlimited),
+> never upstream. Releases are cut here — see
+> [`docs/RELEASING.md`](docs/RELEASING.md). The default mode, *Auto-download only*,
+> stages a verified copy but never installs without a click — **Fully manual** is a
+> preference, not a safety fix. If you installed from a checkout (`./install.sh` after
+> cloning), you can keep updating that way — `git pull` then `./install.sh` — or let the
+> in-app updater take over instead; an in-app install replaces
+> `~/.local/share/claude-unlimited/app`, so pick one path, not both.
 
 Claude Unlimited checks for new releases on its own and does exactly what you
 tell it to in **Settings → Updates**:
