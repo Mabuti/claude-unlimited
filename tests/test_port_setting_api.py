@@ -388,3 +388,5 @@ def test_run_foreground_bind_failure_names_config_path_and_port_key(monkeypatch,
     err = capsys.readouterr().err
     assert str(tmp_path / "config.json") in err
     assert "port" in err
+    assert '"settings"' in err
+    assert "claude-unlimited install" in err

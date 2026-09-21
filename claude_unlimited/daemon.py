@@ -1687,9 +1687,10 @@ def run_foreground(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> None:
         # of it — a systemd/launchd/Task Scheduler restart has no terminal
         # to show that message on, only this process's own stderr/journal.
         print(
-            f"\nCouldn't bind {host}:{port}. If this came from settings.port, edit the "
-            f'"port" key in {config.CONFIG_FILE} to a free port, or override it for this '
-            "run with --port.",
+            f'\nCouldn\'t bind {host}:{port}. If this came from settings.port, set '
+            f'"settings" → "port" in {config.CONFIG_FILE} to a free port (e.g. '
+            '{"settings": {"port": 4400}}), then run `claude-unlimited install` again '
+            "so the service picks it up — or override it for this run with --port.",
             file=sys.stderr,
         )
         raise

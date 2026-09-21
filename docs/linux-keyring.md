@@ -67,8 +67,9 @@ a cold boot.
 
 ### 1. The unlock script
 
-Save as `~/.local/bin/claude-unlimited-keyring-unlock`, `chmod +x` it, and replace the
-`PASSWORD_CMD` line with your own non-interactive password source.
+Save as `~/.local/bin/claude-unlimited-keyring-unlock`, `chmod +x` it. The default
+`PASSWORD_CMD` reads the password file section 4 creates — only edit that line if you
+want a password manager instead.
 
 ```bash
 #!/bin/bash
@@ -248,6 +249,13 @@ That file is the keyring's password from now on — keep it with the same care a
 a purge-and-reinstall doesn't orphan the keyring. If it's ever lost, the keyring can't be
 unlocked: delete `~/.local/share/keyrings/login.keyring` and re-add every account.
 
+Reload systemd now, so it picks up the unit and drop-in from sections 2–3 before the
+first run:
+
+```bash
+systemctl --user daemon-reload
+```
+
 Then run the script **once by hand**. `gnome-keyring-daemon --unlock` creates the login
 keyring with the supplied password when none exists, so the first run bootstraps it;
 every later run just unlocks it.
@@ -257,10 +265,9 @@ chmod 700 ~/.local/bin/claude-unlimited-keyring-unlock
 ~/.local/bin/claude-unlimited-keyring-unlock        # prints "login keyring unlocked"
 ```
 
-Then enable the unit and reload so the drop-in is picked up:
+Then enable the unlock unit:
 
 ```bash
-systemctl --user daemon-reload
 systemctl --user enable --now claude-unlimited-keyring-unlock.service
 ```
 
@@ -272,8 +279,9 @@ systemctl --user enable --now claude-unlimited-keyring-unlock.service
 3. Save the script, the unit, and the drop-in (sections 1–3).
 4. Create the password file (section 4) — `mkdir -p ~/.config/claude-unlimited` and
    write a random password to `~/.config/claude-unlimited/keyring-password`.
-5. Run the script once by hand (section 4) — creates and unlocks the keyring.
-6. `daemon-reload`, `enable --now` the unlock unit, then verify (next section).
+5. `daemon-reload`, then run the script once by hand (section 4) — creates and unlocks
+   the keyring.
+6. `enable --now` the unlock unit, then verify (next section).
 7. `claude-unlimited add-account`. On WSL the browser will not open by itself — paste
    the URL it prints into a Windows browser and paste the code back.
 
