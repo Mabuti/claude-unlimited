@@ -338,17 +338,47 @@ def _prompt_profile_choice(profiles: list):
 # _DESCRIPTION are what show in the list. The ids stay Anthropic-shaped
 # because openai_models.map_model() is keyed on them; the label is where the
 # backing model is surfaced.
+#
+# Opus, Sonnet and Fable carry the `[1m]` suffix so the picker's default slots
+# ARE the 1M-context variants (Haiku has no 1M variant, so it keeps its bare
+# id). Measured 2026-09-21 against a local stub server capturing what `claude`
+# 2.1.278 actually sends: with the bare id (`claude-opus-5`) and `--model
+# opus`, Claude Code reports `modelUsage: claude-opus-5` and sends no
+# `context-1m` beta, so the session is capped to the 200k window
+# (`/autocompact` says "capped to model limit of 200k"). With
+# `claude-opus-5[1m]`, Claude Code reports `modelUsage: claude-opus-5[1m]`,
+# but the WIRE body still sends the bare `model: claude-opus-5` and the
+# request headers add `anthropic-beta: claude-code-20250219,
+# context-1m-2025-08-07,...` — so the daemon, `openai_models.map_model()`, the
+# `/v1/models` parity rows and `proxy._STRIPPED_INBOUND_HEADERS` (which does
+# not strip `anthropic-beta`) are all unaffected; only Claude Code's own
+# picker and its outbound beta header change. Identical behaviour for
+# `claude-sonnet-5[1m]` / `claude-fable-5-1[1m]`.
+#
 # These MUST be the same ids Claude Code uses as each tier's native default,
 # or our override lands as an EXTRA picker entry beside the native one instead
 # of replacing it (v2.1.263 showed both a relabelled Fable and a native "Fable
-# 5.1"). Read out of the 2.1.263 binary's model table: fable->claude-fable-5-1,
-# opus->claude-opus-5, sonnet->claude-sonnet-5, haiku->claude-haiku-4-5. This
-# is upstream-coupled — see the "Claude Code upstream watch" note; a Claude
-# Code release that moves a tier default can reintroduce the duplicate.
+# 5.1"). On a Max account, Claude Code 2.1.278's native Opus default IS the
+# `[1m]` variant — that is exactly why the bare `claude-opus-5` id produced a
+# duplicate Opus entry, and setting the id to match (not just widening the
+# window) is what fixes it. Evidence, 2026-09-21: the 2.1.278 `/model` picker
+# on a Max account lists "Default ... Opus 5 (1M context)" as the native
+# entry, and each `[1m]` id above was accepted by `claude -p --model <tier>`
+# (modelUsage reports the `[1m]` id; the wire carries the bare id plus the
+# context-1m beta). haiku->claude-haiku-4-5 has no 1M variant. This is
+# upstream-coupled — see the "Claude Code upstream watch" note; a Claude Code
+# release that moves a tier default (id OR window) can reintroduce the
+# duplicate.
+#
+# Codex caveat: when a rotated or pinned Codex account actually serves a
+# request, it is the GPT model's own context window that applies, not
+# Claude's 1M — a session that has grown past that window errors instead of
+# compacting. A session that genuinely needs the full 1M window should pin to
+# a Claude profile (`cu code --profile <name>`) rather than rely on rotation.
 _MODEL_TIER_IDS = {
-    "FABLE": "claude-fable-5-1",
-    "OPUS": "claude-opus-5",
-    "SONNET": "claude-sonnet-5",
+    "FABLE": "claude-fable-5-1[1m]",
+    "OPUS": "claude-opus-5[1m]",
+    "SONNET": "claude-sonnet-5[1m]",
     "HAIKU": "claude-haiku-4-5",
 }
 
@@ -389,9 +419,9 @@ def _tier_live_label(live: dict, tier_id: str, family: str):
 # Pinned to a codex Profile: every request this session makes is served by
 # OpenAI, so name the real backing model outright.
 _CODEX_MODEL_LABELS = {
-    "FABLE": ("Fable 5.1 | GPT-6 Astra", "Served by Codex · reasoning: high"),
-    "OPUS": ("Opus 5 | GPT-5.6 Terra", "Served by Codex · reasoning: high"),
-    "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "Served by Codex · reasoning: medium"),
+    "FABLE": ("Fable 5.1 | GPT-6 Astra", "1M context · Served by Codex · reasoning: high"),
+    "OPUS": ("Opus 5 | GPT-5.6 Terra", "1M context · Served by Codex · reasoning: high"),
+    "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "1M context · Served by Codex · reasoning: medium"),
     "HAIKU": ("Haiku 4.5 | GPT-5.6 Luna", "Served by Codex · reasoning: low"),
 }
 
@@ -401,9 +431,9 @@ _CODEX_MODEL_LABELS = {
 # to stays accurate whichever one serves, and still says what is being
 # picked; a provider-neutral tier word would name no model at all.
 _MIXED_MODEL_LABELS = {
-    "FABLE": ("Fable 5.1 | GPT-6 Astra", "Whichever account is active · Codex reasoning: high"),
-    "OPUS": ("Opus 5 | GPT-5.6 Terra", "Whichever account is active · Codex reasoning: high"),
-    "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "Whichever account is active · Codex reasoning: medium"),
+    "FABLE": ("Fable 5.1 | GPT-6 Astra", "1M context · Whichever account is active · Codex reasoning: high"),
+    "OPUS": ("Opus 5 | GPT-5.6 Terra", "1M context · Whichever account is active · Codex reasoning: high"),
+    "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "1M context · Whichever account is active · Codex reasoning: medium"),
     "HAIKU": ("Haiku 4.5 | GPT-5.6 Luna", "Whichever account is active · Codex reasoning: low"),
 }
 
@@ -484,7 +514,8 @@ def _apply_model_labels(forced_profile, enabled_profiles=None,
         if match is not None:
             name, effort = match
             lead = "Served by Codex" if codex_pinned else "Whichever account is active · Codex"
-            description = f"{lead} · reasoning: {effort}" if effort else lead
+            prefix = "1M context · " if tier_id.endswith("[1m]") else ""
+            description = f"{prefix}{lead} · reasoning: {effort}" if effort else f"{prefix}{lead}"
         elif live:
             # Fetch succeeded but the user's parity list has no row for this
             # family — they removed it; leave the tier unlabelled.

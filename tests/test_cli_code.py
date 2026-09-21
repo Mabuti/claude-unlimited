@@ -19,8 +19,8 @@ def test_codex_pinned_session_relabels_the_model_picker(monkeypatch):
     # The id must stay Anthropic-shaped: openai_models.map_model is keyed on it,
     # AND must equal Claude Code's native tier default so our override REPLACES
     # the native picker entry rather than adding a duplicate beside it.
-    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5"
-    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1"
+    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5[1m]"
+    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1[1m]"
     assert os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-haiku-4-5"
     # ...while the visible label names BOTH the Claude tier and the backing GPT.
     assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5 | GPT-5.6 Terra"
@@ -89,7 +89,7 @@ def test_rotated_mixed_pool_uses_provider_neutral_labels(monkeypatch):
     for tier, level in (("FABLE", "high"), ("OPUS", "high"), ("SONNET", "medium"), ("HAIKU", "low")):
         assert level in os.environ[f"ANTHROPIC_DEFAULT_{tier}_MODEL_DESCRIPTION"]
     # ...and the id still has to be one map_model() understands.
-    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5"
+    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5[1m]"
 
 
 def test_codex_labels_come_from_the_live_parity_map_when_reachable(monkeypatch):
@@ -115,7 +115,7 @@ def test_codex_labels_come_from_the_live_parity_map_when_reachable(monkeypatch):
 
     # Live value, not the module literal (which says GPT-5.6 Terra for FABLE).
     assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "Fable 5.1 | GPT-6 Astra"
-    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1"
+    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1[1m]"
     desc = os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION"]
     assert "Served by Codex" in desc and "high" in desc, desc
 
@@ -269,9 +269,45 @@ def test_codex_picker_reflects_saved_list_and_unsets_removed_tiers(monkeypatch):
         [], host="h", port=1, token="t")
 
     # Fable labelled via family match; the tier id stays the native default.
-    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1"
+    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1[1m]"
     assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "Fable 5.1 | GPT-6 Astra"
     assert os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"] == "Opus 5 | GPT-5.6 Terra"
     # Sonnet and Haiku are not in the saved list -> left unset.
     assert "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME" not in os.environ
     assert "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME" not in os.environ
+
+
+def test_1m_tiers_are_labelled_1m_context_and_haiku_is_not(monkeypatch):
+    """Opus, Sonnet and Fable default to the 1M-context id, so their picker
+    description must say so; Haiku has no 1M variant and must not claim it —
+    in both the offline-fallback path and the live-parity path."""
+    from claude_unlimited import cli
+    from claude_unlimited.config import Profile
+    import os
+
+    # Offline fallback (no host/port/token -> no daemon fetch).
+    _clear(monkeypatch)
+    cli._apply_model_labels(Profile(id="c", name="Codex", kind="codex", priority=1,
+                                     automatic=True, enabled=True), [])
+    for tier in ("FABLE", "OPUS", "SONNET"):
+        desc = os.environ[f"ANTHROPIC_DEFAULT_{tier}_MODEL_DESCRIPTION"]
+        assert desc.startswith("1M context · "), (tier, desc)
+    haiku_desc = os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION"]
+    assert not haiku_desc.startswith("1M context · "), haiku_desc
+
+    # Live-parity path (daemon reachable, matched via family prefix).
+    _clear(monkeypatch)
+    monkeypatch.setattr(cli, "_fetch_parity_labels", lambda *a, **k: {
+        "claude-fable-5-1": ("Fable 5.1 | GPT-6 Astra", "high"),
+        "claude-opus-5": ("Opus 5 | GPT-6 Astra", "high"),
+        "claude-sonnet-5": ("Sonnet 5 | GPT-5.6 Terra", "medium"),
+        "claude-haiku-4-5": ("Haiku 4.5 | GPT-5.6 Luna", "low"),
+    })
+    cli._apply_model_labels(
+        Profile(id="c", name="Codex", kind="codex", priority=1, automatic=True, enabled=True),
+        [], host="127.0.0.1", port=4317, token="tok")
+    for tier in ("FABLE", "OPUS", "SONNET"):
+        desc = os.environ[f"ANTHROPIC_DEFAULT_{tier}_MODEL_DESCRIPTION"]
+        assert desc.startswith("1M context · "), (tier, desc)
+    haiku_desc = os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION"]
+    assert not haiku_desc.startswith("1M context · "), haiku_desc

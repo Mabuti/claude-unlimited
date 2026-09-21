@@ -387,6 +387,17 @@ the rest follow the list.
 > tiers (Fable, Opus, Sonnet, Haiku). Extra rows you add are still served and usable by id
 > (`/model <id>` or `--model <id>`), but may not appear in the picker itself.
 
+The Opus, Sonnet and Fable slots in that picker default to their **1M-context** ids, so a
+`cu code` session opens with the wider window already selected — no separate flag or `/model`
+switch needed. The standard 200k model is still one pick away: it's Claude Code's own entry,
+`/model claude-opus-5` (or `claude-sonnet-5` / `claude-fable-5-1`) instead of the default —
+the bare tier aliases (`/model opus`) resolve to the 1M slot. Haiku has no
+1M variant, so its slot is unchanged. One caveat: the 1M window is a Claude Code/Anthropic
+feature — when a Codex account actually serves a given request, it's the GPT model's own
+context window that applies instead, and a session that has grown past that window errors
+rather than compacting. If a session genuinely needs the full 1M window, pin it to a Claude
+profile (`cu code --profile <name>`) rather than leaving it on rotation.
+
 ---
 
 ## Add an API key
