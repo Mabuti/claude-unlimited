@@ -30,6 +30,7 @@
   "stat.next_reset": "Next reset",
   "stat.none": "—",
   "profile.resets_in": "resets in",
+  "profile.resets_on": "resets",
   "profile.not_observed": "not yet observed",
   "profile.session_5h": "5h session",
   "profile.session_7d": "7d weekly",

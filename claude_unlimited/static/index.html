@@ -273,6 +273,10 @@
   .bar-group { flex: 1; min-width: 140px; }
   .bar-label-row { display: flex; justify-content: space-between; font-size: var(--fs-micro); color: var(--text-dim); margin-bottom: 4px; }
   .bar-label-row .mono-num { color: var(--text); font-weight: 600; }
+  /* The right-hand reset label rides in the same row as the bar's own
+     name — truncate rather than wrap so a far-out "resets Tue 8:00 PM"
+     never pushes the row to a second line on a narrow card. */
+  .bar-reset { color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-left: 8px; }
   /* .bar-visual stacks three rows: the gray threshold number above its
      marker line, the track, and the usage number below where the bar ends.
      Each figure sits at its own x-position so neither can be misread as the
