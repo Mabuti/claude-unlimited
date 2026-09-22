@@ -180,7 +180,7 @@ def test_find_by_account_and_org_same_account_different_org_is_no_match(env):
     assert account_uuids == {"uuid-shared"}  # same account_uuid, both kept
 
 
-def test_find_by_account_and_org_legacy_match_reuses_and_signals_backfill(env):
+def test_find_by_account_and_org_legacy_match_reuses_and_signals_backfill(env, monkeypatch):
     p = profile_repo.create_profile(name="Legacy", kind="oauth", credential="tok-long-enough",
                                      account_uuid="uuid-legacy")  # org_uuid=None: added before the pair existed
     assert p.org_uuid is None
@@ -190,8 +190,19 @@ def test_find_by_account_and_org_legacy_match_reuses_and_signals_backfill(env):
     assert found.id == p.id
     assert needs_backfill is True
 
-    # And no duplicate is created via the real upsert path — the account is
-    # correctly recognised as the same Profile, and the org fields backfill.
+    # upsert_oauth_profile()'s legacy branch resolves the EXISTING Profile's
+    # own identity from its own stored credential before reusing it — see
+    # profiles.resolve_legacy_oauth_match(). Mocked here to resolve to the
+    # SAME org as the incoming login, so the reuse-and-backfill path is
+    # taken and no duplicate is created. (A mismatched-org or
+    # cannot-be-resolved legacy match is covered separately in
+    # tests/test_account_identity_legacy_guard.py.)
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", lambda token, timeout=15.0:
+        anthropic_oauth.AccountProfile(
+            account_uuid="uuid-legacy", email="legacy@example.com", display_name="Legacy",
+            org_uuid="org-new", org_name="Acme", organization_type="claude_max",
+            has_claude_max=True, has_claude_pro=False))
+
     updated, reused = profile_repo.upsert_oauth_profile(
         name="Legacy", account_uuid="uuid-legacy", credential="tok-refreshed-long",
         org_uuid="org-new", organization_type="claude_max")

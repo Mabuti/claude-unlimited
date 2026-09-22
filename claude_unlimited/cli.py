@@ -1738,10 +1738,28 @@ def add_account() -> int:
         return 1
 
     name = anthropic_oauth.profile_name_for_account(account)
+    plan = anthropic_oauth.plan_from_account(account)
+
+    # Checked BEFORE the real upsert, purely to report the outcome below —
+    # this is the SAME shared decision upsert_oauth_profile() makes
+    # internally (see resolve_legacy_oauth_match()), so there is no second
+    # copy of the rule, just an earlier look at its answer. When it does
+    # find and backfill a displaced legacy Profile here, that backfill means
+    # the account no longer looks "legacy" by the time upsert_oauth_profile()
+    # re-checks it below, so this costs at most one extra account-identity
+    # lookup, never two.
+    displaced = None
+    existing, needs_backfill = profile_repo.find_by_account_and_org(account.account_uuid, account.org_uuid)
+    if existing is not None and needs_backfill:
+        match = profile_repo.resolve_legacy_oauth_match(
+            existing, needs_backfill, account.org_uuid, account.organization_type)
+        if match.displaced_profile is not None:
+            displaced = match
+
     try:
         profile, reused = profile_repo.upsert_oauth_profile(
             name=name, account_uuid=account.account_uuid, credential=imported.access_token,
-            plan=anthropic_oauth.plan_from_account(account),
+            plan=plan,
             org_uuid=account.org_uuid, organization_type=account.organization_type,
             refresh_token=imported.refresh_token, expires_at=imported.expires_at,
             claude_config_dir=str(config_dir),
@@ -1756,9 +1774,21 @@ def add_account() -> int:
         _prime_via_daemon(profile.id)
 
     print(f"\n{'Refreshed existing profile' if reused else 'Added profile'}: {profile.name}")
+    if displaced is not None:
+        # The Organization: line below is what let the user diagnose the
+        # 2026-09-22 incident by hand after the fact — this makes the SAME
+        # outcome visible up front instead, the moment it happens.
+        org_label = displaced.displaced_org_name or "an organization that could not be named"
+        print(f"  Note: {displaced.displaced_profile.name} already holds a credential for a DIFFERENT "
+              f"organization ({org_label}) under this same account — left untouched. This login was "
+              "added as a separate new Profile instead of overwriting it.")
     if account.org_name:
         print(f"  Organization: {account.org_name}")
-    tier = "Max" if account.has_claude_max else "Pro" if account.has_claude_pro else "unknown tier"
+    # Printed from the same computed `plan` that was just stored, not the raw
+    # has_claude_max/has_claude_pro flags — those are true on a Team seat as
+    # well as a personal Max plan (see anthropic_oauth.plan_from_account()),
+    # so printing from them made a Team login say "Plan: Max".
+    tier = {"team": "Team", "max": "Max", "pro": "Pro"}.get(plan, "unknown tier")
     print(f"  Plan: {tier}")
     print("\nManage priority, threshold, and everything else for it from the Dashboard.")
     return 0
@@ -1884,14 +1914,31 @@ def reauth(port: int) -> int:
     Reuses the Profile's isolated claude_config_dir, set when it was added,
     so re-authenticating logs back into the same account rather than an
     ambiguous fresh session. Before saving, this refuses to overwrite the
-    Profile if the freshly-logged-in account doesn't match it: either a
-    different account_uuid entirely, or the same account_uuid but a
-    different organization/workspace than the Profile was added under (a
-    Team seat and a personal Max plan on one email share one account_uuid
-    but differ by org_uuid — see profiles.find_by_account_and_org()).
-    upsert_oauth_profile() then does the actual pair-aware match-and-save,
-    backfilling org_uuid/organization_type onto a Profile added before this
-    pair became the identity."""
+    Profile if the freshly-logged-in account doesn't match it:
+      - a different account_uuid entirely;
+      - the same account_uuid but a different organization/workspace than
+        the Profile was already resolved to (org_uuid is not None and
+        differs) — a Team seat and a personal Max plan on one email share
+        one account_uuid but differ by org_uuid (see
+        profiles.find_by_account_and_org());
+      - a LEGACY target (org_uuid is None, added before that pair became the
+        identity) whose OWN stored credential resolves to a DIFFERENT
+        organization than the fresh login just completed — resolved via
+        profiles.resolve_profile_own_identity(), never from the fresh
+        login's say-so (the 2026-09-22 incident this whole fix exists for:
+        the org the NEXT login reports is not proof of what a pre-existing
+        Profile is).
+    A legacy target whose own credential can't be resolved at all — the
+    USUAL case, since reauth targets a Profile whose token has already
+    failed — is not refused outright: the organization the fresh login is
+    about to record is printed and an explicit `y` is required before
+    anything is written. Anything else, EOF, or no TTY aborts with nothing
+    written. This is the ONE place `upsert_oauth_profile()`'s
+    `allow_legacy_reuse_when_unresolved` opt-in is used, and only after this
+    confirmation — see that function's docstring for why every other caller
+    keeps the safe default. upsert_oauth_profile() then does the actual
+    pair-aware match-and-save, backfilling org_uuid/organization_type onto a
+    Profile added before this pair became the identity."""
     _banner()
     claude_exe = launch_argv("claude")[0]
     if not shutil.which(claude_exe):
@@ -2000,6 +2047,46 @@ def reauth(port: int) -> int:
         )
         return 1
 
+    if target.account_uuid and target.org_uuid is None:
+        # A LEGACY target: added before org_uuid was the identity, so the
+        # guard above (which only fires when target.org_uuid is not None)
+        # never ran. Trusting the fresh login's org_uuid here is exactly the
+        # 2026-09-22 incident this whole fix exists for — resolve the
+        # target's OWN stored identity instead, from its own credential,
+        # never from this fresh login.
+        resolved = profile_repo.resolve_profile_own_identity(target)
+        if resolved is not None and resolved.org_uuid != account.org_uuid:
+            print(
+                f"\n{target.name}'s own stored credential belongs to "
+                f"{resolved.org_name or 'an unnamed organization'} ({resolved.organization_type or 'unknown type'}), "
+                f"but you just logged into {account.org_name or 'a different, unnamed organization'} "
+                f"({account.organization_type or 'unknown type'}) — refusing to overwrite it. Run "
+                "`claude-unlimited add-account` instead if you meant to add this organization as a new Profile.",
+                file=sys.stderr,
+            )
+            return 1
+        if resolved is None:
+            # The usual case: this Profile is being re-authenticated because
+            # its token had already failed, so its own credential can't be
+            # resolved to confirm which organization it belongs to. Ask
+            # explicitly, naming what is about to be recorded, rather than
+            # silently trusting the fresh login the way the old code did.
+            org_label = account.org_name or "an unnamed organization"
+            org_type = account.organization_type or "unknown type"
+            print(
+                f"\nCould not confirm which organization {target.name}'s existing credential belonged to "
+                "(its own stored token could not be resolved). The account you just logged into belongs "
+                f"to {org_label} ({org_type}), and will be recorded on {target.name} if you continue."
+            )
+            try:
+                answer = input("Continue and record this organization on this Profile? [y/N]: ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print("\nCancelled — nothing was written.", file=sys.stderr)
+                return 1
+            if answer != "y":
+                print("Cancelled — nothing was written.", file=sys.stderr)
+                return 1
+
     try:
         profile, _reused = profile_repo.upsert_oauth_profile(
             name=target.name, account_uuid=account.account_uuid, credential=imported.access_token,
@@ -2007,6 +2094,12 @@ def reauth(port: int) -> int:
             org_uuid=account.org_uuid, organization_type=account.organization_type,
             refresh_token=imported.refresh_token, expires_at=imported.expires_at,
             claude_config_dir=str(config_dir),
+            # Safe by construction: reached only after the checks above have
+            # either resolved target's own identity to match this login, or
+            # gotten the user's explicit y for the unresolved case. See
+            # upsert_oauth_profile()'s docstring for why every other caller
+            # leaves this at its safe default.
+            allow_legacy_reuse_when_unresolved=True,
         )
     except (profile_repo.ValidationError, profile_repo.ProfileRepositoryError) as exc:
         print(f"Logged in, but could not save the profile: {exc}", file=sys.stderr)

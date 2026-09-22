@@ -695,12 +695,23 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     # apart from a personal Max plan on the same email
                     # address (both return the same account.uuid under a
                     # different organization.uuid) — see
-                    # profiles.find_by_account_and_org(). The changes dict
-                    # below backfills org_uuid/organization_type on a legacy
-                    # match the same "only when non-None" way plan already
-                    # does, so the second return value isn't needed here.
-                    existing, _needs_backfill = profile_repo.find_by_account_and_org(
+                    # profiles.find_by_account_and_org(). A legacy
+                    # (org_uuid=None) match is NOT automatically reused: this
+                    # is the same non-interactive path as `add-account`, so
+                    # resolve_legacy_oauth_match() defaults to creating a
+                    # separate new Profile whenever the existing Profile's
+                    # own identity can't be proven to be this login's
+                    # organization — see that function's docstring for why
+                    # (the 2026-09-22 incident: a Team credential silently
+                    # overwritten by an unrelated personal-plan login that
+                    # merely shared the account_uuid). This is the ONE place
+                    # that decision is made — profiles.py — so it can never
+                    # diverge from upsert_oauth_profile()'s copy.
+                    existing, needs_backfill = profile_repo.find_by_account_and_org(
                         body["account_uuid"], body.get("org_uuid"))
+                    match = profile_repo.resolve_legacy_oauth_match(
+                        existing, needs_backfill, body.get("org_uuid"), body.get("organization_type"))
+                    existing = match.reuse_profile
                 if existing is not None:
                     profile_repo.update_credential(existing.id, credential)
                     changes = {k: v for k, v in {
@@ -1674,8 +1685,77 @@ def _update_check_loop() -> None:
         since_last_check += _UPDATE_IDLE_RECHECK_SECONDS
 
 
+def _backfill_legacy_oauth_organizations() -> None:
+    """Fills org_uuid/organization_type/plan onto oauth Profiles that predate
+    organization becoming part of account identity — from each Profile's OWN
+    stored credential, no login, no user involvement.
+
+    A legacy (org_uuid=None) Profile is a liability: it shows the wrong plan
+    badge (has_claude_max is true on a Team seat as well as a personal Max
+    plan, so it renders as Max — see anthropic_oauth.plan_from_account()) and,
+    until it's identified, other code has to guess what it is. The Profile's
+    own stored token is authoritative about which organization it belongs
+    to, so this asks instead of guessing — profiles.resolve_profile_own_
+    identity() does the actual resolution; see its docstring for the
+    2026-09-22 incident that makes "just trust the account_uuid" unsafe.
+
+    Before writing anything, this checks the resolved account_uuid against
+    the Profile's OWN stored account_uuid. A mismatch means the credential
+    was replaced out from under the record — exactly the kind of silent
+    guess that caused the incident this whole initiative exists to fix — so
+    that Profile is left alone rather than backfilled from an identity that
+    doesn't provably belong to it.
+
+    Touches only org_uuid, organization_type and plan. Never name, never the
+    credential. update_profile() records its own "config" activity entry
+    per write, naming the Profile and its (non-secret) new fields — never
+    the token, which never leaves resolve_profile_own_identity().
+
+    Best-effort and silent, by design: any failure for any one Profile —
+    network, decode, ProfileLookupError, anything — just leaves that
+    Profile to be retried on the next pass. This must never raise, so it
+    can never take the daemon down or delay startup; codex-kind and
+    api-kind Profiles, and oauth Profiles that already have an org_uuid,
+    are skipped with no network call at all."""
+    try:
+        candidates = profile_repo.list_profiles()
+    except Exception:
+        return
+    for profile in candidates:
+        if profile.kind != "oauth" or profile.org_uuid is not None:
+            continue
+        try:
+            resolved = profile_repo.resolve_profile_own_identity(profile)
+            if resolved is None:
+                continue
+            if resolved.account_uuid != profile.account_uuid:
+                continue
+            profile_repo.update_profile(
+                profile.id,
+                org_uuid=resolved.org_uuid,
+                organization_type=resolved.organization_type,
+                plan=anthropic_oauth.plan_from_account(resolved),
+            )
+        except Exception:
+            continue
+
+
+def _backfill_legacy_oauth_organizations_async() -> None:
+    """Runs one backfill pass in the background right after startup.
+
+    _oauth_refresh_loop sleeps before its first iteration, so without this a
+    restarted daemon would show a legacy Profile's wrong plan badge for a
+    full _OAUTH_REFRESH_LOOP_INTERVAL_SECONDS before the loop ever gets to
+    it. Same fire-and-forget pattern as _prime_profile_async: the thread is
+    daemon=True so it can never block the process from exiting, and it
+    starts after the server has already bound its port, so a slow or
+    hanging network call in here can never delay that bind."""
+    threading.Thread(target=_backfill_legacy_oauth_organizations, daemon=True).start()
+
+
 def _oauth_refresh_loop() -> None:
-    """Keeps OAuth Profiles' access tokens fresh independently of traffic.
+    """Keeps OAuth Profiles' access tokens fresh independently of traffic,
+    and piggybacks the legacy-organization backfill on the same timer.
 
     The Dashboard's poll only runs while someone has it open, and the
     proxy's per-request refresh only touches the Profile choose() just
@@ -1683,12 +1763,21 @@ def _oauth_refresh_loop() -> None:
     unrefreshed and land on AUTH_INVALID, with no way back except a manual
     re-auth, since choose() never picks an AUTH_INVALID Profile again.
 
+    The backfill pass runs right after runtime_snapshot() on purpose:
+    tokens are freshest at that moment, and reading them here — read-only,
+    never refreshing — cannot race the Gateway's own refresh of the same
+    credential.
+
     Runs for the life of the daemon process. Every call is best-effort, so
     a transient network failure can never crash the daemon."""
     while True:
         time.sleep(_OAUTH_REFRESH_LOOP_INTERVAL_SECONDS)
         try:
             _gateway.runtime_snapshot()
+        except Exception:
+            pass
+        try:
+            _backfill_legacy_oauth_organizations()
         except Exception:
             pass
 
@@ -1732,6 +1821,7 @@ def run_foreground(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> None:
         pass
     threading.Thread(target=_oauth_refresh_loop, daemon=True).start()
     threading.Thread(target=_update_check_loop, daemon=True).start()
+    _backfill_legacy_oauth_organizations_async()
     print(f"CSRF token for this run (Dashboard needs it, never logged again): {_CSRF_TOKEN}")
     # Written on every start on every OS. Harmless where the installer
     # backend gets a pid another way (launchctl, systemctl), and the only

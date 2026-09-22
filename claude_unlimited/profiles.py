@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import re
 import secrets
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Optional
 
-from . import activity, connectors, oauth_credential, secret_store
+# anthropic_oauth imports nothing from this package (stdlib only), so this
+# has no circular-import risk. Needed here for resolve_profile_own_identity()
+# — see its docstring for why this module, not the gateway, is what verifies
+# a Profile's own organization before a login is allowed to touch it.
+from . import activity, anthropic_oauth, connectors, oauth_credential, secret_store
 from . import config as config_module
 from .config import CONFIG_LOCK, Pool, Profile, load_pool, save_pool
 
@@ -209,6 +213,141 @@ def find_by_account_and_org(account_uuid: str, org_uuid: Optional[str],
     return None, False
 
 
+def resolve_profile_own_identity(profile: Profile) -> Optional[anthropic_oauth.AccountProfile]:
+    """Resolves a Profile's own identity from ITS OWN stored credential —
+    never from whatever a NEXT login happens to report.
+
+    2026-09-22 incident this exists to prevent: a legacy (org_uuid=None)
+    Profile was matched on account_uuid alone, and the NEXT login's
+    organization was trusted to decide what that pre-existing Profile was.
+    One Anthropic account_uuid can hold more than one differently-organized
+    subscription (a Team seat and a personal Max plan), so that trust was
+    misplaced — it let a Team credential get silently overwritten by an
+    unrelated personal-plan login that merely shared the account_uuid. The
+    fix is to ask the Profile's OWN credential what it is, instead.
+
+    Contract callers may rely on:
+      - NEVER raises. Every failure — no stored token, a decode error,
+        ProfileLookupError, a network error, anything at all — returns None.
+        Fold every exception in, don't special-case any of them: a caller
+        deciding whether to touch someone's credential must never be taken
+        down by an unrelated exception type it didn't anticipate.
+      - NEVER refreshes the token. Uses the stored CURRENT access token
+        only, exactly as oauth_credential.decode() returns it. The daemon's
+        Gateway owns refresh (gateway.py); a second refresher here would
+        race it on refresh-token rotation and could invalidate the Profile
+        entirely — a read-only identity check must never risk that.
+      - NEVER logs or prints the token — it is held in a local variable and
+        passed straight to fetch_account_profile()'s Authorization header.
+
+    A later ticket reuses this for a daemon-side backfill of legacy
+    Profiles; kept here (not private) so that caller can import it too.
+    """
+    try:
+        raw = secret_store.get_token(profile.id)
+    except Exception:
+        return None
+    try:
+        access_token = oauth_credential.decode(raw).access_token
+    except Exception:
+        return None
+    if not access_token:
+        return None
+    try:
+        return anthropic_oauth.fetch_account_profile(access_token)
+    except Exception:
+        return None
+
+
+@dataclass(frozen=True)
+class LegacyOAuthMatchResult:
+    """What to do with a legacy (org_uuid=None) match from
+    find_by_account_and_org(), decided from the EXISTING Profile's own
+    stored credential rather than the incoming login — see
+    resolve_legacy_oauth_match().
+
+    `reuse_profile` is the Profile the caller should update in place
+    (credential + org fields), or None when the caller must instead CREATE a
+    new Profile for the incoming login and leave the existing one alone.
+
+    `displaced_*` are set only when `reuse_profile` is None because the
+    existing Profile's own identity was successfully resolved and turned out
+    to be a DIFFERENT organization (never set on "couldn't resolve") — they
+    carry what the existing Profile's own credential proved it really is
+    (its own true org_uuid/org_name/organization_type), so a caller like
+    cli.add_account() can tell the user what happened without a second
+    lookup.
+    """
+    reuse_profile: Optional[Profile]
+    displaced_profile: Optional[Profile] = None
+    displaced_org_uuid: Optional[str] = None
+    displaced_org_name: Optional[str] = None
+    displaced_organization_type: Optional[str] = None
+
+
+def resolve_legacy_oauth_match(existing: Optional[Profile], needs_backfill: bool,
+                                org_uuid: Optional[str], organization_type: Optional[str],
+                                *, allow_reuse_when_unresolved: bool = False) -> LegacyOAuthMatchResult:
+    """The ONE place that decides what a legacy match from
+    find_by_account_and_org() means. Shared by upsert_oauth_profile() and
+    daemon.py's POST /api/profiles handler so this rule can never diverge
+    between them — this codebase already had three separately-drifting
+    copies of account dedup once (see find_by_account_and_org()'s docstring
+    and this ticket's history); a login/credential rule is exactly the kind
+    of logic that must live in one place.
+
+    `existing`/`needs_backfill` are exactly what find_by_account_and_org()
+    returned. When `needs_backfill` is False (no match, or an exact-pair
+    match already reuses correctly on its own), `existing` is returned
+    unchanged — there is nothing ambiguous here to resolve.
+
+    When `needs_backfill` is True, this resolves `existing`'s own identity
+    from ITS OWN stored credential (resolve_profile_own_identity() — never
+    the incoming login, never a refresh) and decides:
+      - resolves to the SAME org_uuid as the incoming login -> `existing`
+        really is this account under this organization; returned unchanged
+        so the caller reuses it (and backfills org_uuid/organization_type
+        from the incoming login, same as it always did).
+      - resolves to a DIFFERENT org_uuid -> `existing` is a different,
+        already-identified subscription — the 2026-09-22 incident: a legacy
+        Team Profile's credential silently overwritten by a personal-plan
+        login that merely shared its account_uuid. `existing` is backfilled
+        HERE with ITS OWN true org fields (never the incoming login's) —
+        credential and name untouched — so it stops looking "legacy" the
+        next time its real account re-authenticates, and this returns
+        reuse_profile=None so the caller creates a SEPARATE new Profile for
+        the incoming login instead of touching this one.
+      - cannot be resolved at all (no stored token, decode error, network
+        error, anything) -> the safe default is None (create a new Profile
+        rather than guess which subscription `existing` really is) UNLESS
+        `allow_reuse_when_unresolved` is True. Only cli.reauth() passes that
+        opt-in, and only after ITS OWN interactive confirmation — reauth
+        already knows exactly which Profile the user picked to re-auth, and
+        owns getting the user's explicit go-ahead itself; every other caller
+        keeps the safe default.
+    """
+    if not needs_backfill or existing is None:
+        return LegacyOAuthMatchResult(reuse_profile=existing)
+
+    resolved = resolve_profile_own_identity(existing)
+    if resolved is not None:
+        if resolved.org_uuid == org_uuid:
+            return LegacyOAuthMatchResult(reuse_profile=existing)
+        # A different, already-identified subscription: record ITS OWN true
+        # org fields — never the incoming login's — leaving credential and
+        # name untouched, then signal "create new" for the incoming login.
+        update_profile(existing.id, org_uuid=resolved.org_uuid, organization_type=resolved.organization_type)
+        return LegacyOAuthMatchResult(
+            reuse_profile=None,
+            displaced_profile=existing,
+            displaced_org_uuid=resolved.org_uuid,
+            displaced_org_name=resolved.org_name,
+            displaced_organization_type=resolved.organization_type,
+        )
+
+    return LegacyOAuthMatchResult(reuse_profile=existing if allow_reuse_when_unresolved else None)
+
+
 def update_credential(profile_id: str, credential: str, *, refresh_token: Optional[str] = None,
                        expires_at: Optional[int] = None) -> None:
     if not credential or len(credential.strip()) < 8:
@@ -383,7 +522,8 @@ def create_profile(
 def upsert_oauth_profile(*, name: str, account_uuid: str, credential: str, plan: Optional[str] = None,
                           org_uuid: Optional[str] = None, organization_type: Optional[str] = None,
                           refresh_token: Optional[str] = None, expires_at: Optional[int] = None,
-                          claude_config_dir: Optional[str] = None) -> tuple[Profile, bool]:
+                          claude_config_dir: Optional[str] = None,
+                          allow_legacy_reuse_when_unresolved: bool = False) -> tuple[Profile, bool]:
     """The single dedup-and-upsert path every OAuth-adding flow shares (CLI
     `add-account`, `reauth`, "Import current login"): create a new Profile
     for this (account_uuid, org_uuid) pair, or, if one is already
@@ -393,12 +533,32 @@ def upsert_oauth_profile(*, name: str, account_uuid: str, credential: str, plan:
     Dedups on the PAIR (account_uuid, org_uuid), not on account_uuid alone —
     see find_by_account_and_org() for why account_uuid alone is not a unique
     identity. A Profile registered before org_uuid existed (org_uuid=None) is
-    matched on account_uuid alone and gets org_uuid/organization_type
-    backfilled here rather than duplicated.
+    a LEGACY match: rather than trusting this login's org_uuid to decide what
+    that pre-existing Profile is (the 2026-09-22 incident — see
+    resolve_legacy_oauth_match()), it is resolved from its OWN stored
+    credential first. Only a Profile that is PROVEN to be this same
+    organization gets its org_uuid/organization_type backfilled and its
+    credential refreshed; anything else (a different organization, or a
+    Profile whose own credential can't be resolved) gets a separate new
+    Profile instead, leaving the existing one's credential and name
+    untouched.
+
+    `allow_legacy_reuse_when_unresolved` is the ONE escape hatch from that
+    "can't resolve -> create new" default: it lets a legacy Profile whose own
+    credential could not be resolved be reused anyway. Defaults to False so
+    no existing caller can reach it by accident — only cli.reauth() passes
+    True, and only after its own interactive confirmation naming the
+    organization about to be recorded.
 
     Returns (profile, reused). reused=True means an existing Profile was
-    refreshed in place, not that anything new was added."""
-    existing, _needs_backfill = find_by_account_and_org(account_uuid, org_uuid)
+    refreshed in place, not that anything new was added — this is always
+    False when a new Profile was created, including on the legacy-mismatch
+    path above."""
+    existing, needs_backfill = find_by_account_and_org(account_uuid, org_uuid)
+    match = resolve_legacy_oauth_match(
+        existing, needs_backfill, org_uuid, organization_type,
+        allow_reuse_when_unresolved=allow_legacy_reuse_when_unresolved)
+    existing = match.reuse_profile
     if existing is not None:
         update_credential(existing.id, credential, refresh_token=refresh_token, expires_at=expires_at)
         changes = {k: v for k, v in {

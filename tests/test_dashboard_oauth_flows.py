@@ -175,9 +175,11 @@ def test_post_profile_oauth_same_account_different_org_creates_second_profile(ru
     assert status2 == 201  # created, not reused — did NOT overwrite the first
     assert body2["profile"]["id"] != body1["profile"]["id"]
 
-    # The public wire dict is a deliberate allowlist that doesn't carry
-    # org_uuid/organization_type yet (that's the Team-badge display work,
-    # out of scope here) — so persistence is checked directly.
+    # The public wire dict IS a deliberate allowlist (_profile_to_public_dict
+    # in daemon.py), but org_uuid/organization_type are both on it — checked
+    # directly below, then persistence is checked too for good measure.
+    assert body2["profile"]["org_uuid"] == "org-personal-max"
+    assert body2["profile"]["organization_type"] == "claude_max"
     profiles = profile_repo.list_profiles()
     assert len(profiles) == 2  # neither Profile overwrote the other
     orgs = {p.org_uuid for p in profiles}
