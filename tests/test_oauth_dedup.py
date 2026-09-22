@@ -38,6 +38,33 @@ def env(monkeypatch, tmp_path):
     return store
 
 
+def _fetch_by_token(mapping):
+    """A fetch_account_profile fake keyed by access token — needed wherever a
+    test re-calls upsert_oauth_profile for an account_uuid that already
+    matches without supplying org_uuid: since Finding 1
+    (profiles.find_by_account_and_org()'s org_uuid=None fallback used to
+    return needs_org_backfill=False unconditionally, bypassing
+    resolve_legacy_oauth_match() entirely), such a call now resolves the
+    incoming credential's own organization before deciding, rather than
+    deciding on an unproven account_uuid-only match."""
+    def fake(access_token, timeout=15.0):
+        try:
+            return mapping[access_token]
+        except KeyError:
+            raise anthropic_oauth.ProfileLookupError(f"no fixture for token {access_token!r}")
+    return fake
+
+
+def _account(**overrides):
+    base = dict(
+        account_uuid="uuid-1", email="dev@example.com", display_name="Dev",
+        org_uuid="org-1", org_name="Acme", organization_type="claude_max",
+        has_claude_max=True, has_claude_pro=False,
+    )
+    base.update(overrides)
+    return anthropic_oauth.AccountProfile(**base)
+
+
 def test_upsert_oauth_profile_creates_when_no_existing_account(env):
     profile, reused = profile_repo.upsert_oauth_profile(
         name="X", account_uuid="uuid-1", credential="tok-original-long", plan="pro",
@@ -52,9 +79,20 @@ def test_upsert_oauth_profile_creates_when_no_existing_account(env):
     assert stored.refresh_token == "ref-1"
 
 
-def test_upsert_oauth_profile_refreshes_credential_and_plan_when_account_exists(env):
+def test_upsert_oauth_profile_refreshes_credential_and_plan_when_account_exists(env, monkeypatch):
     first, _ = profile_repo.upsert_oauth_profile(
         name="X", account_uuid="uuid-1", credential="tok-1-long", plan="pro")
+
+    # Neither call supplies org_uuid, and the second now finds a legacy
+    # (org_uuid=None) match for "uuid-1" — Finding 1 means that no longer
+    # reuses blind: it resolves each credential's own organization first.
+    # Both resolve to the SAME real organization here, so this is a
+    # genuinely safe reuse, proven rather than assumed from account_uuid
+    # alone.
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", _fetch_by_token({
+        "tok-1-long": _account(),
+        "tok-2-long": _account(),
+    }))
 
     second, reused = profile_repo.upsert_oauth_profile(
         name="X (renamed on reimport)", account_uuid="uuid-1", credential="tok-2-long", plan="max",
@@ -73,8 +111,14 @@ def test_upsert_oauth_profile_refreshes_credential_and_plan_when_account_exists(
     assert len(profiles) == 1  # never duplicated
 
 
-def test_upsert_oauth_profile_keeps_existing_plan_when_none_given(env):
+def test_upsert_oauth_profile_keeps_existing_plan_when_none_given(env, monkeypatch):
     first, _ = profile_repo.upsert_oauth_profile(name="X", account_uuid="uuid-1", credential="tok-1-long", plan="pro")
+    # See test_upsert_oauth_profile_refreshes_credential_and_plan_when_account_exists
+    # for why this now needs both credentials to resolve to the same org.
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", _fetch_by_token({
+        "tok-1-long": _account(),
+        "tok-2-long": _account(),
+    }))
     second, reused = profile_repo.upsert_oauth_profile(name="X", account_uuid="uuid-1", credential="tok-2-long", plan=None)
     assert reused is True
     assert second.plan == "pro"  # untouched when the caller has nothing new to say
@@ -131,10 +175,20 @@ def test_upsert_oauth_profile_same_account_different_org_creates_second_profile(
     assert {p.account_uuid for p in profiles} == {"uuid-1"}
 
 
-def test_upsert_oauth_profile_keeps_existing_org_fields_when_none_given(env):
+def test_upsert_oauth_profile_keeps_existing_org_fields_when_none_given(env, monkeypatch):
     first, _ = profile_repo.upsert_oauth_profile(
         name="X", account_uuid="uuid-1", credential="tok-1-long",
         plan="max", org_uuid="org-a", organization_type="claude_max")
+
+    # The second call passes org_uuid=None too — Finding 1 means that no
+    # longer reuses on account_uuid alone: it resolves the incoming
+    # credential's own organization first. Mocked to resolve to the SAME
+    # org the first Profile already has, so the reuse is genuinely safe and
+    # the org fields end up unchanged either way — proven now, rather than
+    # merely left untouched because the caller said nothing.
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", _fetch_by_token({
+        "tok-2-long": _account(org_uuid="org-a", organization_type="claude_max"),
+    }))
 
     second, reused = profile_repo.upsert_oauth_profile(
         name="X", account_uuid="uuid-1", credential="tok-2-long",
@@ -229,16 +283,24 @@ def test_find_by_account_and_org_exact_match_wins_over_legacy_candidate(env):
     assert found.id != legacy.id
 
 
-def test_find_by_account_and_org_none_org_argument_falls_back_to_single_key(env):
+def test_find_by_account_and_org_none_org_argument_still_finds_a_candidate(env):
     # A caller with no organization info (e.g. a bundle written before
-    # org_uuid existed) must still find the existing Profile rather than
-    # being refused a match just because it can't supply an org.
+    # org_uuid existed, or one that tried to resolve it and failed) must
+    # still find the existing Profile rather than being refused a match
+    # just because it can't supply an org — but needs_org_backfill is now
+    # True, not False (Finding 1: this used to come back False
+    # unconditionally here, so resolve_legacy_oauth_match() short-circuited
+    # and the caller reused/overwrote the match with no check at all — the
+    # 2026-09-22 incident from the incoming-login side). True routes it
+    # through that decision function instead, which can never actually
+    # reuse on an unknown incoming org — see find_by_account_and_org()'s
+    # docstring for why.
     p = profile_repo.create_profile(name="X", kind="oauth", credential="tok-long-enough",
                                      account_uuid="uuid-1", org_uuid="org-1")
     found, needs_backfill = profile_repo.find_by_account_and_org("uuid-1", None)
     assert found is not None
     assert found.id == p.id
-    assert needs_backfill is False
+    assert needs_backfill is True
 
 
 def test_find_by_account_and_org_no_match_returns_none(env):

@@ -199,37 +199,98 @@ def apply_import(
     """Writes. Call only after `parsed` has been previewed and confirmed.
 
     Never touches Activity: a machine's history is its own, and importing
-    another machine's activity log would be meaningless."""
+    another machine's activity log would be meaningless.
+
+    An oauth item that conflicts with an existing Profile is decided by
+    profiles.resolve_legacy_oauth_match() — the same function daemon.py's
+    POST /api/profiles and profiles.upsert_oauth_profile() use — never by
+    matching on its own here. See that function and
+    profiles.find_by_account_and_org() for what a match means and why an
+    unknown organization (on either side) is never enough on its own to
+    reuse a credential."""
 
     if conflict_strategy not in ("keep_existing", "use_imported"):
         raise ExportImportError(f"Unknown conflict_strategy {conflict_strategy!r}.")
 
-    result = {"profiles_added": 0, "profiles_updated": 0, "profiles_skipped": 0, "settings_applied": False}
+    result = {
+        "profiles_added": 0, "profiles_updated": 0, "profiles_skipped": 0,
+        # Distinct from profiles_skipped (conflict_strategy="keep_existing",
+        # a deliberate no-op): this counts an item the caller DID ask to
+        # apply ("use_imported") that profiles.resolve_legacy_oauth_match()
+        # refused, because the item's organization couldn't be proven to be
+        # the existing Profile's own. Surfaced separately so the caller and
+        # the dashboard can tell "nothing to do here" apart from "something
+        # was held back for safety".
+        "profiles_overwrite_blocked": 0,
+        "settings_applied": False,
+    }
 
     if import_profiles:
-        with CONFIG_LOCK:
-            pool = load_pool()
-            for item in parsed.profiles:
-                # Pair-aware, with the same legacy fallback as every other
-                # dedup implementation (profiles.find_by_account_and_org): a
-                # bundle written before org_uuid existed carries no org_uuid
-                # for any profile, so it legacy-matches on account_uuid alone
-                # against a Profile whose own org_uuid is also still None.
-                # pool.profiles is passed fresh each iteration so an update
-                # made earlier in this same loop is visible to the next item.
-                existing = None
-                item_uuid = item.get("account_uuid")
-                if item_uuid:
-                    existing, _needs_backfill = profile_repo.find_by_account_and_org(
-                        item_uuid, item.get("org_uuid"), profiles=pool.profiles)
-                if existing is not None:
-                    if conflict_strategy == "keep_existing":
-                        result["profiles_skipped"] += 1
-                        continue
-                    # "Use imported version" means the whole Profile, not
-                    # only its credential: every bundle field below is
-                    # applied, not just the stored token.
-                    secret_store.set_token(existing.id, item["credential"])
+        # Each item is looked up, decided and (if applicable) written as its
+        # own transaction, rather than one CONFIG_LOCK spanning the whole
+        # bundle: an oauth item's decision can itself need to write — on a
+        # legacy match that resolves to a DIFFERENT organization,
+        # resolve_legacy_oauth_match() backfills the EXISTING Profile's own
+        # org fields via profiles.update_profile(), which takes CONFIG_LOCK
+        # itself. CONFIG_LOCK is a plain, non-reentrant Lock, so calling
+        # that while already holding it here would deadlock. A fresh
+        # load_pool() per item still sees every earlier item's already-saved
+        # effect, so cross-item matching within one bundle is unaffected.
+        for item in parsed.profiles:
+            item_uuid = item.get("account_uuid")
+            item_org_uuid = item.get("org_uuid")
+            item_organization_type = item.get("organization_type")
+            existing = None
+            needs_backfill = False
+            if item_uuid:
+                existing, needs_backfill = profile_repo.find_by_account_and_org(item_uuid, item_org_uuid)
+
+            if existing is not None and conflict_strategy == "keep_existing":
+                result["profiles_skipped"] += 1
+                continue
+
+            if existing is not None and item.get("kind") == "oauth":
+                # Route through the ONE decision function rather than
+                # trusting find_by_account_and_org()'s match on its own —
+                # this is Finding 2: apply_import() used to call
+                # secret_store.set_token() straight off that match, so a
+                # bundle written before organizations existed could silently
+                # overwrite a different organization's credential exactly
+                # like the 2026-09-22 incident. The bundle carries this
+                # item's own credential, so when its organization is
+                # unknown, resolve it from that credential first — same
+                # "never decide on an unknown org while holding the
+                # credential that would reveal it" rule as daemon.py's POST
+                # /api/profiles.
+                if item_org_uuid is None and item.get("credential"):
+                    resolved_incoming = profile_repo.resolve_identity_from_encoded_credential(item["credential"])
+                    if resolved_incoming is not None:
+                        item_org_uuid = resolved_incoming.org_uuid
+                        item_organization_type = resolved_incoming.organization_type
+                        # Re-look-up now that the org is actually known: an
+                        # exact pair match is unambiguous and reuses without
+                        # ever going through resolve_legacy_oauth_match().
+                        existing, needs_backfill = profile_repo.find_by_account_and_org(item_uuid, item_org_uuid)
+                match = profile_repo.resolve_legacy_oauth_match(
+                    existing, needs_backfill, item_org_uuid, item_organization_type)
+                existing = match.reuse_profile
+                if existing is None:
+                    # Not safe to overwrite. Leave the existing Profile's
+                    # credential and name exactly as they are — do NOT fall
+                    # through to creating a new Profile either: the caller
+                    # asked to update a specific conflicting Profile, not to
+                    # add a new row, so the safest response to "can't prove
+                    # this is safe" is to do nothing at all with this item.
+                    result["profiles_overwrite_blocked"] += 1
+                    continue
+
+            if existing is not None:
+                # "Use imported version" means the whole Profile, not only
+                # its credential: every bundle field below is applied, not
+                # just the stored token.
+                secret_store.set_token(existing.id, item["credential"])
+                with CONFIG_LOCK:
+                    pool = load_pool()
                     updated = replace(
                         existing, name=item["name"], base_url=item.get("base_url"),
                         auth_mode=item.get("auth_mode", "api_key"), priority=item.get("priority", 1),
@@ -237,30 +298,33 @@ def apply_import(
                         automatic=item.get("automatic", True), default_model=item.get("default_model"),
                         monthly_budget_cap=item.get("monthly_budget_cap"), token_threshold=item.get("token_threshold"),
                         tag_color=item.get("tag_color"), plan=item.get("plan"),
-                        org_uuid=item.get("org_uuid"), organization_type=item.get("organization_type"),
+                        org_uuid=item_org_uuid, organization_type=item_organization_type,
                         codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
                     )
                     pool.profiles = [updated if p.id == existing.id else p for p in pool.profiles]
-                    result["profiles_updated"] += 1
-                    continue
+                    save_pool(pool)
+                result["profiles_updated"] += 1
+                continue
 
-                import secrets as _secrets
+            import secrets as _secrets
 
-                new_profile = Profile(
-                    id=_secrets.token_hex(8), name=item["name"], kind=item["kind"], base_url=item.get("base_url"),
-                    auth_mode=item.get("auth_mode", "api_key"), priority=item.get("priority", 1),
-                    switch_threshold=item.get("switch_threshold", 98.0), enabled=item.get("enabled", True),
-                    automatic=item.get("automatic", True), default_model=item.get("default_model"),
-                    monthly_budget_cap=item.get("monthly_budget_cap"), token_threshold=item.get("token_threshold"),
-                    tag_color=item.get("tag_color"),
-                    account_uuid=item.get("account_uuid"), plan=item.get("plan"),
-                    org_uuid=item.get("org_uuid"), organization_type=item.get("organization_type"),
-                    codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
-                )
-                secret_store.set_token(new_profile.id, item["credential"])
+            new_profile = Profile(
+                id=_secrets.token_hex(8), name=item["name"], kind=item["kind"], base_url=item.get("base_url"),
+                auth_mode=item.get("auth_mode", "api_key"), priority=item.get("priority", 1),
+                switch_threshold=item.get("switch_threshold", 98.0), enabled=item.get("enabled", True),
+                automatic=item.get("automatic", True), default_model=item.get("default_model"),
+                monthly_budget_cap=item.get("monthly_budget_cap"), token_threshold=item.get("token_threshold"),
+                tag_color=item.get("tag_color"),
+                account_uuid=item.get("account_uuid"), plan=item.get("plan"),
+                org_uuid=item_org_uuid, organization_type=item_organization_type,
+                codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
+            )
+            secret_store.set_token(new_profile.id, item["credential"])
+            with CONFIG_LOCK:
+                pool = load_pool()
                 pool.profiles.append(new_profile)
-                result["profiles_added"] += 1
-            save_pool(pool)
+                save_pool(pool)
+            result["profiles_added"] += 1
 
     if import_settings and parsed.settings:
         from .config import Settings, validated_settings_changes

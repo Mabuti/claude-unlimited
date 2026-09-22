@@ -1938,7 +1938,16 @@ def reauth(port: int) -> int:
     confirmation — see that function's docstring for why every other caller
     keeps the safe default. upsert_oauth_profile() then does the actual
     pair-aware match-and-save, backfilling org_uuid/organization_type onto a
-    Profile added before this pair became the identity."""
+    Profile added before this pair became the identity.
+
+    A target with account_uuid=None (defensive: create_profile() requires
+    account_uuid for every oauth Profile now, so this should only ever be
+    old on-disk state) skips every check above — there is nothing to
+    compare the fresh login against — and is handled the same way as the
+    "can't resolve" legacy case: name what is about to be recorded and
+    require the same explicit `y`. Addressed by id directly rather than
+    through upsert_oauth_profile()'s account_uuid-based matching, which has
+    no account_uuid to find it by."""
     _banner()
     claude_exe = launch_argv("claude")[0]
     if not shutil.which(claude_exe):
@@ -2017,6 +2026,52 @@ def reauth(port: int) -> int:
     except (anthropic_oauth.CredentialImportError, anthropic_oauth.ProfileLookupError) as exc:
         print(f"Logged in, but could not read/resolve the account: {exc}", file=sys.stderr)
         return 1
+
+    if not target.account_uuid:
+        # Defensive: profiles.create_profile() requires account_uuid for
+        # every oauth Profile, so this should be unreachable from current
+        # code — but on-disk state written before that requirement existed
+        # could still carry account_uuid=None. Every check below starts
+        # with `target.account_uuid and ...` and so skips entirely when
+        # it's None, leaving nothing here to compare the fresh login
+        # against at all. Handle it exactly like the "legacy target whose
+        # own credential can't be resolved" case further down: name what is
+        # about to be recorded and require an explicit y before writing
+        # anything, rather than silently trusting the fresh login the old
+        # code did (the 2026-09-22 incident this whole fix exists for).
+        org_label = account.org_name or "an unnamed organization"
+        org_type = account.organization_type or "unknown type"
+        print(
+            f"\n{target.name} has no account_uuid on record at all, so its identity can't be "
+            f"confirmed. The account you just logged into belongs to {org_label} ({org_type}), "
+            f"and will be recorded on {target.name} if you continue."
+        )
+        try:
+            answer = input("Continue and record this account on this Profile? [y/N]: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled — nothing was written.", file=sys.stderr)
+            return 1
+        if answer != "y":
+            print("Cancelled — nothing was written.", file=sys.stderr)
+            return 1
+
+        # With no account_uuid stored, none of the matching machinery
+        # upsert_oauth_profile() relies on below can find `target` by
+        # account_uuid — it has none. Address it by id directly instead,
+        # the same fields upsert_oauth_profile() would have backfilled.
+        try:
+            profile_repo.update_credential(
+                target.id, imported.access_token,
+                refresh_token=imported.refresh_token, expires_at=imported.expires_at)
+            profile_repo.update_profile(
+                target.id, account_uuid=account.account_uuid, org_uuid=account.org_uuid,
+                organization_type=account.organization_type,
+                plan=anthropic_oauth.plan_from_account(account), claude_config_dir=str(config_dir))
+        except (profile_repo.ValidationError, profile_repo.ProfileRepositoryError) as exc:
+            print(f"Logged in, but could not save the profile: {exc}", file=sys.stderr)
+            return 1
+        print(f"\n{target.name} is re-authenticated — the daemon will pick it back up automatically.")
+        return 0
 
     if target.account_uuid and account.account_uuid != target.account_uuid:
         print(

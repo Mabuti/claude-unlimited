@@ -3,6 +3,7 @@ import json
 import pytest
 
 import claude_unlimited.activity as activity
+import claude_unlimited.anthropic_oauth as anthropic_oauth
 import claude_unlimited.export_import as ei
 import claude_unlimited.profiles as profile_repo
 from claude_unlimited.config import load_pool
@@ -36,6 +37,29 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(activity, "ACTIVITY_FILE", tmp_path / "activity.jsonl")
     monkeypatch.setattr(ei, "activity_module", activity)
     return store
+
+
+def _account(**overrides):
+    base = dict(
+        account_uuid="uuid-shared", email="dev@example.com", display_name="Dev",
+        org_uuid="org-x", org_name="Some Org", organization_type="claude_max",
+        has_claude_max=True, has_claude_pro=False,
+    )
+    base.update(overrides)
+    return anthropic_oauth.AccountProfile(**base)
+
+
+def _fetch_by_token(mapping):
+    """Same shape as test_account_identity_legacy_guard.py's helper: a
+    fetch_account_profile fake keyed by access token, so a test can tell the
+    "existing Profile's own credential" resolution apart from the "incoming
+    bundle item's credential" resolution in one call."""
+    def fake(access_token, timeout=15.0):
+        try:
+            return mapping[access_token]
+        except KeyError:
+            raise anthropic_oauth.ProfileLookupError(f"no fixture for token {access_token!r}")
+    return fake
 
 
 def test_export_profiles_requires_passphrase(env):
@@ -122,9 +146,18 @@ def test_apply_import_keep_existing_skips_conflicting_profile(env):
     assert pool.profiles[0].name == "Existing"
 
 
-def test_apply_import_use_imported_updates_conflicting_credential(env):
+def test_apply_import_use_imported_updates_conflicting_credential(env, monkeypatch):
     existing = profile_repo.create_profile(name="Existing", kind="oauth", credential="original-tok-long",
                                             account_uuid="dup-uuid")
+    # Both the existing Profile's own stored credential and the incoming
+    # bundle item's credential resolve to the SAME organization — a
+    # genuinely safe reuse, not the org_uuid=None-on-both-sides guess the
+    # old code made. See test_apply_import_bundle_without_org_uuid_legacy_
+    # matches_is_now_blocked_when_unresolvable for the unsafe counterpart.
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", _fetch_by_token({
+        "original-tok-long": _account(account_uuid="dup-uuid", org_uuid="org-x"),
+        "imported-tok-long": _account(account_uuid="dup-uuid", org_uuid="org-x"),
+    }))
     bundle_profiles = [{
         "name": "Imported version", "kind": "oauth", "base_url": None, "auth_mode": "api_key",
         "priority": 1, "switch_threshold": 98.0, "enabled": True, "automatic": True,
@@ -134,17 +167,22 @@ def test_apply_import_use_imported_updates_conflicting_credential(env):
     parsed = ei.ParsedBundle(profiles=bundle_profiles, settings=None, activity=None)
     result = ei.apply_import(parsed, import_profiles=True, import_settings=False, conflict_strategy="use_imported")
     assert result["profiles_updated"] == 1
+    assert result["profiles_overwrite_blocked"] == 0
     assert env.get_token(existing.id) == "imported-tok-long"
     pool = load_pool()
     assert len(pool.profiles) == 1  # still no duplicate row
 
 
-def test_apply_import_use_imported_updates_the_whole_profile_not_just_credential(env):
+def test_apply_import_use_imported_updates_the_whole_profile_not_just_credential(env, monkeypatch):
     # "Use imported version" must apply every bundle field (name, priority,
     # threshold, enabled, automatic, tag_color, base_url, default_model,
     # budget cap), not just the stored credential.
     existing = profile_repo.create_profile(name="Existing", kind="oauth", credential="original-tok-long",
                                             account_uuid="dup-uuid", priority=1, switch_threshold=98.0)
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", _fetch_by_token({
+        "original-tok-long": _account(account_uuid="dup-uuid", org_uuid="org-x"),
+        "imported-tok-long": _account(account_uuid="dup-uuid", org_uuid="org-x"),
+    }))
     bundle_profiles = [{
         "name": "Renamed on the other machine", "kind": "oauth", "base_url": None, "auth_mode": "api_key",
         "priority": 3, "switch_threshold": 90.0, "enabled": False, "automatic": False,
@@ -263,13 +301,56 @@ def test_apply_import_bundle_with_org_uuid_different_from_existing_org_adds_seco
     assert {p.org_uuid for p in profiles} == {"org-team", "org-personal-max"}
 
 
-def test_apply_import_bundle_without_org_uuid_legacy_matches(env):
-    # A bundle exported before this fix carries no org_uuid key at all for
-    # any profile — it must still match the existing Profile (also
-    # org_uuid=None) on account_uuid alone, exactly like before.
+def test_apply_import_bundle_without_org_uuid_and_unresolvable_is_blocked_not_overwritten(env, monkeypatch):
+    # Finding 2 regression. Before this fix, a bundle item with no org_uuid
+    # matched an existing org_uuid=None Profile on account_uuid ALONE and
+    # apply_import() called secret_store.set_token() on it directly —
+    # find_by_account_and_org()'s legacy fallback was never routed through
+    # resolve_legacy_oauth_match() at all. That is the 2026-09-22 incident
+    # from the import side: neither side's organization is proven, so
+    # "match on account_uuid alone" is exactly the unsafe guess this whole
+    # fix exists to remove. Both credentials are unresolvable here (network
+    # never mocked to succeed) — the safe default is to leave the existing
+    # Profile alone and report it, never to overwrite it on a guess.
     existing = profile_repo.create_profile(
         name="Existing", kind="oauth", credential="original-tok-long", account_uuid="dup-uuid")
     assert existing.org_uuid is None
+    original_stored = env.get_token(existing.id)
+
+    def boom(access_token, timeout=15.0):
+        raise anthropic_oauth.ProfileLookupError("token no longer valid")
+
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", boom)
+
+    bundle_profiles = [{
+        "name": "Imported version", "kind": "oauth", "base_url": None, "auth_mode": "api_key",
+        "priority": 1, "switch_threshold": 98.0, "enabled": True, "automatic": True,
+        "default_model": None, "monthly_budget_cap": None, "tag_color": None,
+        "account_uuid": "dup-uuid", "credential": "imported-tok-long",
+    }]
+    parsed = ei.ParsedBundle(profiles=bundle_profiles, settings=None, activity=None)
+    result = ei.apply_import(parsed, import_profiles=True, import_settings=False, conflict_strategy="use_imported")
+
+    assert result["profiles_overwrite_blocked"] == 1
+    assert result["profiles_updated"] == 0
+    pool = load_pool()
+    assert len(pool.profiles) == 1  # no duplicate created either
+    assert pool.profiles[0].id == existing.id
+    assert pool.profiles[0].name == "Existing"       # untouched
+    assert env.get_token(existing.id) == original_stored  # byte-for-byte unchanged
+
+
+def test_apply_import_bundle_without_org_uuid_but_resolves_to_same_org_still_updates(env, monkeypatch):
+    # The safe counterpart: no org_uuid key in the bundle, but the incoming
+    # item's OWN credential resolves to the same organization the existing
+    # Profile's own credential resolves to — a genuine match, proven from
+    # both sides' credentials rather than assumed from account_uuid alone.
+    existing = profile_repo.create_profile(
+        name="Existing", kind="oauth", credential="original-tok-long", account_uuid="dup-uuid")
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", _fetch_by_token({
+        "original-tok-long": _account(account_uuid="dup-uuid", org_uuid="org-x"),
+        "imported-tok-long": _account(account_uuid="dup-uuid", org_uuid="org-x"),
+    }))
     bundle_profiles = [{
         "name": "Imported version", "kind": "oauth", "base_url": None, "auth_mode": "api_key",
         "priority": 1, "switch_threshold": 98.0, "enabled": True, "automatic": True,
@@ -279,9 +360,11 @@ def test_apply_import_bundle_without_org_uuid_legacy_matches(env):
     parsed = ei.ParsedBundle(profiles=bundle_profiles, settings=None, activity=None)
     result = ei.apply_import(parsed, import_profiles=True, import_settings=False, conflict_strategy="use_imported")
     assert result["profiles_updated"] == 1
+    assert result["profiles_overwrite_blocked"] == 0
     pool = load_pool()
     assert len(pool.profiles) == 1  # no duplicate
     assert pool.profiles[0].id == existing.id
+    assert env.get_token(existing.id) == "imported-tok-long"
 
 
 def test_org_uuid_and_organization_type_survive_an_export_import_round_trip(env):

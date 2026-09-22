@@ -676,6 +676,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 if body.get("kind") == "oauth" and not body.get("account_uuid"):
                     # Resolve the account uuid from Anthropic directly
                     # rather than asking for a value nobody can look up.
+                    # account_uuid is required to even create an oauth
+                    # Profile (profiles.create_profile()), so a failure here
+                    # is fatal — there is nothing safe to fall back to.
                     try:
                         account = anthropic_oauth.fetch_account_profile(credential)
                     except anthropic_oauth.ProfileLookupError as exc:
@@ -709,6 +712,32 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     # diverge from upsert_oauth_profile()'s copy.
                     existing, needs_backfill = profile_repo.find_by_account_and_org(
                         body["account_uuid"], body.get("org_uuid"))
+                    if existing is not None and needs_backfill and not body.get("org_uuid"):
+                        # account_uuid was supplied directly (e.g. a pasted
+                        # token) and something here already needs the org
+                        # resolved to decide safely — never let the decision
+                        # below run on an unknown org while this credential
+                        # is sitting right here unresolved (that gap is what
+                        # let an unknown incoming org bypass the whole guard
+                        # — see find_by_account_and_org()'s docstring). No
+                        # match at all would create a new Profile regardless
+                        # of the org, so this is skipped then — no resolution
+                        # call it doesn't need. account_uuid is already
+                        # known, so unlike the branch above, a failed
+                        # resolution here is NOT fatal: org_uuid is simply
+                        # left unset, and resolve_legacy_oauth_match() already
+                        # treats a still-unknown incoming org as unsafe to
+                        # reuse rather than this endpoint having to decide it.
+                        try:
+                            account = anthropic_oauth.fetch_account_profile(credential)
+                        except anthropic_oauth.ProfileLookupError:
+                            pass
+                        else:
+                            body.setdefault("plan", anthropic_oauth.plan_from_account(account))
+                            body["org_uuid"] = account.org_uuid
+                            body["organization_type"] = account.organization_type
+                            existing, needs_backfill = profile_repo.find_by_account_and_org(
+                                body["account_uuid"], body["org_uuid"])
                     match = profile_repo.resolve_legacy_oauth_match(
                         existing, needs_backfill, body.get("org_uuid"), body.get("organization_type"))
                     existing = match.reuse_profile

@@ -186,11 +186,25 @@ def find_by_account_and_org(account_uuid: str, org_uuid: Optional[str],
     pool never decides the outcome.
 
     If the `org_uuid` ARGUMENT is None (the caller has no organization
-    information for this login — e.g. a bundle or a caller that never
-    resolved one), this falls back to matching on account_uuid alone, the
-    same single-key behaviour as find_by_account_uuid(), rather than
-    refusing to match: a caller that cannot supply an org must never be made
-    to create a duplicate just because it doesn't know the org.
+    information for this login — e.g. a bundle written before org_uuid
+    existed, or a caller that could not resolve one even after trying),
+    this still returns a same-account_uuid candidate rather than refusing to
+    match — a caller that cannot supply an org must never be made to create
+    a duplicate just because it doesn't know the org — but with
+    needs_org_backfill=True, exactly like a legacy (org_uuid=None) match.
+    That is NOT a promise the candidate is safe to reuse: it only routes the
+    decision to resolve_legacy_oauth_match(), which resolves the candidate's
+    OWN stored credential and compares it against this incoming org_uuid.
+    Since None never equals a real resolved org_uuid, that comparison can
+    only ever come out "different" or "unresolved" — both of which already
+    mean "create a new Profile, don't touch this one" — so an unknown
+    incoming organization can never silently reuse an existing credential.
+    This closes the same hole from the other side as the legacy-match case
+    above: there it was the STORED Profile whose organization was unproven;
+    here it's the INCOMING login's. Before this, an unknown org_uuid
+    returned needs_org_backfill=False and the caller overwrote the match
+    with no check at all — the 2026-09-22 incident, reachable whenever a
+    caller held a credential but never resolved its organization.
 
     `profiles` lets a caller that already holds an in-progress, unsaved Pool
     snapshot (export_import.apply_import(), which mutates a local `pool`
@@ -203,7 +217,14 @@ def find_by_account_and_org(account_uuid: str, org_uuid: Optional[str],
     if not matching_uuid:
         return None, False
     if org_uuid is None:
-        return matching_uuid[0], False
+        # Unknown incoming org: prefer an existing legacy (org_uuid=None)
+        # candidate — it's the one resolve_legacy_oauth_match() actually has
+        # a stored credential to resolve and compare — falling back to the
+        # first match if none is legacy. Either way needs_org_backfill=True
+        # routes this through the decision function; see the docstring above
+        # for why the outcome is always "don't reuse blind" from here.
+        legacy = next((p for p in matching_uuid if p.org_uuid is None), None)
+        return (legacy if legacy is not None else matching_uuid[0]), True
     for p in matching_uuid:
         if p.org_uuid == org_uuid:
             return p, False
@@ -247,8 +268,21 @@ def resolve_profile_own_identity(profile: Profile) -> Optional[anthropic_oauth.A
         raw = secret_store.get_token(profile.id)
     except Exception:
         return None
+    return resolve_identity_from_encoded_credential(raw)
+
+
+def resolve_identity_from_encoded_credential(encoded_credential: str) -> Optional[anthropic_oauth.AccountProfile]:
+    """The decode-then-fetch half of resolve_profile_own_identity(), split
+    out so a caller holding an ALREADY-ENCODED oauth credential blob that
+    isn't (yet, or ever) a stored Profile's own — export_import.py's bundle
+    items, which carry each Profile's exported secret_store blob directly —
+    can resolve it the same way, instead of a second decode-then-fetch copy
+    drifting from this one.
+
+    Same never-raise, never-refresh, never-logs contract as
+    resolve_profile_own_identity(); see that function's docstring."""
     try:
-        access_token = oauth_credential.decode(raw).access_token
+        access_token = oauth_credential.decode(encoded_credential).access_token
     except Exception:
         return None
     if not access_token:
@@ -325,6 +359,16 @@ def resolve_legacy_oauth_match(existing: Optional[Profile], needs_backfill: bool
         already knows exactly which Profile the user picked to re-auth, and
         owns getting the user's explicit go-ahead itself; every other caller
         keeps the safe default.
+
+    `org_uuid` being None here means the INCOMING login's organization is
+    unknown — a caller should have already tried to resolve it from the
+    incoming credential (find_by_account_and_org()'s docstring) before
+    reaching this function, but whether that attempt was made, failed, or
+    was never possible, None is None: `resolved.org_uuid == org_uuid` can
+    never be true for a real resolved org_uuid, so this always falls into
+    the "different" or "unresolved" branch above and never reuses — the
+    hole this closes from the incoming side, symmetric with the stored-side
+    hole this function already closed.
     """
     if not needs_backfill or existing is None:
         return LegacyOAuthMatchResult(reuse_profile=existing)
@@ -553,8 +597,31 @@ def upsert_oauth_profile(*, name: str, account_uuid: str, credential: str, plan:
     Returns (profile, reused). reused=True means an existing Profile was
     refreshed in place, not that anything new was added — this is always
     False when a new Profile was created, including on the legacy-mismatch
-    path above."""
+    path above.
+
+    When `org_uuid` is not supplied (every real caller resolves it from the
+    account before calling this, so today that only happens when a caller
+    doesn't), and doing so turns up something that actually needs it — an
+    account_uuid match with an unproven org — this resolves it from
+    `credential` itself before deciding, rather than deciding on None: this
+    function is, definitionally, about to store that credential, so it is
+    exactly the caller find_by_account_and_org()'s docstring says must never
+    decide on an unknown incoming org while holding the credential that
+    would reveal it. Skipped entirely when there is no match to decide about
+    at all (a fresh account_uuid creates a new Profile regardless), and
+    best-effort when it does run: on failure org_uuid simply stays None, and
+    resolve_legacy_oauth_match() already treats that as unsafe to reuse."""
     existing, needs_backfill = find_by_account_and_org(account_uuid, org_uuid)
+    if existing is not None and needs_backfill and org_uuid is None:
+        try:
+            resolved_incoming = anthropic_oauth.fetch_account_profile(credential)
+        except anthropic_oauth.ProfileLookupError:
+            resolved_incoming = None
+        if resolved_incoming is not None:
+            org_uuid = resolved_incoming.org_uuid
+            if organization_type is None:
+                organization_type = resolved_incoming.organization_type
+            existing, needs_backfill = find_by_account_and_org(account_uuid, org_uuid)
     match = resolve_legacy_oauth_match(
         existing, needs_backfill, org_uuid, organization_type,
         allow_reuse_when_unresolved=allow_legacy_reuse_when_unresolved)
@@ -602,7 +669,14 @@ def update_profile(profile_id: str, **changes) -> Profile:
     allowed = {
         "name", "priority", "switch_threshold", "enabled", "automatic",
         "default_model", "monthly_budget_cap", "token_threshold", "tag_color", "base_url", "auth_mode", "plan",
-        "org_uuid", "organization_type",
+        # account_uuid alongside org_uuid/organization_type: needed so
+        # cli.reauth() can backfill identity onto a target Profile whose
+        # account_uuid is None (old on-disk state predating create_profile()
+        # requiring it for oauth Profiles) — there is no account_uuid to
+        # match that Profile by, so it must be addressed by id instead. Not
+        # otherwise used: every normal oauth Profile gets account_uuid once,
+        # at create_profile() time, and never changes it again.
+        "account_uuid", "org_uuid", "organization_type",
         "claude_config_dir", "codex_home", "codex_model", "codex_reasoning_effort",
     }
     unknown = set(changes) - allowed

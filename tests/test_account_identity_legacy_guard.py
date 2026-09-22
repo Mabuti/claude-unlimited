@@ -241,6 +241,76 @@ def test_legacy_cannot_be_resolved_creates_new_profile_and_leaves_existing_untou
 
 
 # ---------------------------------------------------------------------------
+# Finding 1: an unknown INCOMING organization used to bypass the guard
+# entirely. find_by_account_and_org() returned needs_org_backfill=False
+# whenever the incoming org_uuid argument was None — regardless of whether
+# the matching Profile's own org_uuid was already known — so
+# resolve_legacy_oauth_match() short-circuited and the caller overwrote the
+# match with no check at all.
+# ---------------------------------------------------------------------------
+
+def test_incoming_org_unknown_and_unresolvable_never_overwrites_existing_match(env, monkeypatch):
+    # This is the bug the fix closes, read literally: an existing Profile
+    # for an account, and an incoming credential for the SAME account_uuid
+    # whose organization is unknown and cannot be resolved. Before the fix,
+    # find_by_account_and_org(account_uuid, None) returned (existing, False)
+    # unconditionally, resolve_legacy_oauth_match() short-circuited on
+    # needs_backfill=False, and upsert_oauth_profile() called
+    # update_credential() on `existing` with no check at all — even though
+    # `existing` already had a KNOWN, different-looking identity of its own.
+    existing = profile_repo.create_profile(
+        name="Existing", kind="oauth", credential="existing-token-long",
+        account_uuid="uuid-shared", org_uuid="org-known", organization_type="claude_max")
+    original_stored = env.get_token(existing.id)
+
+    def boom(access_token, timeout=15.0):
+        raise anthropic_oauth.ProfileLookupError("cannot resolve")
+
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", boom)
+
+    new_profile, reused = profile_repo.upsert_oauth_profile(
+        name="Incoming", account_uuid="uuid-shared", credential="incoming-token-long",
+        org_uuid=None, organization_type=None)
+
+    assert reused is False
+    assert new_profile.id != existing.id
+    profiles = profile_repo.list_profiles()
+    assert len(profiles) == 2
+
+    reloaded_existing = next(p for p in profiles if p.id == existing.id)
+    assert env.get_token(existing.id) == original_stored  # byte-for-byte unchanged
+    assert reloaded_existing.name == "Existing"
+    assert reloaded_existing.org_uuid == "org-known"       # untouched
+
+
+def test_exact_pair_match_reuses_without_any_resolution_call(env, monkeypatch):
+    # The genuine fast path must stay fast: when the incoming organization
+    # IS known and equals a Profile's stored org_uuid, that is unambiguous
+    # and must reuse without ever calling fetch_account_profile.
+    existing = profile_repo.create_profile(
+        name="Existing", kind="oauth", credential="existing-token-long",
+        account_uuid="uuid-1", org_uuid="org-1", organization_type="claude_max")
+
+    calls = []
+
+    def spy(access_token, timeout=15.0):
+        calls.append(access_token)
+        raise anthropic_oauth.ProfileLookupError("must not be called for an exact pair match")
+
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", spy)
+
+    updated, reused = profile_repo.upsert_oauth_profile(
+        name="Existing", account_uuid="uuid-1", credential="fresh-token-long",
+        org_uuid="org-1", organization_type="claude_max")
+
+    assert calls == []  # no resolution call made
+    assert reused is True
+    assert updated.id == existing.id
+    stored = oauth_credential.decode(env.get_token(existing.id))
+    assert stored.access_token == "fresh-token-long"
+
+
+# ---------------------------------------------------------------------------
 # POST /api/profiles — same invariant through the real daemon handler.
 # ---------------------------------------------------------------------------
 
@@ -320,6 +390,89 @@ def test_post_profiles_legacy_cannot_resolve_creates_new_non_interactively(env, 
     reloaded_legacy = next(p for p in profiles if p.id == legacy.id)
     assert env.get_token(legacy.id) == original_stored  # untouched
     assert reloaded_legacy.org_uuid is None
+
+
+# ---------------------------------------------------------------------------
+# POST /api/profiles — the reachable Finding-1 path: account_uuid supplied
+# explicitly in the body (the paste-a-token path), org_uuid omitted. Before
+# the fix, daemon.py only resolved the account when account_uuid was
+# MISSING, so this branch reached find_by_account_and_org() with org_uuid=
+# None and the same bypass as the direct upsert_oauth_profile() case above.
+# ---------------------------------------------------------------------------
+
+def test_post_profiles_account_uuid_supplied_no_org_and_unresolvable_creates_new(env, running_server, monkeypatch):
+    base, token = running_server
+    existing = profile_repo.create_profile(
+        name="Existing", kind="oauth", credential="existing-token-long",
+        account_uuid="uuid-shared", org_uuid="org-known", organization_type="claude_max")
+    original_stored = env.get_token(existing.id)
+
+    def boom(access_token, timeout=15.0):
+        raise anthropic_oauth.ProfileLookupError("cannot resolve")
+
+    monkeypatch.setattr(daemon.anthropic_oauth, "fetch_account_profile", boom)
+
+    status, body = _post(f"{base}/api/profiles", {
+        "name": "Incoming", "kind": "oauth", "account_uuid": "uuid-shared",
+        "credential": "incoming-token-long",
+    }, token)
+    assert status == 201  # created, not reused
+    assert body["profile"]["id"] != existing.id
+
+    profiles = profile_repo.list_profiles()
+    assert len(profiles) == 2
+    reloaded_existing = next(p for p in profiles if p.id == existing.id)
+    assert env.get_token(existing.id) == original_stored  # byte-for-byte unchanged
+    assert reloaded_existing.org_uuid == "org-known"       # untouched
+
+
+def test_post_profiles_account_uuid_supplied_no_org_resolves_and_reuses_exact_match(env, running_server, monkeypatch):
+    base, token = running_server
+    existing = profile_repo.create_profile(
+        name="Existing", kind="oauth", credential="existing-token-long",
+        account_uuid="uuid-shared", org_uuid="org-known", organization_type="claude_max")
+
+    monkeypatch.setattr(daemon.anthropic_oauth, "fetch_account_profile", _fetch_by_token({
+        "incoming-token-long": _account(account_uuid="uuid-shared", org_uuid="org-known",
+                                         organization_type="claude_max"),
+    }))
+
+    status, body = _post(f"{base}/api/profiles", {
+        "name": "Incoming", "kind": "oauth", "account_uuid": "uuid-shared",
+        "credential": "incoming-token-long",
+    }, token)
+    assert status == 200
+    assert body["reused_existing"] is True
+    assert body["profile"]["id"] == existing.id
+    assert len(profile_repo.list_profiles()) == 1
+    stored = oauth_credential.decode(env.get_token(existing.id))
+    assert stored.access_token == "incoming-token-long"
+
+
+def test_post_profiles_account_uuid_supplied_no_org_resolves_to_different_org_creates_new(env, running_server, monkeypatch):
+    base, token = running_server
+    existing = profile_repo.create_profile(
+        name="Existing", kind="oauth", credential="existing-token-long",
+        account_uuid="uuid-shared", org_uuid="org-team", organization_type="claude_team")
+    original_stored = env.get_token(existing.id)
+
+    monkeypatch.setattr(daemon.anthropic_oauth, "fetch_account_profile", _fetch_by_token({
+        "incoming-token-long": _account(account_uuid="uuid-shared", org_uuid="org-personal-max",
+                                         organization_type="claude_max"),
+    }))
+
+    status, body = _post(f"{base}/api/profiles", {
+        "name": "Incoming", "kind": "oauth", "account_uuid": "uuid-shared",
+        "credential": "incoming-token-long",
+    }, token)
+    assert status == 201
+    assert body["profile"]["id"] != existing.id
+
+    profiles = profile_repo.list_profiles()
+    assert len(profiles) == 2
+    reloaded_existing = next(p for p in profiles if p.id == existing.id)
+    assert env.get_token(existing.id) == original_stored
+    assert reloaded_existing.org_uuid == "org-team"
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +604,95 @@ def test_reauth_legacy_cannot_resolve_eof_aborts_and_writes_nothing(env, monkeyp
     assert reloaded.org_uuid is None
     assert env.get_token(target.id) == original_stored
     assert len(profile_repo.list_profiles()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Finding 3: reauth()'s overwrite guards each began with
+# `if target.account_uuid and ...`, so a target Profile whose account_uuid
+# is None skipped every one of them. Not reachable from current code —
+# create_profile() requires account_uuid for oauth Profiles — but reachable
+# from old on-disk state that predates that rule. Handled the same way as
+# the "can't resolve" legacy case: an explicit interactive confirmation
+# naming what is about to be recorded, and abort on anything else.
+# ---------------------------------------------------------------------------
+
+def _make_target_with_no_account_uuid(name="Ancient", credential="dead-token-long"):
+    # create_profile() requires account_uuid for an oauth Profile, so this
+    # simulates old on-disk state (predating that requirement) the only way
+    # reachable through the public API: create with a placeholder, then blank
+    # it out via update_profile() — never editing config.json by hand.
+    target = profile_repo.create_profile(
+        name=name, kind="oauth", credential=credential, account_uuid="placeholder-uuid")
+    target = profile_repo.update_profile(target.id, account_uuid=None)
+    assert target.account_uuid is None
+    return target
+
+
+def test_reauth_target_with_no_account_uuid_confirmed_yes_proceeds(env, monkeypatch, tmp_path, capsys):
+    target = _make_target_with_no_account_uuid()
+
+    fresh_account = _account(account_uuid="uuid-fresh", org_uuid="org-new", org_name="New Org",
+                              organization_type="claude_max")
+    _wire_reauth(monkeypatch, tmp_path, fresh_account, fresh_token="fresh-tok-long")
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", lambda access_token, timeout=15.0: fresh_account)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+
+    rc = cli.reauth(cli.DEFAULT_PORT)
+    assert rc == 0
+    assert "re-authenticated" in capsys.readouterr().out
+
+    profiles = profile_repo.list_profiles()
+    assert len(profiles) == 1  # no duplicate created
+    reloaded = profiles[0]
+    assert reloaded.id == target.id
+    assert reloaded.account_uuid == "uuid-fresh"
+    assert reloaded.org_uuid == "org-new"
+    stored = oauth_credential.decode(env.get_token(target.id))
+    assert stored.access_token == "fresh-tok-long"
+
+
+def test_reauth_target_with_no_account_uuid_declined_writes_nothing(env, monkeypatch, tmp_path, capsys):
+    target = _make_target_with_no_account_uuid()
+    original_stored = env.get_token(target.id)
+
+    fresh_account = _account(account_uuid="uuid-fresh", org_uuid="org-new", organization_type="claude_max")
+    _wire_reauth(monkeypatch, tmp_path, fresh_account, fresh_token="fresh-tok-long")
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", lambda access_token, timeout=15.0: fresh_account)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+
+    rc = cli.reauth(cli.DEFAULT_PORT)
+    assert rc == 1
+
+    profiles = profile_repo.list_profiles()
+    assert len(profiles) == 1
+    reloaded = profiles[0]
+    assert reloaded.id == target.id
+    assert reloaded.account_uuid is None  # untouched — refused before any write
+    assert env.get_token(target.id) == original_stored
+
+
+def test_reauth_target_with_no_account_uuid_eof_writes_nothing(env, monkeypatch, tmp_path, capsys):
+    target = _make_target_with_no_account_uuid()
+    original_stored = env.get_token(target.id)
+
+    fresh_account = _account(account_uuid="uuid-fresh", org_uuid="org-new", organization_type="claude_max")
+    _wire_reauth(monkeypatch, tmp_path, fresh_account, fresh_token="fresh-tok-long")
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", lambda access_token, timeout=15.0: fresh_account)
+
+    def raise_eof(prompt=""):
+        raise EOFError()
+
+    monkeypatch.setattr("builtins.input", raise_eof)
+
+    rc = cli.reauth(cli.DEFAULT_PORT)
+    assert rc == 1
+
+    profiles = profile_repo.list_profiles()
+    assert len(profiles) == 1
+    reloaded = profiles[0]
+    assert reloaded.id == target.id
+    assert reloaded.account_uuid is None
+    assert env.get_token(target.id) == original_stored
 
 
 # ---------------------------------------------------------------------------
