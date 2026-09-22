@@ -8,6 +8,7 @@ anthropic_oauth.fetch_account_profile() is monkeypatched.
 """
 
 import threading
+import types
 
 import pytest
 
@@ -260,13 +261,145 @@ def test_async_wrapper_runs_pass_in_a_background_daemon_thread(env, monkeypatch)
             account_uuid="uuid-shared", org_uuid="org-team", organization_type="claude_team"),
     }))
 
-    before = {t.ident for t in threading.enumerate()}
+    # Capture the Thread the wrapper builds instead of diffing
+    # threading.enumerate() around the call. A spawned thread can finish
+    # before enumerate() runs — with a trivial target it finishes first
+    # every time — so "exactly one new thread is visible" is a race that
+    # passes only while the target stays slow enough to still be running.
+    created = []
+    real_thread_cls = threading.Thread
+
+    class _Recording(real_thread_cls):
+        def __init__(self, *args, **kwargs):
+            created.append(self)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(daemon.threading, "Thread", _Recording)
     daemon._backfill_legacy_oauth_organizations_async()
-    new_threads = [t for t in threading.enumerate() if t.ident not in before]
-    assert len(new_threads) == 1
-    assert new_threads[0].daemon is True
-    new_threads[0].join(timeout=2)
-    assert not new_threads[0].is_alive()
+
+    assert len(created) == 1, "the wrapper starts exactly one thread"
+    assert created[0].daemon is True, "a daemon thread never holds up shutdown"
+    created[0].join(timeout=5)
+    assert not created[0].is_alive()
 
     reloaded = profile_repo.find_by_account_uuid("uuid-shared")
     assert reloaded.org_uuid == "org-team"
+
+
+# ---------------------------------------------------------------------------
+# The backfill must NOT be on a timer. AGENTS.md ("Things not to do"): the
+# daemon never polls a provider's API in the background. The backfill used to
+# ride _oauth_refresh_loop's 60-second tick, which meant an oauth Profile the
+# profile endpoint permanently refuses — a `claude setup-token` credential
+# gets a 403 forever, see anthropic_oauth.fetch_account_profile() — was
+# re-fetched every minute for as long as the daemon ran, because both failure
+# paths `continue` without ever setting org_uuid to stop the retry.
+# ---------------------------------------------------------------------------
+
+class _StopLoop(BaseException):
+    """Breaks out of _oauth_refresh_loop's `while True`.
+
+    Deliberately a BaseException, not an Exception: the loop body wraps every
+    call in `except Exception: pass`, so an ordinary exception would be
+    swallowed and the test would spin forever."""
+
+
+def _fake_time(sleeps):
+    return types.SimpleNamespace(sleep=lambda seconds: sleeps.append(seconds))
+
+
+def test_oauth_refresh_loop_never_calls_the_backfill(env, monkeypatch):
+    backfill_calls = []
+    snapshots = []
+    sleeps = []
+
+    class _Gateway:
+        def runtime_snapshot(self):
+            snapshots.append(1)
+            if len(snapshots) >= 3:
+                raise _StopLoop
+
+    monkeypatch.setattr(
+        daemon, "_backfill_legacy_oauth_organizations", lambda: backfill_calls.append(1))
+    monkeypatch.setattr(daemon, "_gateway", _Gateway())
+    monkeypatch.setattr(daemon, "time", _fake_time(sleeps))
+
+    with pytest.raises(_StopLoop):
+        daemon._oauth_refresh_loop()
+
+    # Three full ticks happened, so this is not "the loop never ran".
+    assert sleeps == [daemon._OAUTH_REFRESH_LOOP_INTERVAL_SECONDS] * 3
+    assert len(snapshots) == 3
+    assert backfill_calls == []
+
+
+def test_oauth_refresh_loop_makes_no_profile_endpoint_call_for_a_legacy_profile(env, monkeypatch):
+    """The stronger form of the test above: even with exactly the Profile the
+    backfill exists for sitting in the pool, ticking the loop must not touch
+    the account-profile endpoint."""
+    profile_repo.create_profile(
+        name="Legacy", kind="oauth", credential="legacy-token-long", account_uuid="uuid-shared")
+    fetches = []
+
+    def _never(access_token, timeout=15.0):
+        fetches.append(access_token)
+        raise AssertionError("the refresh loop must not fetch an account profile")
+
+    snapshots = []
+    sleeps = []
+
+    class _Gateway:
+        def runtime_snapshot(self):
+            snapshots.append(1)
+            raise _StopLoop
+
+    monkeypatch.setattr(daemon.anthropic_oauth, "fetch_account_profile", _never)
+    monkeypatch.setattr(daemon, "_gateway", _Gateway())
+    monkeypatch.setattr(daemon, "time", _fake_time(sleeps))
+
+    with pytest.raises(_StopLoop):
+        daemon._oauth_refresh_loop()
+
+    assert fetches == []
+    reloaded = profile_repo.find_by_account_uuid("uuid-shared")
+    assert reloaded.org_uuid is None  # still legacy; only a restart backfills it
+
+
+def test_startup_fires_exactly_one_backfill_pass(env, monkeypatch, tmp_path):
+    """run_foreground() is the only trigger left, and it fires the one-shot
+    async wrapper once — the fourth kind of untriggered request AGENTS.md
+    now documents."""
+    backfill_calls = []
+    thread_targets = []
+
+    class _FakeServer:
+        server_address = ("127.0.0.1", 4317)
+
+        def serve_forever(self):
+            raise KeyboardInterrupt  # run_foreground treats this as a clean stop
+
+        def server_close(self):
+            pass
+
+    class _FakeThread:
+        def __init__(self, target=None, daemon=False, **kwargs):
+            thread_targets.append(getattr(target, "__name__", target))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(daemon, "make_server", lambda host, port: _FakeServer())
+    monkeypatch.setattr(daemon.model_catalogue, "initialize", lambda: None)
+    monkeypatch.setattr(daemon.updater, "ensure_cli_aliases", lambda: None)
+    # Scoped to the daemon module's own attribute so the real threading module
+    # is untouched for everything else running in this process.
+    monkeypatch.setattr(daemon, "threading", types.SimpleNamespace(Thread=_FakeThread))
+    monkeypatch.setattr(daemon, "PID_FILE", tmp_path / "daemon.pid")
+    monkeypatch.setattr(
+        daemon, "_backfill_legacy_oauth_organizations_async",
+        lambda: backfill_calls.append(1))
+
+    daemon.run_foreground(host="127.0.0.1", port=4317)
+
+    assert backfill_calls == [1]
+    assert "_oauth_refresh_loop" in thread_targets
