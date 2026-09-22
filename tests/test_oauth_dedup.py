@@ -80,6 +80,176 @@ def test_upsert_oauth_profile_keeps_existing_plan_when_none_given(env):
     assert second.plan == "pro"  # untouched when the caller has nothing new to say
 
 
+def test_upsert_oauth_profile_stores_org_uuid_and_organization_type_on_create(env):
+    profile, reused = profile_repo.upsert_oauth_profile(
+        name="Org Seat", account_uuid="uuid-team", credential="tok-team-long",
+        plan="team", org_uuid="org-team", organization_type="claude_team")
+    assert reused is False
+    assert profile.org_uuid == "org-team"
+    assert profile.organization_type == "claude_team"
+
+
+def test_upsert_oauth_profile_refreshes_org_uuid_and_organization_type_on_reuse(env):
+    # A true reuse: same account_uuid AND same org_uuid, only the credential
+    # and plan change (e.g. the account's plan was upgraded upstream).
+    first, _ = profile_repo.upsert_oauth_profile(
+        name="X", account_uuid="uuid-1", credential="tok-1-long",
+        plan="max", org_uuid="org-1", organization_type="claude_max")
+
+    second, reused = profile_repo.upsert_oauth_profile(
+        name="X", account_uuid="uuid-1", credential="tok-2-long",
+        plan="max", org_uuid="org-1", organization_type="claude_max")
+
+    assert reused is True
+    assert second.id == first.id
+    assert second.org_uuid == "org-1"
+    assert second.organization_type == "claude_max"
+
+
+def test_upsert_oauth_profile_same_account_different_org_creates_second_profile(env):
+    # This is the behaviour change the account-identity fix makes: identity
+    # is now the PAIR (account_uuid, org_uuid). Before this fix, calling
+    # upsert_oauth_profile() again with the same account_uuid but a
+    # different org_uuid refreshed org_uuid/organization_type in place on
+    # the SAME Profile — which is exactly the reported bug (a Team seat and
+    # a personal Max plan on one email address share one account_uuid but
+    # differ by org_uuid, and the second registration silently overwrote the
+    # first). It must now create a second, separate Profile instead.
+    first, _ = profile_repo.upsert_oauth_profile(
+        name="X", account_uuid="uuid-1", credential="tok-1-long",
+        plan="max", org_uuid="org-old", organization_type="claude_max")
+
+    second, reused = profile_repo.upsert_oauth_profile(
+        name="X", account_uuid="uuid-1", credential="tok-2-long",
+        plan="team", org_uuid="org-new", organization_type="claude_team")
+
+    assert reused is False
+    assert second.id != first.id
+    profiles = profile_repo.list_profiles()
+    assert len(profiles) == 2
+    assert {p.org_uuid for p in profiles} == {"org-old", "org-new"}
+    assert {p.account_uuid for p in profiles} == {"uuid-1"}
+
+
+def test_upsert_oauth_profile_keeps_existing_org_fields_when_none_given(env):
+    first, _ = profile_repo.upsert_oauth_profile(
+        name="X", account_uuid="uuid-1", credential="tok-1-long",
+        plan="max", org_uuid="org-a", organization_type="claude_max")
+
+    second, reused = profile_repo.upsert_oauth_profile(
+        name="X", account_uuid="uuid-1", credential="tok-2-long",
+        plan=None, org_uuid=None, organization_type=None)
+
+    assert reused is True
+    assert second.org_uuid == "org-a"  # untouched, same "only when non-None" pattern as plan
+    assert second.organization_type == "claude_max"
+
+
+def test_find_by_account_and_org_exact_match_reuses(env):
+    p = profile_repo.create_profile(name="X", kind="oauth", credential="tok-long-enough",
+                                     account_uuid="uuid-1", org_uuid="org-1")
+    found, needs_backfill = profile_repo.find_by_account_and_org("uuid-1", "org-1")
+    assert found is not None
+    assert found.id == p.id
+    assert needs_backfill is False
+
+
+def test_find_by_account_and_org_same_account_different_org_is_no_match(env):
+    # The core regression: a Team seat and a personal Max plan on the same
+    # email address share account_uuid but not org_uuid, and each must get
+    # its own Profile rather than the second clobbering the first.
+    profile_repo.create_profile(name="Org Seat", kind="oauth", credential="tok-team-long",
+                                 account_uuid="uuid-shared", org_uuid="org-team",
+                                 organization_type="claude_team")
+
+    found, needs_backfill = profile_repo.find_by_account_and_org("uuid-shared", "org-personal-max")
+    assert found is None
+    assert needs_backfill is False
+
+    # And upsert_oauth_profile(), which is what every real caller uses,
+    # really does create a SECOND Profile rather than overwriting the first.
+    profile_repo.upsert_oauth_profile(
+        name="Personal Max", account_uuid="uuid-shared", credential="tok-max-long",
+        plan="max", org_uuid="org-personal-max", organization_type="claude_max")
+
+    profiles = profile_repo.list_profiles()
+    assert len(profiles) == 2  # neither Profile overwrote the other
+    orgs = {p.org_uuid for p in profiles}
+    assert orgs == {"org-team", "org-personal-max"}
+    account_uuids = {p.account_uuid for p in profiles}
+    assert account_uuids == {"uuid-shared"}  # same account_uuid, both kept
+
+
+def test_find_by_account_and_org_legacy_match_reuses_and_signals_backfill(env):
+    p = profile_repo.create_profile(name="Legacy", kind="oauth", credential="tok-long-enough",
+                                     account_uuid="uuid-legacy")  # org_uuid=None: added before the pair existed
+    assert p.org_uuid is None
+
+    found, needs_backfill = profile_repo.find_by_account_and_org("uuid-legacy", "org-new")
+    assert found is not None
+    assert found.id == p.id
+    assert needs_backfill is True
+
+    # And no duplicate is created via the real upsert path — the account is
+    # correctly recognised as the same Profile, and the org fields backfill.
+    updated, reused = profile_repo.upsert_oauth_profile(
+        name="Legacy", account_uuid="uuid-legacy", credential="tok-refreshed-long",
+        org_uuid="org-new", organization_type="claude_max")
+    assert reused is True
+    assert updated.id == p.id
+    assert updated.org_uuid == "org-new"
+    assert updated.organization_type == "claude_max"
+    assert len(profile_repo.list_profiles()) == 1
+
+
+def test_find_by_account_and_org_exact_match_wins_over_legacy_candidate(env):
+    # Both a legacy (org_uuid=None) Profile and an exact-pair Profile exist
+    # for this account_uuid — the exact match must win regardless of which
+    # was created first or where it sits in the pool.
+    legacy = profile_repo.create_profile(name="Legacy", kind="oauth", credential="tok-legacy-long",
+                                          account_uuid="uuid-both")
+    exact = profile_repo.create_profile(name="Exact", kind="oauth", credential="tok-exact-long",
+                                         account_uuid="uuid-both", org_uuid="org-x")
+
+    found, needs_backfill = profile_repo.find_by_account_and_org("uuid-both", "org-x")
+    assert found is not None
+    assert found.id == exact.id
+    assert needs_backfill is False
+    assert found.id != legacy.id
+
+
+def test_find_by_account_and_org_none_org_argument_falls_back_to_single_key(env):
+    # A caller with no organization info (e.g. a bundle written before
+    # org_uuid existed) must still find the existing Profile rather than
+    # being refused a match just because it can't supply an org.
+    p = profile_repo.create_profile(name="X", kind="oauth", credential="tok-long-enough",
+                                     account_uuid="uuid-1", org_uuid="org-1")
+    found, needs_backfill = profile_repo.find_by_account_and_org("uuid-1", None)
+    assert found is not None
+    assert found.id == p.id
+    assert needs_backfill is False
+
+
+def test_find_by_account_and_org_no_match_returns_none(env):
+    found, needs_backfill = profile_repo.find_by_account_and_org("uuid-nowhere", "org-nowhere")
+    assert found is None
+    assert needs_backfill is False
+
+
+def test_upsert_codex_profile_unaffected_by_pair_aware_lookup(env):
+    # upsert_codex_profile() must keep using find_by_account_uuid() (a plain
+    # single-key match on an OpenAI account id) untouched.
+    first, reused1 = profile_repo.upsert_codex_profile(
+        name="Codex", account_id="codex-uuid-1", encoded_credential="enc-tok-1-long")
+    assert reused1 is False
+
+    second, reused2 = profile_repo.upsert_codex_profile(
+        name="Codex", account_id="codex-uuid-1", encoded_credential="enc-tok-2-long")
+    assert reused2 is True
+    assert second.id == first.id
+    assert len(profile_repo.list_profiles()) == 1
+
+
 def test_find_by_account_uuid(env):
     profile_repo.create_profile(name="X", kind="oauth", credential="tok-original-long", account_uuid="uuid-1")
     found = profile_repo.find_by_account_uuid("uuid-1")
@@ -153,7 +323,7 @@ def test_import_claude_code_second_time_updates_instead_of_duplicating(env, monk
 
     def fake_fetch(token, timeout=15.0):
         return anthropic_oauth.AccountProfile(account_uuid="same-account-uuid", email="dev@example.com",
-                                                display_name="Dev", org_uuid=None, org_name=None,
+                                                display_name="Dev", org_uuid=None, org_name=None, organization_type=None,
                                                 has_claude_max=True, has_claude_pro=False)
 
     monkeypatch.setattr(daemon.anthropic_oauth, "read_claude_code_credentials", fake_read)

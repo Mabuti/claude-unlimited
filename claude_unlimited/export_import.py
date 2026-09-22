@@ -24,6 +24,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from . import activity as activity_module
+from . import profiles as profile_repo
 from . import secret_store
 from .config import CONFIG_LOCK, Profile, load_pool, save_pool
 
@@ -65,6 +66,13 @@ class ExportedProfile:
     # Profile afterwards, so leaving it out of the bundle meant a restored
     # account showed no tier in the Dashboard forever.
     plan: Optional[str] = None
+    # org_uuid/organization_type: the other half of the identity pair
+    # alongside account_uuid (see profiles.find_by_account_and_org) and the
+    # source of the plan label. Without these a restored bundle can only
+    # ever legacy-match on account_uuid alone, which is exactly the
+    # ambiguity this pair exists to resolve.
+    org_uuid: Optional[str] = None
+    organization_type: Optional[str] = None
     # codex_home is deliberately NOT exported: it is a local path from the
     # one-time `codex login` handshake, meaningless on another machine, and
     # the credential that a re-import actually needs is already carried
@@ -99,7 +107,8 @@ def build_export_bundle(
                 automatic=p.automatic, default_model=p.default_model, monthly_budget_cap=p.monthly_budget_cap,
                 token_threshold=p.token_threshold,
                 tag_color=p.tag_color, account_uuid=p.account_uuid, credential=cred,
-                plan=p.plan, codex_model=p.codex_model, codex_reasoning_effort=p.codex_reasoning_effort,
+                plan=p.plan, org_uuid=p.org_uuid, organization_type=p.organization_type,
+                codex_model=p.codex_model, codex_reasoning_effort=p.codex_reasoning_effort,
             )))
         payload["profiles"] = exported
 
@@ -200,9 +209,19 @@ def apply_import(
     if import_profiles:
         with CONFIG_LOCK:
             pool = load_pool()
-            by_uuid = {p.account_uuid: p for p in pool.profiles if p.account_uuid}
             for item in parsed.profiles:
-                existing = by_uuid.get(item.get("account_uuid")) if item.get("account_uuid") else None
+                # Pair-aware, with the same legacy fallback as every other
+                # dedup implementation (profiles.find_by_account_and_org): a
+                # bundle written before org_uuid existed carries no org_uuid
+                # for any profile, so it legacy-matches on account_uuid alone
+                # against a Profile whose own org_uuid is also still None.
+                # pool.profiles is passed fresh each iteration so an update
+                # made earlier in this same loop is visible to the next item.
+                existing = None
+                item_uuid = item.get("account_uuid")
+                if item_uuid:
+                    existing, _needs_backfill = profile_repo.find_by_account_and_org(
+                        item_uuid, item.get("org_uuid"), profiles=pool.profiles)
                 if existing is not None:
                     if conflict_strategy == "keep_existing":
                         result["profiles_skipped"] += 1
@@ -218,6 +237,7 @@ def apply_import(
                         automatic=item.get("automatic", True), default_model=item.get("default_model"),
                         monthly_budget_cap=item.get("monthly_budget_cap"), token_threshold=item.get("token_threshold"),
                         tag_color=item.get("tag_color"), plan=item.get("plan"),
+                        org_uuid=item.get("org_uuid"), organization_type=item.get("organization_type"),
                         codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
                     )
                     pool.profiles = [updated if p.id == existing.id else p for p in pool.profiles]
@@ -234,6 +254,7 @@ def apply_import(
                     monthly_budget_cap=item.get("monthly_budget_cap"), token_threshold=item.get("token_threshold"),
                     tag_color=item.get("tag_color"),
                     account_uuid=item.get("account_uuid"), plan=item.get("plan"),
+                    org_uuid=item.get("org_uuid"), organization_type=item.get("organization_type"),
                     codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
                 )
                 secret_store.set_token(new_profile.id, item["credential"])

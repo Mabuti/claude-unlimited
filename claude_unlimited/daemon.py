@@ -250,6 +250,8 @@ def _profile_to_public_dict(p, runtime=None, usage=None, in_use_now=False) -> di
         "token_threshold": p.token_threshold,
         "tag_color": p.tag_color,
         "account_uuid": p.account_uuid,
+        "org_uuid": p.org_uuid,
+        "organization_type": p.organization_type,
         "plan": p.plan,
         "codex_home": p.codex_home,
         "codex_model": p.codex_model,
@@ -684,12 +686,30 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                         return
                     body["account_uuid"] = account.account_uuid
                     body["plan"] = anthropic_oauth.plan_from_account(account)
+                    body["org_uuid"] = account.org_uuid
+                    body["organization_type"] = account.organization_type
 
-                existing = profile_repo.find_by_account_uuid(body["account_uuid"]) if body.get("kind") == "oauth" and body.get("account_uuid") else None
+                existing = None
+                if body.get("kind") == "oauth" and body.get("account_uuid"):
+                    # Pair-aware: account_uuid alone can't tell a Team seat
+                    # apart from a personal Max plan on the same email
+                    # address (both return the same account.uuid under a
+                    # different organization.uuid) — see
+                    # profiles.find_by_account_and_org(). The changes dict
+                    # below backfills org_uuid/organization_type on a legacy
+                    # match the same "only when non-None" way plan already
+                    # does, so the second return value isn't needed here.
+                    existing, _needs_backfill = profile_repo.find_by_account_and_org(
+                        body["account_uuid"], body.get("org_uuid"))
                 if existing is not None:
                     profile_repo.update_credential(existing.id, credential)
-                    if "plan" in body:
-                        existing = profile_repo.update_profile(existing.id, plan=body["plan"])
+                    changes = {k: v for k, v in {
+                        "plan": body.get("plan"),
+                        "org_uuid": body.get("org_uuid"),
+                        "organization_type": body.get("organization_type"),
+                    }.items() if v is not None}
+                    if changes:
+                        existing = profile_repo.update_profile(existing.id, **changes)
                     self._send_json(200, {"profile": _profile_to_public_dict(existing), "reused_existing": True})
                     return
 
@@ -756,7 +776,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             try:
                 imported = anthropic_oauth.read_claude_code_credentials()
                 account = anthropic_oauth.fetch_account_profile(imported.access_token)
-                name = account.email or "Imported Claude account"
+                name = anthropic_oauth.profile_name_for_account(account)
                 plan = anthropic_oauth.plan_from_account(account)
 
                 # Also refreshes a Profile whose plan has changed: this flow
@@ -764,7 +784,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 # free.
                 profile_out, reused = profile_repo.upsert_oauth_profile(
                     name=name, account_uuid=account.account_uuid, credential=imported.access_token,
-                    plan=plan, refresh_token=imported.refresh_token, expires_at=imported.expires_at,
+                    plan=plan, org_uuid=account.org_uuid, organization_type=account.organization_type,
+                    refresh_token=imported.refresh_token, expires_at=imported.expires_at,
                 )
                 status = 200 if reused else 201
                 if not reused:

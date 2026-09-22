@@ -7,10 +7,13 @@ import pytest
 
 import claude_unlimited.anthropic_oauth as oauth_module
 from claude_unlimited.anthropic_oauth import (
+    AccountProfile,
     CredentialImportError,
     ProfileLookupError,
     fetch_account_profile,
     isolated_macos_keychain_service,
+    plan_from_account,
+    profile_name_for_account,
     read_claude_code_credentials,
 )
 
@@ -163,7 +166,7 @@ def test_fetch_account_profile_parses_real_response_shape(monkeypatch):
     payload = json.dumps({
         "account": {"uuid": "acct-1234", "email": "dev@example.com", "display_name": "Dev",
                      "has_claude_max": True, "has_claude_pro": False},
-        "organization": {"uuid": "org-5678", "name": "Acme"},
+        "organization": {"uuid": "org-5678", "name": "Acme", "organization_type": "claude_max"},
     }).encode()
 
     def fake_urlopen(req, timeout=None):
@@ -174,7 +177,95 @@ def test_fetch_account_profile_parses_real_response_shape(monkeypatch):
     profile = fetch_account_profile("real-token")
     assert profile.account_uuid == "acct-1234"
     assert profile.org_uuid == "org-5678"
+    assert profile.organization_type == "claude_max"
     assert profile.has_claude_max is True
+
+
+def test_fetch_account_profile_parses_organization_type_for_a_team_seat(monkeypatch):
+    # Measured 2026-09-22 (spec §4): a Team seat's organization_type is
+    # "claude_team", and has_claude_max is true there too — organization_type
+    # is the only field in this payload that tells the two apart.
+    payload = json.dumps({
+        "account": {"uuid": "acct-team", "email": "dev@example.com", "display_name": "Dev",
+                     "has_claude_max": True, "has_claude_pro": False},
+        "organization": {"uuid": "org-team", "name": "ExeVision Inc.", "organization_type": "claude_team"},
+    }).encode()
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeHTTPResponse(payload)
+
+    monkeypatch.setattr(oauth_module.urllib.request, "urlopen", fake_urlopen)
+    profile = fetch_account_profile("real-token")
+    assert profile.organization_type == "claude_team"
+
+
+def _account(organization_type=None, has_claude_max=False, has_claude_pro=False, email=None, org_name=None):
+    return AccountProfile(
+        account_uuid="acct", email=email, display_name=None, org_uuid=None, org_name=org_name,
+        organization_type=organization_type, has_claude_max=has_claude_max, has_claude_pro=has_claude_pro,
+    )
+
+
+def test_plan_from_account_returns_team_for_a_team_organization():
+    # has_claude_max is true on a Team seat too (spec §4 result 2) — this
+    # asserts the team branch wins over the flags, not just that it exists.
+    account = _account(organization_type="claude_team", has_claude_max=True)
+    assert plan_from_account(account) == "team"
+
+
+def test_plan_from_account_returns_max_when_flag_set_and_no_team_org():
+    account = _account(organization_type="claude_max", has_claude_max=True)
+    assert plan_from_account(account) == "max"
+
+
+def test_plan_from_account_returns_pro():
+    account = _account(organization_type="claude_max", has_claude_pro=True)
+    assert plan_from_account(account) == "pro"
+
+
+def test_plan_from_account_returns_none_when_nothing_determinable():
+    account = _account()
+    assert plan_from_account(account) is None
+
+
+def test_plan_from_account_falls_back_to_flags_for_an_unrecognised_organization_type():
+    # An organization_type this code doesn't recognise (e.g. a future
+    # claude_enterprise) must never be guessed at — fall through to the
+    # existing flag logic rather than inventing a label.
+    account = _account(organization_type="claude_enterprise", has_claude_max=True)
+    assert plan_from_account(account) == "max"
+
+
+def test_profile_name_for_account_is_plain_email_for_a_personal_max_plan():
+    account = _account(organization_type="claude_max", email="user@example.com", org_name="Personal Org")
+    assert profile_name_for_account(account) == "user@example.com"
+
+
+def test_profile_name_for_account_is_plain_email_for_a_personal_pro_plan():
+    account = _account(organization_type="claude_pro", email="user@example.com", org_name="Personal Org")
+    assert profile_name_for_account(account) == "user@example.com"
+
+
+def test_profile_name_for_account_includes_org_name_for_a_team_organization():
+    account = _account(organization_type="claude_team", email="user@example.com", org_name="Acme Inc")
+    assert profile_name_for_account(account) == "user@example.com (Acme Inc)"
+
+
+def test_profile_name_for_account_falls_back_to_plain_email_when_organization_type_is_none():
+    account = _account(organization_type=None, email="user@example.com", org_name="Acme Inc")
+    assert profile_name_for_account(account) == "user@example.com"
+
+
+def test_profile_name_for_account_falls_back_to_plain_email_when_org_name_missing():
+    # organization_type says this isn't personal, but there's nothing to put
+    # in the parens — must never render a dangling "()".
+    account = _account(organization_type="claude_team", email="user@example.com", org_name=None)
+    assert profile_name_for_account(account) == "user@example.com"
+
+
+def test_profile_name_for_account_falls_back_to_imported_placeholder_when_email_missing():
+    account = _account(organization_type="claude_team", email=None, org_name="Acme Inc")
+    assert profile_name_for_account(account) == "Imported Claude account"
 
 
 def test_fetch_account_profile_raises_on_missing_uuid(monkeypatch):

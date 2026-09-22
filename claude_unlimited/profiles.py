@@ -152,6 +152,63 @@ def find_by_account_uuid(account_uuid: str) -> Optional[Profile]:
     return next((p for p in load_pool().profiles if p.account_uuid == account_uuid), None)
 
 
+def find_by_account_and_org(account_uuid: str, org_uuid: Optional[str],
+                             *, profiles: Optional[list[Profile]] = None) -> tuple[Optional[Profile], bool]:
+    """Pair-aware identity lookup for OAuth Profiles.
+
+    `account_uuid` alone is not a unique key: one Anthropic account_uuid can
+    surface under more than one organization.uuid — a personal Max plan and
+    an organization (Team) seat on the same email address return the SAME
+    account.uuid but a DIFFERENT organization.uuid (measured 2026-09-22).
+    Deduping on account_uuid alone therefore collapses two separate,
+    separately-billed subscriptions into one Profile, silently overwriting
+    the first with the second. Identity here is the pair.
+
+    Returns (profile, needs_org_backfill) with exactly three outcomes:
+      - Exact match: a Profile with this account_uuid AND this org_uuid
+        already exists -> (profile, False). Reuse it as-is.
+      - Legacy match: no exact match, but a Profile with this account_uuid
+        and org_uuid=None exists -> (profile, True). Reuse it, but signal
+        that the caller must backfill org_uuid/organization_type onto it.
+        This is what stops a Profile added before this pair became the
+        identity from being duplicated the next time its account re-auths —
+        without it, every pre-existing Profile would look like a "no match"
+        and spawn a duplicate on its very next credential refresh.
+      - No match: (None, False). The caller should create a new Profile.
+
+    An exact match always wins over a legacy match when both exist for this
+    account_uuid — the pool is scanned for an exact pair match in full before
+    a legacy candidate is considered, so which one is stored first in the
+    pool never decides the outcome.
+
+    If the `org_uuid` ARGUMENT is None (the caller has no organization
+    information for this login — e.g. a bundle or a caller that never
+    resolved one), this falls back to matching on account_uuid alone, the
+    same single-key behaviour as find_by_account_uuid(), rather than
+    refusing to match: a caller that cannot supply an org must never be made
+    to create a duplicate just because it doesn't know the org.
+
+    `profiles` lets a caller that already holds an in-progress, unsaved Pool
+    snapshot (export_import.apply_import(), which mutates a local `pool`
+    across a whole bundle before saving it once) match against that snapshot
+    instead of re-reading config.json from disk. Omitted, this reads the
+    live pool the same way find_by_account_uuid() does.
+    """
+    candidates = list(load_pool().profiles if profiles is None else profiles)
+    matching_uuid = [p for p in candidates if p.account_uuid == account_uuid]
+    if not matching_uuid:
+        return None, False
+    if org_uuid is None:
+        return matching_uuid[0], False
+    for p in matching_uuid:
+        if p.org_uuid == org_uuid:
+            return p, False
+    for p in matching_uuid:
+        if p.org_uuid is None:
+            return p, True
+    return None, False
+
+
 def update_credential(profile_id: str, credential: str, *, refresh_token: Optional[str] = None,
                        expires_at: Optional[int] = None) -> None:
     if not credential or len(credential.strip()) < 8:
@@ -224,6 +281,8 @@ def create_profile(
     token_threshold: Optional[int] = None,
     tag_color: Optional[str] = None,
     account_uuid: Optional[str] = None,
+    org_uuid: Optional[str] = None,
+    organization_type: Optional[str] = None,
     plan: Optional[str] = None,
     refresh_token: Optional[str] = None,
     expires_at: Optional[int] = None,
@@ -276,6 +335,8 @@ def create_profile(
         token_threshold=token_threshold,
         tag_color=tag_color,
         account_uuid=account_uuid,
+        org_uuid=org_uuid,
+        organization_type=organization_type,
         plan=plan,
         claude_config_dir=claude_config_dir,
         codex_home=codex_home,
@@ -320,23 +381,35 @@ def create_profile(
 
 
 def upsert_oauth_profile(*, name: str, account_uuid: str, credential: str, plan: Optional[str] = None,
+                          org_uuid: Optional[str] = None, organization_type: Optional[str] = None,
                           refresh_token: Optional[str] = None, expires_at: Optional[int] = None,
                           claude_config_dir: Optional[str] = None) -> tuple[Profile, bool]:
     """The single dedup-and-upsert path every OAuth-adding flow shares (CLI
-    `add-account`, "Import current login"): create a new Profile for this
-    account_uuid, or, if one is already registered, refresh its credential
-    and keep its plan and claude_config_dir current.
+    `add-account`, `reauth`, "Import current login"): create a new Profile
+    for this (account_uuid, org_uuid) pair, or, if one is already
+    registered, refresh its credential and keep its plan, org_uuid,
+    organization_type and claude_config_dir current.
+
+    Dedups on the PAIR (account_uuid, org_uuid), not on account_uuid alone —
+    see find_by_account_and_org() for why account_uuid alone is not a unique
+    identity. A Profile registered before org_uuid existed (org_uuid=None) is
+    matched on account_uuid alone and gets org_uuid/organization_type
+    backfilled here rather than duplicated.
 
     Returns (profile, reused). reused=True means an existing Profile was
     refreshed in place, not that anything new was added."""
-    existing = find_by_account_uuid(account_uuid)
+    existing, _needs_backfill = find_by_account_and_org(account_uuid, org_uuid)
     if existing is not None:
         update_credential(existing.id, credential, refresh_token=refresh_token, expires_at=expires_at)
-        changes = {k: v for k, v in {"plan": plan, "claude_config_dir": claude_config_dir}.items() if v is not None}
+        changes = {k: v for k, v in {
+            "plan": plan, "org_uuid": org_uuid, "organization_type": organization_type,
+            "claude_config_dir": claude_config_dir,
+        }.items() if v is not None}
         updated = update_profile(existing.id, **changes) if changes else existing
         return updated, True
 
     profile = create_profile(name=name, kind="oauth", credential=credential, account_uuid=account_uuid,
+                              org_uuid=org_uuid, organization_type=organization_type,
                               plan=plan, refresh_token=refresh_token, expires_at=expires_at,
                               claude_config_dir=claude_config_dir)
     return profile, False
@@ -369,6 +442,7 @@ def update_profile(profile_id: str, **changes) -> Profile:
     allowed = {
         "name", "priority", "switch_threshold", "enabled", "automatic",
         "default_model", "monthly_budget_cap", "token_threshold", "tag_color", "base_url", "auth_mode", "plan",
+        "org_uuid", "organization_type",
         "claude_config_dir", "codex_home", "codex_model", "codex_reasoning_effort",
     }
     unknown = set(changes) - allowed

@@ -24,6 +24,21 @@ def test_every_locale_file_covers_every_en_key():
         assert not missing, f"{code} is missing keys (should have fallen back): {missing}"
 
 
+def test_every_locale_file_has_every_en_key_in_its_own_raw_file():
+    # load_locale() merges in English for anything missing, so the assertion
+    # above passes even when a locale file itself never got the key — it
+    # only proves the fallback works, not that the translation exists. This
+    # reads each file with no fallback so a key added to en.json and missed
+    # in de/es/ro (or any future locale) actually fails.
+    en_keys = set(i18n._read_locale_file("en").keys()) - {"_meta"}
+    for code in i18n.list_locales():
+        if code == "en":
+            continue
+        raw_keys = set(i18n._read_locale_file(code).keys()) - {"_meta"}
+        missing = en_keys - raw_keys
+        assert not missing, f"{code}.json itself is missing keys: {missing}"
+
+
 def test_load_locale_falls_back_to_english_for_missing_key(monkeypatch):
     monkeypatch.setattr(i18n, "_read_locale_file", lambda code: (
         {"_meta": {"language_name": "Test"}} if code == "xx" else

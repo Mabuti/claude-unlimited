@@ -256,6 +256,12 @@
                      background-size: 260% 100%; border: 1px solid rgba(255,208,140,0.5);
                      animation: plan-shimmer 5s linear infinite; text-shadow: 0 0 6px rgba(255,208,140,0.6); }
   html.light-theme .plan-badge.max, .app.light-theme .plan-badge.max { color: #FFF6E5; }
+  /* Team — an organization seat, not a personal plan, so it deliberately
+     does not borrow Pro's cyan or Max's gold/purple shimmer: solid indigo,
+     same flat idiom as Pro, no animation (an org seat isn't a "tier" to
+     celebrate the way Max is). */
+  .plan-badge.team { color: #B8A8FF; background: rgba(124,92,255,0.16); border: 1px solid rgba(124,92,255,0.35); }
+  html.light-theme .plan-badge.team, .app.light-theme .plan-badge.team { color: #4B3AA8; }
   @keyframes plan-spark {
     0%, 100% { opacity: 0; transform: scale(0.4); }
     50% { opacity: 1; transform: scale(1.15); }

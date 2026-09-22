@@ -63,6 +63,40 @@ def test_save_and_load_pool_roundtrip(tmp_path, monkeypatch):
     assert loaded.profiles[1] == pool.profiles[1]
 
 
+def test_org_uuid_and_organization_type_round_trip_through_save_and_load(tmp_path, monkeypatch):
+    monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
+    monkeypatch.setattr("claude_unlimited.config.CONFIG_FILE", tmp_path / "config.json")
+
+    pool = Pool(profiles=[
+        Profile(id="a", name="Org Seat", kind="oauth", account_uuid="uuid-a",
+                org_uuid="org-a", organization_type="claude_team", plan="team"),
+    ])
+    save_pool(pool)
+
+    loaded = load_pool()
+    assert loaded.profiles[0].org_uuid == "org-a"
+    assert loaded.profiles[0].organization_type == "claude_team"
+    assert loaded.profiles[0] == pool.profiles[0]
+
+
+def test_profile_without_org_uuid_or_organization_type_loads_with_none_for_both(tmp_path, monkeypatch):
+    # Backward-compatibility guarantee: a config.json written before A3 has
+    # neither key on a profile entry at all, and load_pool() must not KeyError
+    # — both fields come back None, exactly like every other optional field.
+    monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
+    cfg_file = tmp_path / "config.json"
+    monkeypatch.setattr("claude_unlimited.config.CONFIG_FILE", cfg_file)
+    cfg_file.write_text(json.dumps({
+        "profiles": [{"id": "a", "name": "Personal Max", "kind": "oauth", "account_uuid": "uuid-a", "plan": "max"}],
+        "settings": {},
+    }))
+
+    loaded = load_pool()
+    assert loaded.profiles[0].org_uuid is None
+    assert loaded.profiles[0].organization_type is None
+    assert loaded.profiles[0].account_uuid == "uuid-a"  # unaffected sibling field still loads
+
+
 def test_launchers_and_port_round_trip_through_save_and_load(tmp_path, monkeypatch):
     monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
     monkeypatch.setattr("claude_unlimited.config.CONFIG_FILE", tmp_path / "config.json")

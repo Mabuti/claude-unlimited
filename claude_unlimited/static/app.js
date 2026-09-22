@@ -710,6 +710,10 @@ function planBadge(p) {
       <span class="spark"></span><span class="spark"></span><span class="spark"></span>
       ${OAUTH_ICON}<span>${esc(t('profiles.plan_badge_pro'))}</span></span>`;
   }
+  if (p.plan === 'team') {
+    return `<span class="plan-badge team" title="${esc(t('profiles.kind_oauth_team'))}">
+      ${OAUTH_ICON}<span>${esc(t('profiles.plan_badge_team'))}</span></span>`;
+  }
   return `<span class="plan-badge api" title="${esc(t('profiles.kind_oauth_unknown'))}">${OAUTH_ICON}<span>${esc(t('profiles.plan_badge_unknown'))}</span></span>`;
 }
 

@@ -299,6 +299,7 @@ class AccountProfile:
     display_name: Optional[str]
     org_uuid: Optional[str]
     org_name: Optional[str]
+    organization_type: Optional[str]
     has_claude_max: Optional[bool]
     has_claude_pro: Optional[bool]
 
@@ -306,14 +307,58 @@ class AccountProfile:
 def plan_from_account(account: AccountProfile) -> Optional[str]:
     """The plan detected from Anthropic's /api/oauth/profile response.
 
-    "max" takes priority, since an account can carry both flags. None means
+    has_claude_max is true on a Team seat as well as on a personal Max plan —
+    measured 2026-09-22, both responses carry it — so the has_claude_* flags
+    alone cannot tell a Team account apart from a personal one and must not be
+    trusted to. organization.organization_type is checked first because it is
+    the one field that does distinguish them; "max" then takes priority over
+    "pro" among the flags, since a personal account can carry both. None means
     undetermined, never a guess. Every OAuth-adding path shares this one
     implementation — see profiles.upsert_oauth_profile()."""
+    if account.organization_type == "claude_team":
+        return "team"
     if account.has_claude_max:
         return "max"
     if account.has_claude_pro:
         return "pro"
     return None
+
+
+# organization_type values that mean "this is someone's own personal plan,
+# not a shared organization seat" — see profile_name_for_account().
+_PERSONAL_ORGANIZATION_TYPES = frozenset({"claude_max", "claude_pro"})
+
+
+def profile_name_for_account(account: AccountProfile) -> str:
+    """The Profile name to use when adding a NEW OAuth Profile for this
+    account.
+
+    Two Profiles can legitimately share one email address: a personal plan
+    and an organization (Team) seat return the same account.email (see
+    profiles.find_by_account_and_org() for the matching account_uuid,
+    org_uuid pair problem). Naming both from account.email alone makes them
+    indistinguishable in the Dashboard, so a non-personal organization_type
+    is folded into the name: "<email> (<org_name>)". organization_type in
+    _PERSONAL_ORGANIZATION_TYPES (a personal Max or Pro plan) is named as
+    plain email, same as always. organization_type=None or a missing
+    org_name leaves nothing reliable to disambiguate with, so this falls
+    back to the plain email exactly as before — never a dangling "()" or the
+    literal word "None". A missing email falls back to the same "Imported
+    Claude account" placeholder every OAuth-adding path has always used.
+
+    Applies ONLY where a NEW Profile's name is first computed.
+    upsert_oauth_profile() deliberately leaves an existing Profile's name
+    alone when it reuses one — a hand-edited name must survive a re-auth —
+    so this must never be called on a reuse/update path. Every OAuth-adding
+    path shares this one implementation — see cli.add_account() and
+    daemon.py's /api/import-claude-code handler."""
+    if not account.email:
+        return "Imported Claude account"
+    if (account.organization_type
+            and account.organization_type not in _PERSONAL_ORGANIZATION_TYPES
+            and account.org_name):
+        return f"{account.email} ({account.org_name})"
+    return account.email
 
 
 def fetch_account_profile(access_token: str, timeout: float = 15.0) -> AccountProfile:
@@ -359,6 +404,7 @@ def fetch_account_profile(access_token: str, timeout: float = 15.0) -> AccountPr
         display_name=account.get("display_name"),
         org_uuid=org.get("uuid"),
         org_name=org.get("name"),
+        organization_type=org.get("organization_type"),
         has_claude_max=account.get("has_claude_max"),
         has_claude_pro=account.get("has_claude_pro"),
     )

@@ -220,6 +220,91 @@ def test_the_account_tier_survives_an_export_import_round_trip(env):
     assert [p.plan for p in profile_repo.list_profiles()] == ["max"]
 
 
+def test_apply_import_bundle_with_org_uuid_pair_matches(env):
+    # A bundle written after this fix carries org_uuid — an exact pair match
+    # (account_uuid AND org_uuid) reuses the existing Profile.
+    existing = profile_repo.create_profile(
+        name="Existing", kind="oauth", credential="original-tok-long",
+        account_uuid="uuid-1", org_uuid="org-1", organization_type="claude_max")
+    bundle_profiles = [{
+        "name": "Imported version", "kind": "oauth", "base_url": None, "auth_mode": "api_key",
+        "priority": 1, "switch_threshold": 98.0, "enabled": True, "automatic": True,
+        "default_model": None, "monthly_budget_cap": None, "tag_color": None,
+        "account_uuid": "uuid-1", "org_uuid": "org-1", "organization_type": "claude_max",
+        "credential": "imported-tok-long",
+    }]
+    parsed = ei.ParsedBundle(profiles=bundle_profiles, settings=None, activity=None)
+    result = ei.apply_import(parsed, import_profiles=True, import_settings=False, conflict_strategy="use_imported")
+    assert result["profiles_updated"] == 1
+    pool = load_pool()
+    assert len(pool.profiles) == 1  # no duplicate
+    assert pool.profiles[0].id == existing.id
+
+
+def test_apply_import_bundle_with_org_uuid_different_from_existing_org_adds_second_profile(env):
+    # Same account_uuid, different org_uuid — the bundle carries a second
+    # subscription for an account already partly in the pool, and it must
+    # be added rather than overwriting the first.
+    profile_repo.create_profile(
+        name="Org Seat", kind="oauth", credential="team-tok-long",
+        account_uuid="uuid-shared", org_uuid="org-team", organization_type="claude_team")
+    bundle_profiles = [{
+        "name": "Personal Max", "kind": "oauth", "base_url": None, "auth_mode": "api_key",
+        "priority": 1, "switch_threshold": 98.0, "enabled": True, "automatic": True,
+        "default_model": None, "monthly_budget_cap": None, "tag_color": None,
+        "account_uuid": "uuid-shared", "org_uuid": "org-personal-max", "organization_type": "claude_max",
+        "credential": "personal-tok-long",
+    }]
+    parsed = ei.ParsedBundle(profiles=bundle_profiles, settings=None, activity=None)
+    result = ei.apply_import(parsed, import_profiles=True, import_settings=False)
+    assert result["profiles_added"] == 1
+    profiles = load_pool().profiles
+    assert len(profiles) == 2
+    assert {p.org_uuid for p in profiles} == {"org-team", "org-personal-max"}
+
+
+def test_apply_import_bundle_without_org_uuid_legacy_matches(env):
+    # A bundle exported before this fix carries no org_uuid key at all for
+    # any profile — it must still match the existing Profile (also
+    # org_uuid=None) on account_uuid alone, exactly like before.
+    existing = profile_repo.create_profile(
+        name="Existing", kind="oauth", credential="original-tok-long", account_uuid="dup-uuid")
+    assert existing.org_uuid is None
+    bundle_profiles = [{
+        "name": "Imported version", "kind": "oauth", "base_url": None, "auth_mode": "api_key",
+        "priority": 1, "switch_threshold": 98.0, "enabled": True, "automatic": True,
+        "default_model": None, "monthly_budget_cap": None, "tag_color": None,
+        "account_uuid": "dup-uuid", "credential": "imported-tok-long",
+    }]
+    parsed = ei.ParsedBundle(profiles=bundle_profiles, settings=None, activity=None)
+    result = ei.apply_import(parsed, import_profiles=True, import_settings=False, conflict_strategy="use_imported")
+    assert result["profiles_updated"] == 1
+    pool = load_pool()
+    assert len(pool.profiles) == 1  # no duplicate
+    assert pool.profiles[0].id == existing.id
+
+
+def test_org_uuid_and_organization_type_survive_an_export_import_round_trip(env):
+    profile_repo.create_profile(
+        name="Org Seat", kind="oauth", credential="sk-ant-12345678",
+        account_uuid="acct-1", org_uuid="org-team", organization_type="claude_team")
+    bundle = ei.build_export_bundle(
+        include_profiles=True, include_settings=False, include_activity=False,
+        passphrase="hunter22")
+
+    profile_repo.reset_all_profiles()
+    parsed = ei.import_bundle(bundle, passphrase="hunter22")
+    assert parsed.profiles[0]["org_uuid"] == "org-team"
+    assert parsed.profiles[0]["organization_type"] == "claude_team"
+
+    ei.apply_import(parsed, import_profiles=True, import_settings=False)
+
+    restored = profile_repo.list_profiles()
+    assert len(restored) == 1
+    assert restored[0].org_uuid == "org-team"
+    assert restored[0].organization_type == "claude_team"
+
+
 def test_importing_settings_does_not_reset_fields_the_bundle_never_carried(env):
     """A bundle exported by a version predating a field simply has no key for
     it. Rebuilding Settings from scratch turned that into "reset it to the

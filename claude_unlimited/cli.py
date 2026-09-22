@@ -1737,11 +1737,12 @@ def add_account() -> int:
         print(f"Logged in, but could not read/resolve the new account: {exc}", file=sys.stderr)
         return 1
 
-    name = account.email or "Imported Claude account"
+    name = anthropic_oauth.profile_name_for_account(account)
     try:
         profile, reused = profile_repo.upsert_oauth_profile(
             name=name, account_uuid=account.account_uuid, credential=imported.access_token,
             plan=anthropic_oauth.plan_from_account(account),
+            org_uuid=account.org_uuid, organization_type=account.organization_type,
             refresh_token=imported.refresh_token, expires_at=imported.expires_at,
             claude_config_dir=str(config_dir),
         )
@@ -1882,9 +1883,15 @@ def reauth(port: int) -> int:
 
     Reuses the Profile's isolated claude_config_dir, set when it was added,
     so re-authenticating logs back into the same account rather than an
-    ambiguous fresh session. upsert_oauth_profile() then matches the
-    freshly-logged-in account back to this Profile by account_uuid and
-    refuses to overwrite it if a different account was used by mistake."""
+    ambiguous fresh session. Before saving, this refuses to overwrite the
+    Profile if the freshly-logged-in account doesn't match it: either a
+    different account_uuid entirely, or the same account_uuid but a
+    different organization/workspace than the Profile was added under (a
+    Team seat and a personal Max plan on one email share one account_uuid
+    but differ by org_uuid — see profiles.find_by_account_and_org()).
+    upsert_oauth_profile() then does the actual pair-aware match-and-save,
+    backfilling org_uuid/organization_type onto a Profile added before this
+    pair became the identity."""
     _banner()
     claude_exe = launch_argv("claude")[0]
     if not shutil.which(claude_exe):
@@ -1973,10 +1980,31 @@ def reauth(port: int) -> int:
         )
         return 1
 
+    # account_uuid alone isn't enough to know this is really the same
+    # Profile: a Team seat and a personal Max plan on the same email return
+    # the SAME account.uuid under a DIFFERENT organization.uuid (measured
+    # 2026-09-22). If this target Profile was already resolved to a specific
+    # organization (org_uuid is not None) and the freshly-logged-in account
+    # belongs to a different one, this is the right account but the wrong
+    # workspace — refuse the same way, rather than silently rebinding the
+    # Profile to a different subscription. A target with org_uuid=None
+    # predates this pair becoming the identity; it is matched on
+    # account_uuid alone and upsert_oauth_profile() backfills its org fields
+    # below.
+    if target.account_uuid and target.org_uuid and account.org_uuid != target.org_uuid:
+        print(
+            f"\nYou logged into the right account but a DIFFERENT organization/workspace than "
+            f"{target.name} was originally added with — refusing to overwrite it. Run "
+            "`claude-unlimited add-account` instead if you meant to add this organization as a new Profile.",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         profile, _reused = profile_repo.upsert_oauth_profile(
             name=target.name, account_uuid=account.account_uuid, credential=imported.access_token,
             plan=anthropic_oauth.plan_from_account(account),
+            org_uuid=account.org_uuid, organization_type=account.organization_type,
             refresh_token=imported.refresh_token, expires_at=imported.expires_at,
             claude_config_dir=str(config_dir),
         )

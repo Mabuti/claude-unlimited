@@ -43,7 +43,7 @@ def _fake_add_account_credentials(email="new@example.com", account_uuid="uuid-ne
         access_token="tok-new-long", refresh_token="ref-new", expires_at=9999, subscription_type="pro"), \
         anthropic_oauth.AccountProfile(
             account_uuid=account_uuid, email=email, display_name="New", org_uuid=None, org_name="Acme",
-            has_claude_max=False, has_claude_pro=True)
+            organization_type=None, has_claude_max=False, has_claude_pro=True)
 
 
 def test_add_account_full_flow_uses_an_isolated_config_dir(env, monkeypatch, tmp_path, capsys):
@@ -89,6 +89,34 @@ def test_add_account_full_flow_uses_an_isolated_config_dir(env, monkeypatch, tmp
     out = capsys.readouterr().out
     assert "Added profile" in out
     assert "will NOT log out" in out
+
+
+def test_add_account_names_a_new_team_org_profile_with_the_org_name(env, monkeypatch, tmp_path, capsys):
+    # A personal Max plan and a Team seat can share one email — see
+    # profiles.find_by_account_and_org(). The Profile name is the only thing
+    # telling them apart until the plan badge loads, so a new Team Profile
+    # must fold the org name in rather than being named from email alone.
+    monkeypatch.setattr(cli, "CLAUDE_ACCOUNTS_DIR", tmp_path / "claude-accounts")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/claude")
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kw: _FakeCompletedProcess(0))
+
+    creds = anthropic_oauth.ImportedCredentials(
+        access_token="tok-team-long", refresh_token="ref-team", expires_at=9999, subscription_type="max")
+    account = anthropic_oauth.AccountProfile(
+        account_uuid="uuid-team", email="shared@example.com", display_name="Shared",
+        org_uuid="org-team", org_name="Acme Inc", organization_type="claude_team",
+        has_claude_max=True, has_claude_pro=False)
+    monkeypatch.setattr(anthropic_oauth, "read_claude_code_credentials", lambda config_dir=None: creds)
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", lambda token: account)
+
+    assert cli.add_account() == 0
+
+    profiles = profile_repo.list_profiles()
+    assert len(profiles) == 1
+    assert profiles[0].name == "shared@example.com (Acme Inc)"
+    assert profiles[0].plan == "team"
+    assert profiles[0].org_uuid == "org-team"
+    assert profiles[0].organization_type == "claude_team"
 
 
 def test_add_account_fails_cleanly_when_claude_not_on_path(env, monkeypatch, capsys):

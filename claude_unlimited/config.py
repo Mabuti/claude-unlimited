@@ -166,7 +166,9 @@ class Profile:
     token_threshold: Optional[int] = None  # api kind only, optional: lifetime cumulative tokens at which Rotation stops picking this Profile. The api-kind analogue of switch_threshold, since an API key has no session-percentage window to measure against.
     tag_color: Optional[str] = None  # cosmetic only
     account_uuid: Optional[str] = None  # oauth kind only: the account identity Anthropic expects in the request body
-    plan: Optional[str] = None  # oauth kind only: "max" | "pro" | None (not yet detected), from anthropic_oauth.fetch_account_profile
+    org_uuid: Optional[str] = None  # oauth kind only: organization.uuid from anthropic_oauth.fetch_account_profile; part of the dedup key alongside account_uuid (see profiles.find_by_account_and_org)
+    organization_type: Optional[str] = None  # oauth kind only: organization.organization_type from anthropic_oauth.fetch_account_profile, e.g. "claude_max" | "claude_team"; drives anthropic_oauth.plan_from_account()
+    plan: Optional[str] = None  # oauth kind only: "team" | "max" | "pro" | None (not yet detected), from anthropic_oauth.fetch_account_profile
     credential_updated_at: Optional[str] = None  # ISO timestamp bumped by profiles.update_credential(), so the live Gateway can notice a re-auth and clear a stuck AUTH_INVALID state
     claude_config_dir: Optional[str] = None  # oauth kind only: an isolated CLAUDE_CONFIG_DIR this Profile was authenticated under via `claude-unlimited add-account`, so it can be re-authenticated without touching another account's session. None for a Profile added by paste or "Import current login".
     codex_home: Optional[str] = None  # codex kind only: an isolated CODEX_HOME holding this Profile's auth.json, the counterpart of claude_config_dir. Every Codex invocation is scoped to it, so it never touches another Codex login on this machine.
@@ -257,6 +259,8 @@ def load_pool() -> Pool:
             token_threshold=p.get("token_threshold"),
             tag_color=p.get("tag_color"),
             account_uuid=p.get("account_uuid"),
+            org_uuid=p.get("org_uuid"),
+            organization_type=p.get("organization_type"),
             plan=p.get("plan"),
             credential_updated_at=p.get("credential_updated_at"),
             claude_config_dir=p.get("claude_config_dir"),
