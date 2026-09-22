@@ -1,5 +1,6 @@
 import os
 import pytest
+from datetime import datetime, timedelta, timezone
 
 import claude_unlimited.cli as cli
 from claude_unlimited.config import Profile
@@ -166,3 +167,141 @@ def test_code_self_heals_the_cli_launchers(monkeypatch, code_env):
 
     assert cli.code(4317, [], profile_arg=None) == 0
     assert called == [True]
+
+
+# ---- live-state annotation ----
+
+_FIXED_NOW = datetime(2026, 9, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+
+class _FixedDatetime(datetime):
+    """Stands in for cli.datetime so `resets in Xh Ym` is exact instead of
+    racing the wall clock between building the fixture and asserting on it."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return _FIXED_NOW if tz is not None else _FIXED_NOW.replace(tzinfo=None)
+
+
+def _freeze_now(monkeypatch):
+    monkeypatch.setattr(cli, "datetime", _FixedDatetime)
+
+
+def _iso_in(**delta_kwargs):
+    return (_FIXED_NOW + timedelta(**delta_kwargs)).isoformat()
+
+
+def _iso_ago(**delta_kwargs):
+    return (_FIXED_NOW - timedelta(**delta_kwargs)).isoformat()
+
+
+def test_prompt_annotates_an_exhausted_profile_with_word_and_reset_time(monkeypatch, capsys):
+    _freeze_now(monkeypatch)
+    live = [{
+        "id": "id-a", "state": "exhausted", "status_word": "exhausted",
+        "usage_5h_percent": 100, "usage_5h_resets_at": _iso_in(hours=11, minutes=17),
+        "usage_7d_percent": 40, "usage_7d_resets_at": _iso_in(days=3),
+    }]
+    monkeypatch.setattr("builtins.input", lambda prompt: "1")
+    cli._prompt_profile_choice(_profiles(), live)
+    out = capsys.readouterr().out
+    assert "[2] Alice — exhausted · resets in 11h 17m" in out
+
+
+def test_prompt_leaves_a_healthy_profile_as_a_bare_name(monkeypatch, capsys):
+    live = [{"id": "id-a", "state": "eligible", "status_word": "healthy"}]
+    monkeypatch.setattr("builtins.input", lambda prompt: "1")
+    cli._prompt_profile_choice(_profiles(), live)
+    out = capsys.readouterr().out
+    assert "[2] Alice\n" in out
+    assert "healthy" not in out
+
+
+def test_prompt_with_no_live_snapshot_renders_bare_names(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda prompt: "1")
+    cli._prompt_profile_choice(_profiles(), None)
+    out = capsys.readouterr().out
+    assert "[2] Alice\n" in out
+    assert "[3] Bob\n" in out
+
+
+def test_prompt_renders_the_word_alone_when_there_is_no_reset_timestamp(monkeypatch, capsys):
+    live = [{"id": "id-a", "state": "cooldown", "status_word": "cooldown"}]
+    monkeypatch.setattr("builtins.input", lambda prompt: "1")
+    cli._prompt_profile_choice(_profiles(), live)
+    out = capsys.readouterr().out
+    assert "[2] Alice — cooldown\n" in out
+
+
+def test_prompt_omits_the_reset_clause_when_the_timestamp_is_in_the_past(monkeypatch, capsys):
+    _freeze_now(monkeypatch)
+    live = [{
+        "id": "id-a", "state": "draining", "status_word": "almost exhausted",
+        "usage_5h_percent": 90, "usage_5h_resets_at": _iso_ago(hours=2),
+    }]
+    monkeypatch.setattr("builtins.input", lambda prompt: "1")
+    cli._prompt_profile_choice(_profiles(), live)
+    out = capsys.readouterr().out
+    assert "[2] Alice — almost exhausted\n" in out
+    assert "resets in" not in out
+
+
+def test_prompt_falls_back_to_a_bare_name_when_the_id_is_unknown(monkeypatch, capsys):
+    live = [{"id": "not-a-known-id", "state": "exhausted", "status_word": "exhausted"}]
+    monkeypatch.setattr("builtins.input", lambda prompt: "1")
+    cli._prompt_profile_choice(_profiles(), live)
+    out = capsys.readouterr().out
+    assert "[2] Alice\n" in out
+
+
+def test_picking_a_flagged_account_still_returns_that_profile(monkeypatch):
+    live = [{"id": "id-a", "state": "exhausted", "status_word": "exhausted"}]
+    monkeypatch.setattr("builtins.input", lambda prompt: "2")
+    chosen = cli._prompt_profile_choice(_profiles(), live)
+    assert chosen.name == "Alice"
+    assert chosen.id == "id-a"
+
+
+# ---- _profile_state_suffix ----
+
+def test_profile_state_suffix_never_raises_on_a_malformed_entry():
+    # A junk timestamp costs only the reset clause — the warning still shows.
+    assert cli._profile_state_suffix(
+        {"id": "x", "state": "exhausted", "usage_5h_resets_at": 12345}) == " \u2014 exhausted"
+    # Anything not shaped like an entry at all degrades to a bare name.
+    assert cli._profile_state_suffix("not-a-dict") == ""
+    assert cli._profile_state_suffix(None) == ""
+    assert cli._profile_state_suffix({}) == ""
+
+
+def test_code_fetches_live_profiles_with_a_one_second_timeout_before_prompting(monkeypatch, code_env):
+    from claude_unlimited.config import Pool, Profile, save_pool
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="Alice", kind="oauth", enabled=True),
+        Profile(id="b", name="Bob", kind="oauth", enabled=True),
+    ]))
+    monkeypatch.setattr("builtins.input", lambda prompt: "1")
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli, "_fetch_placeholder_token", lambda host, port, timeout=2.0: "placeholder-tok")
+
+    calls = []
+
+    def fake_fetch(host, port, timeout=2.0):
+        calls.append(timeout)
+        return None
+
+    monkeypatch.setattr(cli, "_fetch_live_profiles", fake_fetch)
+
+    assert cli.code(4317, [], profile_arg=None) == 0
+    assert calls == [1.0]
+
+
+def test_unparseable_reset_timestamp_keeps_the_status_word(monkeypatch, capsys):
+    """A malformed resets_at costs the reset clause, never the warning itself."""
+    monkeypatch.setattr("builtins.input", lambda prompt: "1")
+    live = [{"id": "id-a", "state": "exhausted", "status_word": "exhausted",
+             "usage_5h_percent": 100, "usage_5h_resets_at": "not-a-timestamp"}]
+    cli._prompt_profile_choice(_profiles(), live)
+    out = capsys.readouterr().out
+    assert "Alice — exhausted" in out
+    assert "resets in" not in out

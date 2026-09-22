@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -302,16 +303,102 @@ def _match_profile(profiles: list, needle: str):
     return matches[0] if len(matches) == 1 else None
 
 
-def _prompt_profile_choice(profiles: list):
+def _format_time_delta(seconds: float) -> str:
+    """`11h 17m` / `47m` (under an hour) / `2d 3h` (over a day). `seconds`
+    is assumed non-negative — callers only reach here once a target is
+    confirmed to be in the future."""
+    total_minutes = int(seconds) // 60
+    if total_minutes < 60:
+        return f"{total_minutes}m"
+    hours, minutes = divmod(total_minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
+
+
+def _driving_reset_timestamp(entry: dict) -> Optional[str]:
+    """Which of the two usage windows' `resets_at` drives the reset clause:
+    whichever of usage_5h_percent / usage_7d_percent is higher, falling back
+    to the other window when the higher one has no timestamp. A missing or
+    non-numeric percent sorts lowest, never highest."""
+    def _pct(value):
+        return value if isinstance(value, (int, float)) else -1
+
+    windows = [
+        (_pct(entry.get("usage_5h_percent")), entry.get("usage_5h_resets_at")),
+        (_pct(entry.get("usage_7d_percent")), entry.get("usage_7d_resets_at")),
+    ]
+    windows.sort(key=lambda w: w[0], reverse=True)
+    higher, other = windows
+    return higher[1] or other[1]
+
+
+def _seconds_until(resets_at) -> Optional[float]:
+    """Seconds from now until an ISO-8601 `resets_at`, or None when it can't
+    be read as a time at all. Separate from the caller so an unparseable
+    timestamp costs only the reset clause: the status word is the part that
+    matters, and dropping "exhausted" because its reset time was malformed
+    would hide exactly what the user needs to see."""
+    try:
+        when = datetime.fromisoformat(str(resets_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (when - datetime.now(timezone.utc)).total_seconds()
+
+
+def _profile_state_suffix(entry: Optional[dict]) -> str:
+    """" — <status word>[ · resets in <Xh Ym>]" for a live /api/profiles
+    entry, or "" for a healthy/unknown account. Never raises — this renders
+    into an interactive picker the user still has to be able to use even
+    when the daemon's live snapshot is stale or malformed, so any entry this
+    function can't make sense of just degrades to a bare name."""
+    try:
+        if not entry:
+            return ""
+        state = entry.get("state")
+        if not state or state == "eligible":
+            return ""
+        word = entry.get("status_word") or state
+        suffix = f" — {word}"
+        resets_at = _driving_reset_timestamp(entry)
+        if resets_at:
+            remaining = _seconds_until(resets_at)
+            if remaining is not None and remaining > 0:
+                suffix += f" · resets in {_format_time_delta(remaining)}"
+        return suffix
+    except (AttributeError, TypeError, ValueError):
+        # A snapshot entry that isn't shaped like one (not a dict, odd types
+        # in the usage windows) degrades to a bare name rather than taking
+        # the picker down.
+        return ""
+
+
+def _prompt_profile_choice(profiles: list, live: Optional[list] = None):
     """Interactive "[1] Rotated accounts / [2] <name> / ..." picker.
+
+    `live` is the optional GET /api/profiles snapshot from
+    _fetch_live_profiles — None when the daemon wasn't reachable, in which
+    case every profile just prints its bare name. Matched to `profiles` by
+    id, never by name.
 
     Returns a Profile to pin to, or None for the normal unpinned behavior.
     Empty input defaults to option 1. KeyboardInterrupt and EOFError
     propagate: code() decides how Ctrl-C or Ctrl-D ends the process."""
+    live_by_id = {}
+    try:
+        for entry in live or []:
+            if isinstance(entry, dict) and entry.get("id"):
+                live_by_id[entry["id"]] = entry
+    except TypeError:  # a snapshot that is not a list of entries means bare names
+        live_by_id = {}
+
     print("Which Profile should this session use?\n")
     print("  [1] Rotated accounts (default — automatic threshold/priority rotation)")
     for i, p in enumerate(profiles, start=2):
-        print(f"  [{i}] {p.name}")
+        print(f"  [{i}] {p.name}{_profile_state_suffix(live_by_id.get(p.id))}")
     print()
     raw = input(f"Choice [1-{len(profiles) + 1}, default 1]: ").strip()
     if not raw or raw == "1":
@@ -1423,8 +1510,12 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -
                 print("Available: " + ", ".join(p.name for p in enabled_profiles), file=sys.stderr)
             return 1
     elif len(enabled_profiles) > 1 and sys.stdin.isatty():
+        # Short timeout deliberately: this is the interactive launch path,
+        # and an unreachable daemon must not stall the picker — it just
+        # renders bare names (see _fetch_live_profiles' own None fallback).
+        live_profiles = _fetch_live_profiles(LOOPBACK_HOST, port, timeout=1.0)
         try:
-            forced_profile = _prompt_profile_choice(enabled_profiles)
+            forced_profile = _prompt_profile_choice(enabled_profiles, live_profiles)
         except (KeyboardInterrupt, EOFError):
             print("\nCancelled.", file=sys.stderr)
             return 1
