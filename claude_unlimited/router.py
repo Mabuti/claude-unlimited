@@ -32,6 +32,15 @@ from .observation import (
 )
 
 
+# Percentage points below switch_threshold that counts as "approaching" —
+# shared by the Gateway's own near-threshold warning and by any display
+# surface (CLI picker, Dashboard) that needs to know whether a restored
+# usage number contradicts a "healthy" status word. Lives here, not in
+# gateway.py, so a lightweight caller (cli.py) doesn't have to pull in the
+# Gateway's full set of heavy imports just to read one constant.
+APPROACHING_THRESHOLD_BAND = 5.0
+
+
 class ProfileState(str, Enum):
     ELIGIBLE = "eligible"
     DRAINING = "draining"  # threshold crossed; deprioritised, but still usable as a last resort (see choose)

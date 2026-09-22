@@ -32,7 +32,7 @@ from . import profiles as profile_repo
 from .config import Pool, Profile, load_pool
 from .observation import AuthInvalid, ProviderUnavailable, QuotaExhausted, Unknown, UsageSnapshot, classify
 from .proxy import build_upstream_request, filter_response_headers, request_model, rewrite_model
-from .router import PoolSnapshot, ProfileRuntime, ProfileState, RoutingDecision, choose, observe, recover_expired_cooldowns
+from .router import APPROACHING_THRESHOLD_BAND, PoolSnapshot, ProfileRuntime, ProfileState, RoutingDecision, choose, observe, recover_expired_cooldowns
 from .upstream import UpstreamResponse
 from .upstream import send as real_send
 
@@ -107,7 +107,8 @@ def _filter_openai_headers(headers: dict[str, str]) -> dict[str, str]:
 # it leaves ELIGIBLE (rotated/exhausted) or comes back from a reset, so the
 # next approach gets its own warning instead of staying silent forever.
 _QUOTA_RESET_SOURCE_STATES = (ProfileState.COOLDOWN, ProfileState.EXHAUSTED, ProfileState.DRAINING)
-APPROACHING_THRESHOLD_BAND = 5.0  # percentage points below switch_threshold that counts as "approaching"
+# APPROACHING_THRESHOLD_BAND now lives in router.py (imported below) so
+# display surfaces like cli.py can reuse it without importing this module.
 
 # Status codes plausibly meaning "this specific model isn't usable with this
 # key" for an API-kind Profile — 400 (invalid_request_error, e.g. "model:
