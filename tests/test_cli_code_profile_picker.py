@@ -305,3 +305,83 @@ def test_unparseable_reset_timestamp_keeps_the_status_word(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Alice — exhausted" in out
     assert "resets in" not in out
+
+
+# ---- _profile_state_suffix: eligible-but-contradicts-"healthy" ----
+
+def test_eligible_and_well_below_the_band_renders_bare():
+    entry = {"id": "id-a", "state": "eligible", "status_word": "healthy",
+              "usage_5h_percent": 26.0, "usage_7d_percent": 40.0}
+    assert cli._profile_state_suffix(entry) == ""
+
+
+def test_eligible_but_5h_in_band_renders_the_5h_window_and_percent():
+    # default switch_threshold 98.0, band width 5.0 -> band starts at 93.0
+    entry = {"id": "id-a", "state": "eligible", "status_word": "healthy",
+              "usage_5h_percent": 95.0, "usage_7d_percent": 40.0}
+    assert cli._profile_state_suffix(entry) == " — 5h at 95%"
+
+
+def test_eligible_but_7d_in_band_renders_the_7d_window_and_percent():
+    entry = {"id": "id-a", "state": "eligible", "status_word": "healthy",
+              "usage_5h_percent": 26.0, "usage_7d_percent": 98.0}
+    assert cli._profile_state_suffix(entry) == " — 7d at 98%"
+
+
+def test_eligible_with_both_windows_in_band_shows_the_higher():
+    entry = {"id": "id-a", "state": "eligible", "status_word": "healthy",
+              "usage_5h_percent": 95.0, "usage_7d_percent": 98.0}
+    assert cli._profile_state_suffix(entry) == " — 7d at 98%"
+
+
+def test_eligible_uses_the_wire_window_labels_when_present():
+    entry = {"id": "id-a", "state": "eligible", "status_word": "healthy",
+              "usage_7d_percent": 98.0, "usage_window_label_7d": "1w"}
+    assert cli._profile_state_suffix(entry) == " — 1w at 98%"
+
+
+def test_non_eligible_state_rendering_is_unchanged_by_the_eligible_band_logic():
+    entry = {"id": "id-a", "state": "exhausted", "status_word": "exhausted",
+              "usage_5h_percent": 100, "usage_7d_percent": 98.0}
+    assert cli._profile_state_suffix(entry) == " — exhausted"
+
+
+def test_eligible_with_missing_switch_threshold_falls_back_to_the_default():
+    # No switch_threshold on the entry at all -> DEFAULT_SWITCH_THRESHOLD (98.0)
+    # governs the band, same as the explicit-98.0 case above.
+    entry = {"id": "id-a", "state": "eligible", "status_word": "healthy",
+              "usage_7d_percent": 98.0}
+    assert cli._profile_state_suffix(entry) == " — 7d at 98%"
+
+
+def test_eligible_with_missing_or_none_percents_renders_bare():
+    assert cli._profile_state_suffix({"id": "id-a", "state": "eligible", "status_word": "healthy"}) == ""
+    entry = {"id": "id-a", "state": "eligible", "status_word": "healthy",
+              "usage_5h_percent": None, "usage_7d_percent": None}
+    assert cli._profile_state_suffix(entry) == ""
+
+
+def test_eligible_with_a_custom_switch_threshold_moves_the_band():
+    # switch_threshold 80.0, band width 5.0 -> band starts at 75.0, so 76%
+    # qualifies here even though it would be well clear of the 98.0 default.
+    entry = {"id": "id-a", "state": "eligible", "status_word": "healthy",
+              "switch_threshold": 80.0, "usage_5h_percent": 76.0}
+    assert cli._profile_state_suffix(entry) == " — 5h at 76%"
+
+    # And the same 76% does NOT qualify under the default threshold.
+    entry_default = {"id": "id-a", "state": "eligible", "status_word": "healthy",
+                       "usage_5h_percent": 76.0}
+    assert cli._profile_state_suffix(entry_default) == ""
+
+
+def test_usage_band_is_inclusive_at_its_exact_boundary():
+    """The band is "at or above", not "above" — pin it, or a > / >= slip
+    passes every other test in this file."""
+    def suffix(pct):
+        return cli._profile_state_suffix({
+            "id": "id-a", "state": "eligible", "status_word": "healthy",
+            "switch_threshold": 98.0, "usage_7d_percent": pct})
+
+    assert suffix(92.999) == ""
+    assert suffix(93.0) == " \u2014 7d at 93%"     # exactly threshold - band
+    assert suffix(93.001) != ""

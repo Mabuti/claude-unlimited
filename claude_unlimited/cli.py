@@ -36,8 +36,9 @@ from . import daemon_installer
 from . import i18n
 from . import updater
 from . import profiles as profile_repo
-from .config import CLAUDE_ACCOUNTS_DIR, CODEX_ACCOUNTS_DIR, ensure_app_dir, load_pool, launch_argv, resolve_port
+from .config import CLAUDE_ACCOUNTS_DIR, CODEX_ACCOUNTS_DIR, DEFAULT_SWITCH_THRESHOLD, ensure_app_dir, load_pool, launch_argv, resolve_port
 from .daemon import DEFAULT_PORT, LOOPBACK_HOST, run_foreground
+from .router import APPROACHING_THRESHOLD_BAND
 
 # The escalation ladder for stopping a process. SIGKILL is Unix-only — even
 # naming `signal.SIGKILL` raises AttributeError on Windows — so it is included
@@ -349,18 +350,56 @@ def _seconds_until(resets_at) -> Optional[float]:
     return (when - datetime.now(timezone.utc)).total_seconds()
 
 
+def _format_percent(value) -> str:
+    """`98%` for a whole number, `97.5%` otherwise — never `98.0%`."""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return f"{value}%"
+
+
+def _eligible_usage_suffix(entry: dict) -> str:
+    """" — <window> at <pct>%" for a `state == "eligible"` profile whose
+    restored usage numbers contradict "healthy", or "" when it's genuinely
+    healthy. A window "contradicts healthy" once its percent is at or above
+    switch_threshold - APPROACHING_THRESHOLD_BAND — the same band the
+    Gateway itself uses to warn about an approaching threshold (see
+    gateway.py), so this never disagrees with the Gateway about what counts
+    as "approaching". When both windows qualify, the higher one wins."""
+    switch_threshold = entry.get("switch_threshold")
+    if not isinstance(switch_threshold, (int, float)):
+        switch_threshold = DEFAULT_SWITCH_THRESHOLD
+    band = switch_threshold - APPROACHING_THRESHOLD_BAND
+
+    candidates = [
+        (entry.get("usage_5h_percent"), entry.get("usage_window_label") or "5h"),
+        (entry.get("usage_7d_percent"), entry.get("usage_window_label_7d") or "7d"),
+    ]
+    qualifying = [
+        (pct, label) for pct, label in candidates
+        if isinstance(pct, (int, float)) and pct >= band
+    ]
+    if not qualifying:
+        return ""
+    pct, label = max(qualifying, key=lambda pair: pair[0])
+    return f" — {label} at {_format_percent(pct)}"
+
+
 def _profile_state_suffix(entry: Optional[dict]) -> str:
     """" — <status word>[ · resets in <Xh Ym>]" for a live /api/profiles
-    entry, or "" for a healthy/unknown account. Never raises — this renders
-    into an interactive picker the user still has to be able to use even
-    when the daemon's live snapshot is stale or malformed, so any entry this
-    function can't make sense of just degrades to a bare name."""
+    entry in a non-eligible state; " — <window> at <pct>%" for an eligible
+    (healthy) entry whose restored usage numbers contradict that; or "" when
+    there's nothing to say. Never raises — this renders into an interactive
+    picker the user still has to be able to use even when the daemon's live
+    snapshot is stale or malformed, so any entry this function can't make
+    sense of just degrades to a bare name."""
     try:
         if not entry:
             return ""
         state = entry.get("state")
-        if not state or state == "eligible":
+        if not state:
             return ""
+        if state == "eligible":
+            return _eligible_usage_suffix(entry)
         word = entry.get("status_word") or state
         suffix = f" — {word}"
         resets_at = _driving_reset_timestamp(entry)

@@ -883,9 +883,47 @@ function usageWindowLabelOrBlank(rawLabel) {
   return rawLabel ? usageWindowLabel(rawLabel, '') : '';
 }
 
+// The daemon deliberately drops quota state (not usage numbers) on restart
+// (see runtime_state.py's module docstring), so right after a restart a
+// Profile can read status_word "healthy" while its restored usage_5h/7d
+// percent already sits at or past where it would have rotated away. Mirrors
+// the CLI profile picker's rule (cli.py _eligible_usage_suffix /
+// router.APPROACHING_THRESHOLD_BAND): a window at or above
+// switch_threshold - ALMOST_EXHAUSTED_BAND contradicts "healthy". Both
+// surfaces use the same band so they never disagree. Returns null when
+// nothing contradicts the word.
+function healthyUsageOverride(p) {
+  if (p.status_word !== 'healthy') return null;
+  // Mirrors the CLI's fallback (cli.py _eligible_usage_suffix): an entry
+  // arriving without a usable switch_threshold falls back to the daemon's
+  // own default, which GET /api/status already serves. Returning null here
+  // instead would fail OPEN — leaving the "healthy" word on a Profile whose
+  // numbers contradict it, which is the one thing this function exists to
+  // prevent, and would make the Dashboard disagree with the picker.
+  let threshold = p.switch_threshold;
+  if (typeof threshold !== 'number' && _lastStatus) threshold = _lastStatus.default_switch_threshold;
+  if (typeof threshold !== 'number') return null;
+  const band = threshold - ALMOST_EXHAUSTED_BAND;
+  const candidates = [
+    [p.usage_5h_percent, usageWindowLabel(p.usage_window_label, primaryWindowFallbackKey(p))],
+    [p.usage_7d_percent, usageWindowLabel(p.usage_window_label_7d, secondaryWindowFallbackKey(p))],
+  ];
+  const qualifying = candidates.filter(([pct]) => typeof pct === 'number' && pct >= band);
+  if (!qualifying.length) return null;
+  qualifying.sort((a, b) => b[0] - a[0]);
+  const [pct, label] = qualifying[0];
+  const over = pct >= threshold;
+  return {
+    text: `${label} ${pct}%`,
+    color: over ? 'var(--bad)' : 'var(--warn)',
+    bg: over ? 'var(--bad-soft)' : 'var(--warn-soft)',
+  };
+}
+
 function renderProfileCard(p) {
   const isActive = _lastStatus && _lastStatus.current_profile_id === p.id;
-  const statusColors = STATUS_COLORS[p.status_word] || { color: 'var(--good)', bg: 'var(--good-soft)' };
+  const usageOverride = healthyUsageOverride(p);
+  const statusColors = usageOverride || STATUS_COLORS[p.status_word] || { color: 'var(--good)', bg: 'var(--good-soft)' };
   // The plan badge already names the tier, so this carries only the detail
   // it has no room for: the base_url. A chatgpt_subscription codex Profile
   // has no base_url (it routes through the `codex` CLI), so it stays blank
@@ -941,7 +979,7 @@ function renderProfileCard(p) {
           <span class="mono-num">${p.priority}</span>
         </span>
         ${p.enabled
-          ? `<span class="p-status-word" style="color:${statusColors.color};background:${statusColors.bg}">${esc(statusLabel(p.status_word))}</span>`
+          ? `<span class="p-status-word" style="color:${statusColors.color};background:${statusColors.bg}">${esc(usageOverride ? usageOverride.text : statusLabel(p.status_word))}</span>`
           : `<span class="p-disabled-badge">${esc(t('profile.disabled'))}</span>`}
       </div>
       <div class="p-bars">${usageBlock}</div>
@@ -1418,8 +1456,9 @@ function openProfileDetailModal(profileId) {
   document.getElementById('pd_name').firstChild.textContent = p.name + ' ';
   document.getElementById('pd_name_input').value = p.name;
   const statusTag = document.getElementById('pd_status_tag');
-  if (p.enabled && p.status_word !== 'healthy') {
-    statusTag.textContent = statusLabel(p.status_word);
+  const pdUsageOverride = healthyUsageOverride(p);
+  if (p.enabled && (p.status_word !== 'healthy' || pdUsageOverride)) {
+    statusTag.textContent = pdUsageOverride ? pdUsageOverride.text : statusLabel(p.status_word);
     statusTag.style.display = '';
   } else {
     statusTag.style.display = 'none';
