@@ -172,6 +172,31 @@ def test_port_change_rejects_above_65535(running_server):
     assert body["error"] == "invalid_port"
 
 
+@pytest.mark.parametrize("bad", [0, 80, 1023, 65536, 99999, -1])
+def test_port_change_rejects_everything_outside_the_shared_range(bad, running_server):
+    # The endpoint and config.resolve_port() now share one definition of the
+    # range (config.MIN_PORT/MAX_PORT), so this asserts against the constants
+    # rather than repeating 1024/65535 a third time.
+    base, token, _, _ = running_server
+    assert not config.port_in_range(bad)
+    status, body = _request(f"{base}/api/settings/port", "POST", {"port": bad},
+                             headers={"X-CSRF-Token": token})
+    assert status == 400
+    assert body["error"] == "invalid_port"
+    assert str(config.MIN_PORT) in body["message"]
+    assert str(config.MAX_PORT) in body["message"]
+
+
+def test_port_change_rejects_a_non_integer_naming_the_shared_range(running_server):
+    base, token, _, _ = running_server
+    status, body = _request(f"{base}/api/settings/port", "POST", {"port": "not-a-port"},
+                             headers={"X-CSRF-Token": token})
+    assert status == 400
+    assert body["error"] == "invalid_port"
+    assert str(config.MIN_PORT) in body["message"]
+    assert str(config.MAX_PORT) in body["message"]
+
+
 def test_port_change_noop_when_equal_to_running_port(running_server, monkeypatch):
     base, token, tmp_path, port = running_server
     install_calls = []

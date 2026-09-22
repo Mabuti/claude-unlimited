@@ -45,6 +45,21 @@ CONFIG_LOCK = threading.Lock()
 
 DEFAULT_SWITCH_THRESHOLD = 98.0
 
+# The one definition of what counts as a usable listen port, for every path
+# that resolves one: the --port flag, CLAUDE_UNLIMITED_PORT, settings.port and
+# POST /api/settings/port (daemon.py imports these rather than repeating the
+# numbers, so the CLI and the Dashboard can never disagree about what they
+# accept). The floor is 1024, not 1: this daemon does not run privileged, so
+# anything below that cannot be bound and telling the user "between 1024 and
+# 65535" up front beats an EACCES from deep inside the bind.
+MIN_PORT = 1024
+MAX_PORT = 65535
+
+
+def port_in_range(port: int) -> bool:
+    """True when `port` is one this daemon could actually bind."""
+    return MIN_PORT <= port <= MAX_PORT
+
 
 def _default_port() -> int:
     """daemon.py owns DEFAULT_PORT (4317) and already imports this module at
@@ -125,19 +140,52 @@ def resolve_port(explicit: Optional[int]) -> int:
     env > settings.port > DEFAULT_PORT. argparse's own `default=` can't tell
     "flag omitted" from "flag given but happened to equal the default", so
     every --port subparser passes `default=None` and every reader calls this
-    instead of reading args.port directly."""
+    instead of reading args.port directly.
+
+    Every candidate is range-checked against MIN_PORT/MAX_PORT — the same
+    pair POST /api/settings/port enforces — so a port can't sail through the
+    CLI that the Dashboard would reject. An out-of-range explicit --port
+    raises ValueError (the user typed it and deserves to be told); an
+    out-of-range env var or a hand-edited out-of-range settings.port falls
+    through to the next candidate, exactly as a non-numeric env var already
+    did.
+
+    Raises:
+        ValueError: `explicit` is outside MIN_PORT..MAX_PORT."""
     if explicit is not None:
+        if not port_in_range(explicit):
+            # An explicit --port is the one input a human definitely typed on
+            # purpose, so an out-of-range one is an error, not something to
+            # quietly paper over: silently falling back would start the daemon
+            # on a port they did not ask for and never tell them why.
+            raise ValueError(
+                f"--port must be between {MIN_PORT} and {MAX_PORT} (got {explicit}); "
+                f"anything below {MIN_PORT} needs privileges this daemon does not run with."
+            )
         return explicit
     env = os.environ.get("CLAUDE_UNLIMITED_PORT")
     if env:
         try:
-            return int(env)
+            candidate = int(env)
         except ValueError:
-            pass  # not a number; fall through to settings/default rather than crash
+            candidate = None  # not a number; fall through to settings/default rather than crash
+        # Out of range is treated the same way as not-a-number. The
+        # environment is not a place a user watches for error messages — it
+        # gets inherited from a service unit, a shell profile, a parent
+        # process — so a bad value there falls back rather than refusing to
+        # start something that was working yesterday.
+        if candidate is not None and port_in_range(candidate):
+            return candidate
     try:
-        return load_pool().settings.port
+        saved = load_pool().settings.port
     except Exception:
         return _default_port()
+    # settings.port normally cannot be out of range — POST /api/settings/port
+    # is the only writer and it validates — but config.json is a plain file a
+    # user is invited to hand-edit (run_foreground's bind-failure message says
+    # so in as many words), so this is not a can't-happen. Same treatment as a
+    # bad env var: fall back rather than refuse to start.
+    return saved if port_in_range(saved) else _default_port()
 
 
 @dataclass

@@ -2164,6 +2164,23 @@ def reauth(port: int) -> int:
     return 0
 
 
+def _resolve_port_or_exit(explicit) -> int:
+    """resolve_port() for the CLI, where a bad --port is a typo, not a crash.
+
+    config.resolve_port() raises ValueError on an out-of-range explicit port
+    deliberately — a user who typed `--port 99999` must be told, not silently
+    given 4317. But main() calls it inside the dispatch expression, so an
+    uncaught raise reaches the terminal as a stack trace whose last line
+    happens to be the message. argparse exits 2 with one line for a bad flag;
+    a bad flag VALUE should look the same.
+    """
+    try:
+        return resolve_port(explicit)
+    except ValueError as exc:
+        print(f"claude-unlimited: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="claude-unlimited", add_help=True,
@@ -2219,7 +2236,7 @@ def main(argv=None) -> int:
 
     args, unknown = parser.parse_known_args(argv)
     if args.cmd == "start":
-        return start(resolve_port(args.port))
+        return start(_resolve_port_or_exit(args.port))
     if args.cmd == "status":
         return status()
     if args.cmd == "doctor":
@@ -2229,13 +2246,13 @@ def main(argv=None) -> int:
     if args.cmd in ("add-codex-account", "aca"):
         return add_codex_account()
     if args.cmd == "reauth":
-        return reauth(resolve_port(args.port))
+        return reauth(_resolve_port_or_exit(args.port))
     if args.cmd == "code":
-        return code(resolve_port(args.port), unknown, profile_arg=args.profile)
+        return code(_resolve_port_or_exit(args.port), unknown, profile_arg=args.profile)
     if args.cmd == "desktop":
-        return desktop_revert() if args.revert else desktop(resolve_port(args.port))
+        return desktop_revert() if args.revert else desktop(_resolve_port_or_exit(args.port))
     if args.cmd == "install":
-        return install(resolve_port(args.port))
+        return install(_resolve_port_or_exit(args.port))
     if args.cmd == "uninstall":
         return uninstall()
     if args.cmd == "service-start":
@@ -2243,9 +2260,9 @@ def main(argv=None) -> int:
     if args.cmd == "service-stop":
         return service_stop()
     if args.cmd == "restart":
-        return restart(resolve_port(args.port))
+        return restart(_resolve_port_or_exit(args.port))
     if args.cmd == "purge":
-        return purge(resolve_port(args.port), assume_yes=args.yes)
+        return purge(_resolve_port_or_exit(args.port), assume_yes=args.yes)
 
     parser.print_help()
     return 0

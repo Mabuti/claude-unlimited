@@ -167,6 +167,66 @@ def test_resolve_port_ignores_non_numeric_env(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# resolve_port(): range validation. MIN_PORT/MAX_PORT are the SAME pair
+# POST /api/settings/port enforces (daemon.py imports them), so a port can no
+# longer sail through CLAUDE_UNLIMITED_PORT or --port that the Dashboard
+# would reject out of hand.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", ["0", "80", "65536", "99999", "-1"])
+def test_resolve_port_out_of_range_env_falls_back_to_settings(bad, tmp_path, monkeypatch):
+    # Same treatment as a non-numeric value: the environment is inherited from
+    # a service unit or a shell profile, not a place anyone reads errors, so a
+    # bad value there must not stop a daemon that worked yesterday.
+    _isolate(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_UNLIMITED_PORT", bad)
+    config.save_pool(config.Pool(settings=config.Settings(port=7000)))
+    assert config.resolve_port(None) == 7000
+
+
+def test_resolve_port_out_of_range_env_falls_back_to_default_when_no_settings(tmp_path, monkeypatch):
+    _isolate(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_UNLIMITED_PORT", "99999")
+    assert config.resolve_port(None) == config._default_port()
+
+
+@pytest.mark.parametrize("edge", [config.MIN_PORT, config.MAX_PORT, 5000])
+def test_resolve_port_accepts_in_range_env(edge, tmp_path, monkeypatch):
+    _isolate(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_UNLIMITED_PORT", str(edge))
+    config.save_pool(config.Pool(settings=config.Settings(port=7000)))
+    assert config.resolve_port(None) == edge
+
+
+@pytest.mark.parametrize("bad", [0, 80, 1023, 65536, 99999, -1])
+def test_resolve_port_out_of_range_explicit_raises(bad, tmp_path, monkeypatch):
+    # An explicit --port is the one value a human definitely typed, so it is
+    # an error rather than a silent fallback onto a port they never asked for.
+    _isolate(monkeypatch, tmp_path)
+    monkeypatch.delenv("CLAUDE_UNLIMITED_PORT", raising=False)
+    config.save_pool(config.Pool(settings=config.Settings(port=7000)))
+    with pytest.raises(ValueError) as excinfo:
+        config.resolve_port(bad)
+    assert str(config.MIN_PORT) in str(excinfo.value)
+    assert str(config.MAX_PORT) in str(excinfo.value)
+
+
+@pytest.mark.parametrize("edge", [config.MIN_PORT, config.MAX_PORT, 9999])
+def test_resolve_port_accepts_in_range_explicit(edge, tmp_path, monkeypatch):
+    _isolate(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_UNLIMITED_PORT", "6000")
+    config.save_pool(config.Pool(settings=config.Settings(port=7000)))
+    assert config.resolve_port(edge) == edge
+
+
+def test_port_in_range_boundaries():
+    assert not config.port_in_range(config.MIN_PORT - 1)
+    assert config.port_in_range(config.MIN_PORT)
+    assert config.port_in_range(config.MAX_PORT)
+    assert not config.port_in_range(config.MAX_PORT + 1)
+
+
+# ---------------------------------------------------------------------------
 # validated_settings_changes(): launchers accepted/validated, port rejected
 # ---------------------------------------------------------------------------
 
@@ -204,3 +264,14 @@ def test_validated_settings_changes_rejects_port_even_alongside_other_valid_fiel
     # must not silently drop it and apply the rest — it must fail loudly.
     with pytest.raises(ValueError, match="POST /api/settings/port"):
         config.validated_settings_changes({"update_mode": "manual", "port": 5000})
+
+
+def test_resolve_port_falls_back_when_settings_port_is_out_of_range(tmp_path, monkeypatch):
+    """settings.port has one validating writer (POST /api/settings/port), but
+    config.json is a plain file run_foreground's bind-failure message invites
+    the user to hand-edit — so an out-of-range value there is reachable, and
+    must fall back rather than be handed to bind()."""
+    _isolate(monkeypatch, tmp_path)
+    monkeypatch.delenv("CLAUDE_UNLIMITED_PORT", raising=False)
+    config.save_pool(config.Pool(settings=config.Settings(port=99999)))
+    assert config.resolve_port(None) == config._default_port()

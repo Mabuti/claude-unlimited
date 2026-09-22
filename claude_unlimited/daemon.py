@@ -975,13 +975,18 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 self._send_json(400, {
                     "error": "invalid_port",
-                    "message": "port must be an integer between 1024 and 65535.",
+                    "message": f"port must be an integer between {config.MIN_PORT} "
+                               f"and {config.MAX_PORT}.",
                 })
                 return
-            if not (1024 <= new_port <= 65535):
+            # config owns the range, so this endpoint and config.resolve_port()
+            # (the --port flag and CLAUDE_UNLIMITED_PORT) can't drift apart:
+            # a port the CLI accepts is one the Dashboard accepts.
+            if not config.port_in_range(new_port):
                 self._send_json(400, {
                     "error": "invalid_port",
-                    "message": "port must be between 1024 and 65535 — anything below 1024 "
+                    "message": f"port must be between {config.MIN_PORT} and "
+                               f"{config.MAX_PORT} — anything below {config.MIN_PORT} "
                                "needs privileges this daemon does not run with.",
                 })
                 return
