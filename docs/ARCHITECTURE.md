@@ -37,6 +37,13 @@ A Profile is one account. Three kinds share the same rotation, thresholds and Da
 They differ in credential handling, transport and quota signals. A change verified on one
 kind is not verified on the others — this is the project's most repeated defect.
 
+A `codex` Profile's identity is the pair (`account_uuid`, `codex_user_id`): the ChatGPT
+account id is shared by different users, so it cannot be the key on its own.
+`profiles.find_codex_profile()` is the one place that decides a match, for both
+`add-account` and bundle import. A Profile saved before `codex_user_id` existed has it read
+locally from its own stored id_token. When an identity cannot be read, a login adds a new
+Profile and an import is blocked; neither overwrites.
+
 ## Module map
 
 **Request path** — everything a live session touches.

@@ -1,7 +1,32 @@
+import base64
+import json
+
 import pytest
 
 import claude_unlimited.activity as activity
 import claude_unlimited.profiles as profiles
+
+
+def _fake_id_token(claims: dict) -> str:
+    """A syntactically valid JWT with a bogus signature — same fixture shape
+    as test_openai_credential.py's _fake_jwt(). decode_jwt_claims() never
+    verifies signatures, so this is faithful without signing keys."""
+    header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode()
+    return f"{header}.{payload}.fakesig"
+
+
+def _codex_credential(*, account_id: str, user_id: str = None, access_token: str = "tok",
+                       refresh_token: str = None) -> str:
+    """An encoded codex credential blob carrying a real-shaped id_token, so
+    openai_credential.chatgpt_user_id() can read chatgpt_user_id out of it —
+    mirrors what `codex add-account` actually stores."""
+    import claude_unlimited.openai_credential as openai_credential
+
+    id_token = _fake_id_token({"https://api.openai.com/auth": {
+        "chatgpt_user_id": user_id, "chatgpt_account_id": account_id}}) if user_id else None
+    return openai_credential.encode(openai_credential.StoredOpenAICredential(
+        access_token=access_token, refresh_token=refresh_token, account_id=account_id, id_token=id_token))
 
 
 class FakeSecretStore:
@@ -122,22 +147,254 @@ def test_upsert_codex_profile_creates_new(fake_store, tmp_path):
     assert openai_credential.decode(fake_store.get_token(profile.id)).access_token == "tok-a"
 
 
-def test_upsert_codex_profile_refreshes_existing_by_account_id(fake_store):
+def test_upsert_codex_profile_same_user_relogin_reuses_and_refreshes_in_place(fake_store, tmp_path):
     import claude_unlimited.openai_credential as openai_credential
 
-    first = openai_credential.encode(openai_credential.StoredOpenAICredential(
-        access_token="tok-old", refresh_token="ref-old", account_id="acct-1", id_token=None))
-    created, _ = profiles.upsert_codex_profile(name="A", account_id="acct-1", encoded_credential=first)
+    home1 = str(tmp_path / "codex-accounts" / "home1")
+    home2 = str(tmp_path / "codex-accounts" / "home2")
+    first = _codex_credential(account_id="acct-1", user_id="user-a", access_token="tok-old")
+    created, _ = profiles.upsert_codex_profile(name="A", account_id="acct-1", encoded_credential=first,
+                                                codex_home=home1)
 
-    second = openai_credential.encode(openai_credential.StoredOpenAICredential(
-        access_token="tok-new", refresh_token="ref-new", account_id="acct-1", id_token=None))
-    updated, reused = profiles.upsert_codex_profile(name="A", account_id="acct-1", encoded_credential=second, plan="pro")
+    second = _codex_credential(account_id="acct-1", user_id="user-a", access_token="tok-new")
+    updated, reused = profiles.upsert_codex_profile(name="Ignored on reuse", account_id="acct-1",
+                                                      encoded_credential=second, plan="pro", codex_home=home2)
 
     assert reused is True
     assert updated.id == created.id  # same Profile, not a duplicate
     assert len(profiles.list_profiles()) == 1
+    assert updated.name == "A"  # never renamed on reuse
     assert updated.plan == "pro"
+    assert updated.codex_home == home2
+    assert updated.codex_user_id == "user-a"
     assert openai_credential.decode(fake_store.get_token(created.id)).access_token == "tok-new"
+
+
+def test_upsert_codex_profile_create_path_persists_codex_user_id(fake_store):
+    """M12 regression: the create path must pass codex_user_id through to
+    create_profile(), not just resolve it and drop it. Checked via
+    load_pool() (not only the returned dataclass) so a mutant that resolves
+    the id correctly but fails to actually persist it is still caught."""
+    from claude_unlimited.config import load_pool
+
+    cred = _codex_credential(account_id="acct-new", user_id="user-fresh")
+    created, reused = profiles.upsert_codex_profile(name="Fresh", account_id="acct-new", encoded_credential=cred)
+
+    assert reused is False
+    assert created.codex_user_id == "user-fresh"
+
+    reloaded = load_pool().get(created.id)
+    assert reloaded is not None
+    assert reloaded.codex_user_id == "user-fresh"
+
+
+def test_upsert_codex_profile_same_account_id_different_user_does_not_overwrite(fake_store, tmp_path):
+    """The 2026-09-22 incident, reproduced directly: two DIFFERENT ChatGPT
+    users sharing the SAME chatgpt_account_id must end up as two Profiles,
+    with neither credential overwritten by the other."""
+    import claude_unlimited.openai_credential as openai_credential
+
+    home_a = str(tmp_path / "codex-accounts" / "user-a")
+    home_b = str(tmp_path / "codex-accounts" / "user-b")
+    first_cred = _codex_credential(account_id="acct-shared", user_id="user-a", access_token="tok-user-a")
+    first, reused1 = profiles.upsert_codex_profile(
+        name="User A", account_id="acct-shared", encoded_credential=first_cred, codex_home=home_a)
+    assert reused1 is False
+
+    second_cred = _codex_credential(account_id="acct-shared", user_id="user-b", access_token="tok-user-b")
+    second, reused2 = profiles.upsert_codex_profile(
+        name="User B", account_id="acct-shared", encoded_credential=second_cred, codex_home=home_b)
+
+    assert reused2 is False
+    assert second.id != first.id
+    all_profiles = profiles.list_profiles()
+    assert len(all_profiles) == 2
+
+    # First user's Profile is completely untouched: name, codex_home, and the
+    # exact stored credential blob.
+    reloaded_first = next(p for p in all_profiles if p.id == first.id)
+    assert reloaded_first.name == "User A"
+    assert reloaded_first.codex_home == home_a
+    assert fake_store.get_token(first.id) == first_cred
+    assert openai_credential.decode(fake_store.get_token(first.id)).access_token == "tok-user-a"
+
+    reloaded_second = next(p for p in all_profiles if p.id == second.id)
+    assert reloaded_second.codex_home == home_b
+    assert openai_credential.decode(fake_store.get_token(second.id)).access_token == "tok-user-b"
+
+
+def test_upsert_codex_profile_legacy_profile_backfilled_on_same_user_relogin(fake_store):
+    """A codex Profile created before codex_user_id existed (None on disk)
+    but whose STORED credential already carries an id_token: re-login by the
+    SAME user resolves that stored id_token locally, confirms the match, and
+    backfills codex_user_id onto the Profile."""
+    import claude_unlimited.openai_credential as openai_credential
+
+    legacy_cred = _codex_credential(account_id="acct-1", user_id="user-a", access_token="tok-legacy")
+    legacy = profiles.create_profile(name="Legacy", kind="codex", credential=legacy_cred,
+                                      auth_mode="chatgpt_subscription", account_uuid="acct-1",
+                                      credential_already_encoded=True)
+    assert legacy.codex_user_id is None
+
+    relogin_cred = _codex_credential(account_id="acct-1", user_id="user-a", access_token="tok-fresh")
+    updated, reused = profiles.upsert_codex_profile(name="Legacy", account_id="acct-1",
+                                                      encoded_credential=relogin_cred)
+
+    assert reused is True
+    assert updated.id == legacy.id
+    assert len(profiles.list_profiles()) == 1
+    assert updated.codex_user_id == "user-a"  # backfilled
+    assert openai_credential.decode(fake_store.get_token(legacy.id)).access_token == "tok-fresh"
+
+
+def test_upsert_codex_profile_legacy_profile_resolving_to_different_user_not_overwritten(fake_store):
+    import claude_unlimited.openai_credential as openai_credential
+
+    legacy_cred = _codex_credential(account_id="acct-1", user_id="user-a", access_token="tok-legacy")
+    legacy = profiles.create_profile(name="Legacy", kind="codex", credential=legacy_cred,
+                                      auth_mode="chatgpt_subscription", account_uuid="acct-1",
+                                      credential_already_encoded=True)
+
+    other_user_cred = _codex_credential(account_id="acct-1", user_id="user-b", access_token="tok-other")
+    updated, reused = profiles.upsert_codex_profile(name="Other User", account_id="acct-1",
+                                                      encoded_credential=other_user_cred)
+
+    assert reused is False
+    assert updated.id != legacy.id
+    assert len(profiles.list_profiles()) == 2
+    reloaded_legacy = profiles.list_profiles()[[p.id for p in profiles.list_profiles()].index(legacy.id)]
+    assert reloaded_legacy.name == "Legacy"
+    assert openai_credential.decode(fake_store.get_token(legacy.id)).access_token == "tok-legacy"  # untouched
+
+
+def test_upsert_codex_profile_legacy_profile_with_unresolvable_credential_not_overwritten(fake_store):
+    """A legacy Profile whose stored credential has NO id_token at all (a
+    raw token shape, or an id_token missing the claim) can't be resolved
+    locally, so an incoming same-account_id login — even one whose own user
+    is known — must not overwrite it. A new Profile is created instead."""
+    import claude_unlimited.openai_credential as openai_credential
+
+    unresolvable_cred = _codex_credential(account_id="acct-1", access_token="tok-raw")  # no user_id -> no id_token
+    legacy = profiles.create_profile(name="Legacy", kind="codex", credential=unresolvable_cred,
+                                      auth_mode="chatgpt_subscription", account_uuid="acct-1",
+                                      credential_already_encoded=True)
+
+    incoming_cred = _codex_credential(account_id="acct-1", user_id="user-a", access_token="tok-new")
+    updated, reused = profiles.upsert_codex_profile(name="New Login", account_id="acct-1",
+                                                      encoded_credential=incoming_cred)
+
+    assert reused is False
+    assert updated.id != legacy.id
+    assert len(profiles.list_profiles()) == 2
+    assert openai_credential.decode(fake_store.get_token(legacy.id)).access_token == "tok-raw"  # untouched
+
+
+def test_upsert_codex_profile_incoming_login_without_id_token_does_not_overwrite(fake_store):
+    """The incoming side of the same rule: even against a Profile whose OWN
+    identity is fully known, a new login that carries no id_token (unknown
+    incoming user) must never be trusted to decide it's the same person."""
+    import claude_unlimited.openai_credential as openai_credential
+
+    known_cred = _codex_credential(account_id="acct-1", user_id="user-a", access_token="tok-known")
+    known, _ = profiles.upsert_codex_profile(name="Known", account_id="acct-1", encoded_credential=known_cred)
+
+    no_id_token_cred = _codex_credential(account_id="acct-1", access_token="tok-unknown")
+    updated, reused = profiles.upsert_codex_profile(name="Unknown Login", account_id="acct-1",
+                                                      encoded_credential=no_id_token_cred)
+
+    assert reused is False
+    assert updated.id != known.id
+    assert len(profiles.list_profiles()) == 2
+    assert openai_credential.decode(fake_store.get_token(known.id)).access_token == "tok-known"  # untouched
+
+
+def test_find_codex_profile_outcomes(fake_store):
+    """Direct coverage of find_codex_profile()'s (profile, blocked) contract
+    — F1 regression (verifier finding, 2026-09-22): "no candidate matched"
+    must NOT be conflated with "a candidate couldn't be resolved". Only the
+    second is `blocked=True`; a distinct, fully-resolved person sharing an
+    account_id is (None, False), same as a genuinely free account_id."""
+    # No candidate at all shares this account_id.
+    found, blocked = profiles.find_codex_profile("acct-none", "user-a")
+    assert found is None
+    assert blocked is False
+
+    # Confirmed match: the stored codex_user_id equals the incoming user_id.
+    known_cred = _codex_credential(account_id="acct-1", user_id="user-a")
+    known, _ = profiles.upsert_codex_profile(name="A", account_id="acct-1", encoded_credential=known_cred)
+    found, blocked = profiles.find_codex_profile("acct-1", "user-a")
+    assert found is not None and found.id == known.id
+    assert blocked is False
+
+    # Every same-account_id candidate resolves cleanly and NONE matches:
+    # a distinct person, not blocked — the exact F1 fix.
+    found, blocked = profiles.find_codex_profile("acct-1", "user-b")
+    assert found is None
+    assert blocked is False
+
+    # An unresolvable candidate (no id_token) shares a DIFFERENT account_id:
+    # blocked, because that candidate's own identity can't be ruled out.
+    unresolvable_cred = _codex_credential(account_id="acct-2")  # no user_id -> no id_token
+    profiles.create_profile(name="Legacy", kind="codex", credential=unresolvable_cred,
+                             auth_mode="chatgpt_subscription", account_uuid="acct-2",
+                             credential_already_encoded=True)
+    found, blocked = profiles.find_codex_profile("acct-2", "user-c")
+    assert found is None
+    assert blocked is True
+
+    # Incoming user_id unknown: blocked even against a fully-known account_id.
+    found, blocked = profiles.find_codex_profile("acct-1", None)
+    assert found is None
+    assert blocked is True
+
+
+def test_find_codex_profile_ignores_an_oauth_profile_sharing_the_account_id(fake_store):
+    """F2 regression (verifier finding, 2026-09-22): an oauth Profile whose
+    account_uuid happens to equal a codex account_id must never be treated
+    as a codex candidate — not matched, and not counted toward `blocked`
+    either. Mutation testing found that dropping find_codex_profile()'s
+    `kind == "codex"` filter still left the suite green; this pins it down
+    directly instead of relying on it being caught incidentally."""
+    profiles.create_profile(name="Oauth account", kind="oauth", credential="sk-ant-12345678",
+                             account_uuid="shared-id")
+
+    found, blocked = profiles.find_codex_profile("shared-id", "user-a")
+    assert found is None
+    assert blocked is False  # not a candidate at all, so not even "ambiguous"
+
+    # And a codex login against that same raw id must proceed as a fresh
+    # add, never as though it collided with the oauth Profile.
+    cred = _codex_credential(account_id="shared-id", user_id="user-a")
+    created, reused = profiles.upsert_codex_profile(name="Codex", account_id="shared-id", encoded_credential=cred)
+    assert reused is False
+    assert created.kind == "codex"
+    assert len(profiles.list_profiles()) == 2
+
+
+def test_upsert_codex_profile_legacy_candidate_with_token_missing_from_store_does_not_raise(fake_store):
+    """M18 regression: _resolve_codex_profile_own_user_id() must never let
+    secret_store.get_token() raising (its token has gone missing from the
+    Keychain entirely — not merely unresolvable, but absent) propagate up
+    through find_codex_profile() and crash the caller. A resolution failure
+    must always mean "can't resolve", never an exception, same contract as
+    every other resolver in this file (resolve_profile_own_identity(),
+    resolve_identity_from_access_token(), etc). Simulated as a legacy
+    codex Profile whose token was removed from the store after creation."""
+    legacy_cred = _codex_credential(account_id="acct-1", user_id="user-a")
+    legacy = profiles.create_profile(name="Legacy", kind="codex", credential=legacy_cred,
+                                      auth_mode="chatgpt_subscription", account_uuid="acct-1",
+                                      credential_already_encoded=True)
+    fake_store.delete_token(legacy.id)  # token now entirely missing from the store
+
+    incoming_cred = _codex_credential(account_id="acct-1", user_id="user-a")
+    updated, reused = profiles.upsert_codex_profile(name="New Login", account_id="acct-1",
+                                                      encoded_credential=incoming_cred)
+
+    # Can't confirm the legacy candidate is (or isn't) this same person, so
+    # this must create a new Profile — never raise, never blindly reuse.
+    assert reused is False
+    assert updated.id != legacy.id
+    assert len(profiles.list_profiles()) == 2
 
 
 def test_update_credential_raw_stores_the_blob_as_is_and_stamps_credential_updated_at(fake_store):

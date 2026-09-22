@@ -79,6 +79,25 @@ def chatgpt_plan_type(id_token: str) -> Optional[str]:
     return None
 
 
+def chatgpt_user_id(id_token: str) -> Optional[str]:
+    """Reads the ChatGPT user id from the id_token's claims — the claim
+    that, paired with account_id, is a codex Profile's real identity (see
+    profiles.find_codex_profile). account_id alone is not unique: two
+    different ChatGPT users (different emails, different chatgpt_user_id
+    claims) were measured 2026-09-22 sharing the same chatgpt_account_id, so
+    this is the discriminator profiles.py uses to tell them apart.
+
+    Same claims namespace chatgpt_plan_type() reads, but with no top-level
+    fallback key — the claim has only ever been observed nested. Fails open
+    to None on anything else, same as every other reader here: an unread
+    user id already means "don't trust this match" to every caller."""
+    claims = decode_jwt_claims(id_token)
+    value = claims.get("https://api.openai.com/auth")
+    if isinstance(value, dict) and isinstance(value.get("chatgpt_user_id"), str):
+        return value["chatgpt_user_id"]
+    return None
+
+
 def chatgpt_email(id_token: str) -> Optional[str]:
     claims = decode_jwt_claims(id_token)
     email = claims.get("email")

@@ -79,6 +79,13 @@ class ExportedProfile:
     # above.
     codex_model: Optional[str] = None
     codex_reasoning_effort: Optional[str] = None
+    # codex_user_id IS exported, unlike codex_home: it's identity (the other
+    # half of a codex Profile's dedup pair alongside account_uuid — see
+    # profiles.find_codex_profile), not a local path. Without it, a bundle
+    # item could only ever legacy-match an existing codex Profile on
+    # account_uuid alone, which is exactly the 2026-09-22 incident's
+    # ambiguity on the import side too.
+    codex_user_id: Optional[str] = None
 
 
 def build_export_bundle(
@@ -109,6 +116,7 @@ def build_export_bundle(
                 tag_color=p.tag_color, account_uuid=p.account_uuid, credential=cred,
                 plan=p.plan, org_uuid=p.org_uuid, organization_type=p.organization_type,
                 codex_model=p.codex_model, codex_reasoning_effort=p.codex_reasoning_effort,
+                codex_user_id=p.codex_user_id,
             )))
         payload["profiles"] = exported
 
@@ -207,7 +215,18 @@ def apply_import(
     matching on its own here. See that function and
     profiles.find_by_account_and_org() for what a match means and why an
     unknown organization (on either side) is never enough on its own to
-    reuse a credential."""
+    reuse a credential.
+
+    A codex item is decided the same way by profiles.find_codex_profile()
+    — the same function upsert_codex_profile() uses — with one difference
+    from the oauth path: on a "not confirmed" outcome there, `existing` is
+    handed back non-None (needs_backfill=True) so resolve_legacy_oauth_match()
+    can still run; find_codex_profile() instead hands back (None, True)
+    directly, since there is no equivalent resolution function to route
+    through (no network call can settle a ChatGPT identity — it's pure
+    local decode). Either way the result for an item conflict_strategy
+    asked to apply but couldn't be proven safe is the same:
+    profiles_overwrite_blocked, and the existing Profile is left alone."""
 
     if conflict_strategy not in ("keep_existing", "use_imported"):
         raise ExportImportError(f"Unknown conflict_strategy {conflict_strategy!r}.")
@@ -240,16 +259,82 @@ def apply_import(
             item_uuid = item.get("account_uuid")
             item_org_uuid = item.get("org_uuid")
             item_organization_type = item.get("organization_type")
+            item_kind = item.get("kind")
+            item_codex_user_id = item.get("codex_user_id")
+            if item_kind == "codex" and item.get("credential"):
+                # Never decide a codex item's identity from the bundle's
+                # claimed codex_user_id field while holding the credential
+                # that would actually prove it — same rule as the oauth
+                # branch's "resolve from the incoming credential before
+                # trusting an unknown org" below, and the reason
+                # upsert_codex_profile() resolves the incoming login's own
+                # id_token instead of taking a caller's word for who it is.
+                # The credential wins when it resolves to anything at all;
+                # the bundle's own field is only a fallback for when the
+                # credential itself yields no user id — an id_token with no
+                # chatgpt_user_id claim, or no id_token at all (a raw,
+                # non-JSON credential shape) — where the field is genuinely
+                # all there is to go on. That includes, but isn't limited
+                # to, an old-shape item exported before codex_user_id
+                # existed: such an item has no field to fall back to
+                # either, so this simply leaves item_codex_user_id at
+                # item.get("codex_user_id")'s default of None in that case.
+                from_credential = profile_repo.codex_user_id_from_encoded_credential(item["credential"])
+                if from_credential is not None:
+                    item_codex_user_id = from_credential
             existing = None
             needs_backfill = False
+            # codex_blocked is find_codex_profile()'s `blocked` return: true
+            # only when an UNRESOLVABLE same-account_id candidate stands
+            # between this account_id and a safe decision, or the incoming
+            # identity itself is unknown — see its docstring's Returns
+            # section. It is NOT true just because every candidate resolved
+            # and none of them matched: that is a genuinely distinct person
+            # sharing this account_id (the 2026-09-22 incident's own
+            # shape), and existing=None, codex_blocked=False there falls
+            # straight through to the ordinary "add a new Profile" path
+            # below, same as a brand-new account_id would. It has no oauth
+            # equivalent: find_by_account_and_org() always hands back a
+            # candidate (needs_backfill=True) for its ambiguous case
+            # instead, which is what routes an oauth item through
+            # resolve_legacy_oauth_match() below rather than needing a
+            # separate flag here.
+            codex_blocked = False
             if item_uuid:
-                existing, needs_backfill = profile_repo.find_by_account_and_org(item_uuid, item_org_uuid)
+                if item_kind == "codex":
+                    existing, codex_blocked = profile_repo.find_codex_profile(item_uuid, item_codex_user_id)
+                else:
+                    existing, needs_backfill = profile_repo.find_by_account_and_org(item_uuid, item_org_uuid)
 
-            if existing is not None and conflict_strategy == "keep_existing":
+            if (existing is not None or codex_blocked) and conflict_strategy == "keep_existing":
+                # A conflict exists (confirmed match, or an ambiguous
+                # same-account_id candidate) and the caller asked to keep
+                # what's already there — never even attempt resolution, the
+                # same short-circuit the oauth branch below takes when
+                # `existing` alone was enough to answer this.
                 result["profiles_skipped"] += 1
                 continue
 
-            if existing is not None and item.get("kind") == "oauth":
+            if existing is None and codex_blocked:
+                # Never safe to overwrite, and — unlike the genuine "no
+                # conflict" case (no candidate at all, or every candidate
+                # resolved and none of them is this item's chatgpt_user_id)
+                # — never safe to add a new Profile for this item either:
+                # this account_id has at least one Profile whose OWN
+                # identity couldn't be resolved at all, so there's no way
+                # to rule out that THAT Profile is actually this item's
+                # person. A caller that asked to apply this item gets
+                # nothing done, exactly mirroring the oauth "not safe to
+                # overwrite" branch just below. See
+                # profiles.find_codex_profile()'s docstring for why
+                # upsert_codex_profile()'s own CLI path is allowed to
+                # create a new Profile on this same outcome and this import
+                # path is not: a bundle apply is never a fresh interactive
+                # login.
+                result["profiles_overwrite_blocked"] += 1
+                continue
+
+            if existing is not None and item_kind == "oauth":
                 # Route through the ONE decision function rather than
                 # trusting find_by_account_and_org()'s match on its own —
                 # this is Finding 2: apply_import() used to call
@@ -300,6 +385,7 @@ def apply_import(
                         tag_color=item.get("tag_color"), plan=item.get("plan"),
                         org_uuid=item_org_uuid, organization_type=item_organization_type,
                         codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
+                        codex_user_id=item_codex_user_id,
                     )
                     pool.profiles = [updated if p.id == existing.id else p for p in pool.profiles]
                     save_pool(pool)
@@ -318,6 +404,7 @@ def apply_import(
                 account_uuid=item.get("account_uuid"), plan=item.get("plan"),
                 org_uuid=item_org_uuid, organization_type=item_organization_type,
                 codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
+                codex_user_id=item_codex_user_id,
             )
             secret_store.set_token(new_profile.id, item["credential"])
             with CONFIG_LOCK:

@@ -309,18 +309,31 @@ def test_find_by_account_and_org_no_match_returns_none(env):
     assert needs_backfill is False
 
 
-def test_upsert_codex_profile_unaffected_by_pair_aware_lookup(env):
-    # upsert_codex_profile() must keep using find_by_account_uuid() (a plain
-    # single-key match on an OpenAI account id) untouched.
+def test_upsert_codex_profile_unaffected_by_oauth_pair_aware_lookup(env):
+    # upsert_codex_profile() must keep using its OWN identity function
+    # (find_codex_profile(), account_id + chatgpt_user_id) rather than
+    # find_by_account_and_org() — the oauth pair-aware lookup this file
+    # covers is a different function for a different kind and must never be
+    # reached from the codex path.
+    #
+    # Both logins below carry no id_token (a plain, non-JSON encoded blob),
+    # so neither side's chatgpt_user_id can be resolved — this is exactly
+    # the "unresolvable candidate" / "unknown incoming user" case
+    # profiles.find_codex_profile() treats as unsafe to reuse (see
+    # test_profiles.py::test_upsert_codex_profile_legacy_profile_with_unresolvable_credential_not_overwritten
+    # and ...incoming_login_without_id_token_does_not_overwrite for the
+    # dedicated coverage). It must therefore create a SECOND Profile here,
+    # not merge into the first the way a bare account_id match once did —
+    # that old behavior is the 2026-09-22 incident this fix removes.
     first, reused1 = profile_repo.upsert_codex_profile(
         name="Codex", account_id="codex-uuid-1", encoded_credential="enc-tok-1-long")
     assert reused1 is False
 
     second, reused2 = profile_repo.upsert_codex_profile(
         name="Codex", account_id="codex-uuid-1", encoded_credential="enc-tok-2-long")
-    assert reused2 is True
-    assert second.id == first.id
-    assert len(profile_repo.list_profiles()) == 1
+    assert reused2 is False
+    assert second.id != first.id
+    assert len(profile_repo.list_profiles()) == 2
 
 
 def test_find_by_account_uuid(env):

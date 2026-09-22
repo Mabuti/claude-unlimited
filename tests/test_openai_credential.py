@@ -7,6 +7,7 @@ from claude_unlimited.openai_credential import (
     access_token_expires_at,
     chatgpt_email,
     chatgpt_plan_type,
+    chatgpt_user_id,
     decode,
     decode_jwt_claims,
     encode,
@@ -77,6 +78,41 @@ def test_chatgpt_plan_type_none_when_absent():
 def test_chatgpt_email_reads_the_real_claim():
     token = _fake_jwt({"email": "user@example.com"})
     assert chatgpt_email(token) == "user@example.com"
+
+
+def test_chatgpt_user_id_reads_the_real_claim_shape():
+    # 2026-09-22: two different ChatGPT users, different chatgpt_user_id
+    # claims, shared the same chatgpt_account_id — this claim is the
+    # discriminator profiles.find_codex_profile() uses to tell them apart.
+    token = _fake_jwt({"https://api.openai.com/auth": {
+        "chatgpt_user_id": "user-abc123", "chatgpt_account_id": "acct-shared", "chatgpt_plan_type": "plus"}})
+    assert chatgpt_user_id(token) == "user-abc123"
+
+
+def test_chatgpt_user_id_none_when_absent():
+    token = _fake_jwt({"email": "a@b.com"})
+    assert chatgpt_user_id(token) is None
+
+
+def test_chatgpt_user_id_none_when_namespace_present_but_wrong_shape():
+    token = _fake_jwt({"https://api.openai.com/auth": "not-a-dict"})
+    assert chatgpt_user_id(token) is None
+
+
+def test_chatgpt_user_id_none_when_claim_is_not_a_string():
+    # M17 regression: the claim itself must be a string, not merely present
+    # — a non-string chatgpt_user_id (an int, a nested dict) must fail open
+    # to None rather than being returned as-is and later compared against a
+    # real string user id, where it could never legitimately match but
+    # would also never legitimately mean "same as this real string".
+    token_int = _fake_jwt({"https://api.openai.com/auth": {"chatgpt_user_id": 12345}})
+    assert chatgpt_user_id(token_int) is None
+
+    token_nested = _fake_jwt({"https://api.openai.com/auth": {"chatgpt_user_id": {"nested": "value"}}})
+    assert chatgpt_user_id(token_nested) is None
+
+    token_list = _fake_jwt({"https://api.openai.com/auth": {"chatgpt_user_id": ["a", "b"]}})
+    assert chatgpt_user_id(token_list) is None
 
 
 def test_encode_decode_round_trip():

@@ -18,7 +18,7 @@ from typing import Optional
 # has no circular-import risk. Needed here for resolve_profile_own_identity()
 # — see its docstring for why this module, not the gateway, is what verifies
 # a Profile's own organization before a login is allowed to touch it.
-from . import activity, anthropic_oauth, connectors, oauth_credential, secret_store
+from . import activity, anthropic_oauth, connectors, oauth_credential, openai_credential, secret_store
 from . import config as config_module
 from .config import CONFIG_LOCK, Pool, Profile, load_pool, save_pool
 
@@ -131,7 +131,7 @@ def _validate_field_types(**changes) -> None:
         if key in changes and not isinstance(changes[key], str):
             raise ValidationError(f"{key} must be a string.")
 
-    for key in ("base_url", "default_model", "tag_color", "plan", "codex_model"):
+    for key in ("base_url", "default_model", "tag_color", "plan", "codex_model", "codex_user_id"):
         if key in changes and changes[key] is not None and not isinstance(changes[key], str):
             raise ValidationError(f"{key} must be a string, or null.")
 
@@ -154,6 +154,153 @@ def find_by_account_uuid(account_uuid: str) -> Optional[Profile]:
     `add-account` for an already-added account must update its credential
     rather than create a duplicate row."""
     return next((p for p in load_pool().profiles if p.account_uuid == account_uuid), None)
+
+
+def find_codex_profile(account_id: str, user_id: Optional[str],
+                        *, profiles: Optional[list[Profile]] = None) -> tuple[Optional[Profile], bool]:
+    """The codex-kind analogue of find_by_account_and_org(): a codex
+    Profile's dedup key is the PAIR (account_id, chatgpt_user_id), not the
+    OpenAI account_id alone.
+
+    Measured 2026-09-22: two DIFFERENT ChatGPT users — different emails,
+    different chatgpt_user_id claims in their id_tokens — shared the SAME
+    chatgpt_account_id on this machine. upsert_codex_profile() deduped on
+    account_id alone via find_by_account_uuid(), so the second user's
+    `codex add-account` login silently overwrote the first user's stored
+    credential and repointed its codex_home at the second user's isolated
+    CODEX_HOME. This is the one place that decides what a codex Profile's
+    identity is, shared by upsert_codex_profile() and
+    export_import.apply_import() so the rule can never diverge between
+    them, the same way find_by_account_and_org()/resolve_legacy_oauth_match()
+    are shared on the oauth side.
+
+    Unlike the oauth pair, there is no network call that can resolve a
+    ChatGPT account's identity — chatgpt_user_id lives only in the
+    id_token's own claims — so this function is pure local decode
+    throughout and NEVER makes a network call.
+
+    Returns (profile, blocked):
+      - A same-account_id Profile whose identity is confirmed to be
+        `user_id` -> (profile, False). "Confirmed" means either its stored
+        codex_user_id already equals `user_id`, or (a legacy Profile with
+        codex_user_id=None) its OWN stored credential's id_token, decoded
+        locally, resolves to `user_id`. Reuse it; the caller backfills
+        codex_user_id on the legacy path.
+      - No Profile at all shares this account_id -> (None, False). Safe to
+        create a new Profile — nothing here could be this person, so
+        nothing here is at risk of being mistaken for them either.
+      - Every same-account_id Profile's identity resolves (no unresolvable
+        candidate) and NONE of them equals `user_id` -> (None, False). This
+        is a genuinely distinct person sharing this account_id — the
+        2026-09-22 incident's own shape, seats A and B on one
+        chatgpt_account_id — and is exactly as safe to create a new
+        Profile for as the no-candidate case above: every candidate's true
+        identity is already proven, and none of them is this login, so
+        creating a separate Profile cannot collide with any of them. (Found
+        by verifier F1, 2026-09-22: this used to return blocked=True here
+        too, which made export_import.apply_import() refuse to add a
+        second seat on a clean migration — the incident's symptom
+        reappearing from the fix meant to prevent it.)
+      - At least one same-account_id Profile's identity could NOT be
+        resolved (no id_token in its stored credential, or a decode
+        failure), and none of the RESOLVED candidates (if any) matched
+        `user_id` -> (None, True). `blocked=True` here means specifically
+        "an unresolved candidate stands between this account_id and a safe
+        decision" — it is NOT a stand-in for "no candidate confirmed a
+        match" in general, which is the (None, False) case just above.
+      - The incoming `user_id` itself is unknown (None) -> (None, True),
+        regardless of whether every candidate resolves cleanly: an unknown
+        incoming identity can never be compared against anything, known or
+        not, symmetric with find_by_account_and_org()'s "org_uuid is None"
+        branch.
+
+    `blocked=True` marks the two outcomes above apart from a genuine "no
+    conflict" case (no candidate at all, or every candidate resolved and
+    none matched): this account_id is NOT free to assume is a fresh person
+    when the doubt is about an UNRESOLVABLE candidate or an UNKNOWN
+    incoming login — see export_import.apply_import(), which must not
+    create a duplicate on `blocked=True` even though it also gets
+    `existing=None` there. Only upsert_codex_profile()'s own "no match ->
+    add" default is allowed to fall through to creating a Profile
+    regardless of `blocked`, because a fresh interactive login is never
+    mistaken for an unattended bundle overwrite either way.
+
+    `profiles` lets a caller holding an in-progress, unsaved Pool snapshot
+    match against that snapshot instead of re-reading config.json —
+    unused today (unlike find_by_account_and_org(), apply_import() commits
+    each codex item as its own transaction too), kept for the same reason
+    find_by_account_and_org() takes it: so a future caller that does need
+    it never has to duplicate this function to get it."""
+    candidates = [p for p in (load_pool().profiles if profiles is None else profiles)
+                  if p.kind == "codex" and p.account_uuid == account_id]
+    if not candidates:
+        return None, False
+    if user_id is None:
+        return None, True
+
+    any_unresolved = False
+    for p in candidates:
+        known = p.codex_user_id if p.codex_user_id is not None else _resolve_codex_profile_own_user_id(p)
+        if known is None:
+            any_unresolved = True
+            continue
+        if known == user_id:
+            return p, False
+    # No candidate matched. Blocked only if at least one candidate's own
+    # identity couldn't be proven either way — if every candidate resolved
+    # cleanly and none of them is this person, this is a distinct person,
+    # safe to add (see the docstring's F1 outcome above).
+    return None, any_unresolved
+
+
+def _resolve_codex_profile_own_user_id(profile: Profile) -> Optional[str]:
+    """Resolves a legacy codex Profile's own chatgpt_user_id LOCALLY, from
+    ITS OWN stored credential's id_token — never from the incoming login,
+    and never a network call (there is none to make for a ChatGPT account;
+    this is the codex counterpart of resolve_profile_own_identity(), minus
+    the fetch half that function needs for Anthropic's oauth API).
+
+    Returns None on anything at all: no stored token, a raw (non-JSON, no
+    id_token) credential, a decode error, or an id_token missing the
+    chatgpt_user_id claim. None always means "can't resolve", and
+    find_codex_profile() already treats that as unsafe to reuse."""
+    try:
+        raw = secret_store.get_token(profile.id)
+    except Exception:
+        return None
+    try:
+        stored = openai_credential.decode(raw)
+    except Exception:
+        return None
+    if not stored.id_token:
+        return None
+    return openai_credential.chatgpt_user_id(stored.id_token)
+
+
+def codex_user_id_from_encoded_credential(encoded_credential: str) -> Optional[str]:
+    """The INCOMING side of the same local-decode-only resolution
+    _resolve_codex_profile_own_user_id() does for an already-stored
+    Profile: pulls chatgpt_user_id out of a not-yet-stored encoded
+    credential blob — the one upsert_codex_profile() is about to store, or
+    the one an export_import.py bundle item carries — so find_codex_profile()
+    is never asked to decide a match while the incoming login's own
+    identity is still unknown. Same fail-open-to-None contract; never
+    raises, never makes a network call.
+
+    Public (not a leading-underscore helper) because export_import.py's
+    apply_import() calls it too: a bundle item's claimed codex_user_id field
+    must never be trusted over what the item's OWN shipped credential
+    resolves to — the credential is the thing that's actually about to be
+    stored, so it, not a field alongside it, decides identity. See
+    apply_import()'s codex branch for the "credential wins, bundle field is
+    only a fallback for an item that predates this field" rule."""
+    try:
+        stored = openai_credential.decode(encoded_credential)
+    except Exception:
+        return None
+    if not stored.id_token:
+        return None
+    return openai_credential.chatgpt_user_id(stored.id_token)
 
 
 def find_by_account_and_org(account_uuid: str, org_uuid: Optional[str],
@@ -492,6 +639,7 @@ def create_profile(
     codex_home: Optional[str] = None,
     codex_model: Optional[str] = None,
     codex_reasoning_effort: Optional[str] = None,
+    codex_user_id: Optional[str] = None,
     credential_already_encoded: bool = False,
 ) -> Profile:
     _validate(name, kind, base_url, auth_mode, tag_color)
@@ -503,6 +651,7 @@ def create_profile(
         monthly_budget_cap=monthly_budget_cap, automatic=automatic,
         default_model=default_model, tag_color=tag_color, plan=plan,
         codex_model=codex_model, codex_reasoning_effort=codex_reasoning_effort,
+        codex_user_id=codex_user_id,
         claude_config_dir=claude_config_dir, codex_home=codex_home,
     )
     if priority is not None:
@@ -544,6 +693,7 @@ def create_profile(
         codex_home=codex_home,
         codex_model=codex_model,
         codex_reasoning_effort=codex_reasoning_effort,
+        codex_user_id=codex_user_id,
     )
 
     if credential_already_encoded:
@@ -661,23 +811,45 @@ def upsert_oauth_profile(*, name: str, account_uuid: str, credential: str, plan:
 def upsert_codex_profile(*, name: str, account_id: str, encoded_credential: str,
                           plan: Optional[str] = None, codex_home: Optional[str] = None) -> tuple[Profile, bool]:
     """The codex-kind analogue of upsert_oauth_profile(): same
-    create-or-refresh-in-place shape, with the OpenAI account_id as the
-    dedup key. Profile.account_uuid doubles as a generic upstream-account
-    identity slot — despite the name, find_by_account_uuid() is a plain
-    equality match with no kind-specific meaning.
+    create-or-refresh-in-place shape, with the PAIR (account_id,
+    chatgpt_user_id) as the dedup key — see find_codex_profile() for why
+    account_id (Profile.account_uuid, reused as a generic upstream-account
+    identity slot) is not unique on its own for a codex Profile, and for
+    the 2026-09-22 incident this function used to be the reachable cause of
+    when it deduped on account_id alone.
 
     encoded_credential must already be openai_credential.encode()'s output;
-    this function stores it as-is rather than building the blob."""
-    existing = find_by_account_uuid(account_id)
+    this function stores it as-is rather than building the blob. The
+    incoming login's own chatgpt_user_id is resolved from it locally (no
+    network call — there is none to make) before find_codex_profile() is
+    asked to decide anything.
+
+    Returns (profile, reused). reused=True means an existing Profile was
+    refreshed in place. When find_codex_profile() reports no confirmed
+    match — whether because truly nothing shares this account_id yet, or
+    because something does but couldn't be confirmed as the same person —
+    this always creates a NEW Profile rather than guessing: an interactive
+    `codex add-account` login is never mistaken for an unattended bundle
+    overwrite, unlike export_import.apply_import(), which must not create a
+    duplicate on that same "not confirmed" outcome (see its own docstring)."""
+    user_id = codex_user_id_from_encoded_credential(encoded_credential)
+    existing, _blocked = find_codex_profile(account_id, user_id)
     if existing is not None:
         update_credential_raw(existing.id, encoded_credential)
         changes = {k: v for k, v in {"plan": plan, "codex_home": codex_home}.items() if v is not None}
+        if existing.codex_user_id is None and user_id is not None:
+            # Legacy Profile just confirmed as this same user by
+            # find_codex_profile()'s local resolution: backfill its own
+            # identity now that it's proven, so it stops looking "legacy"
+            # next time — never the caller's name, never blind trust.
+            changes["codex_user_id"] = user_id
         updated = update_profile(existing.id, **changes) if changes else existing
         return updated, True
 
     profile = create_profile(name=name, kind="codex", credential=encoded_credential,
                               auth_mode="chatgpt_subscription", account_uuid=account_id,
-                              plan=plan, codex_home=codex_home, credential_already_encoded=True)
+                              plan=plan, codex_home=codex_home, codex_user_id=user_id,
+                              credential_already_encoded=True)
     return profile, False
 
 
@@ -693,7 +865,7 @@ def update_profile(profile_id: str, **changes) -> Profile:
         # otherwise used: every normal oauth Profile gets account_uuid once,
         # at create_profile() time, and never changes it again.
         "account_uuid", "org_uuid", "organization_type",
-        "claude_config_dir", "codex_home", "codex_model", "codex_reasoning_effort",
+        "claude_config_dir", "codex_home", "codex_model", "codex_reasoning_effort", "codex_user_id",
     }
     unknown = set(changes) - allowed
     if unknown:

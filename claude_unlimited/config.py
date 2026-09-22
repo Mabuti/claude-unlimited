@@ -174,6 +174,7 @@ class Profile:
     codex_home: Optional[str] = None  # codex kind only: an isolated CODEX_HOME holding this Profile's auth.json, the counterpart of claude_config_dir. Every Codex invocation is scoped to it, so it never touches another Codex login on this machine.
     codex_model: Optional[str] = None  # codex kind only: overrides openai_models.py's mapping; None uses the automatic Claude-model -> Codex-model mapping.
     codex_reasoning_effort: Optional[str] = None  # codex kind only: overrides the reasoning-effort tier the mapping would pick (low|medium|high|xhigh|max|ultra); None uses the mapping's per-model default.
+    codex_user_id: Optional[str] = None  # codex kind only: the id_token's chatgpt_user_id claim, part of the dedup key alongside account_uuid (see profiles.find_codex_profile). account_uuid alone is not unique for a codex Profile — two different ChatGPT users can share the same chatgpt_account_id (measured 2026-09-22). None on a Profile added before this field existed; profiles.find_codex_profile() resolves and backfills it locally from the Profile's own stored credential rather than trusting a later login's claim.
 
 
 UPDATE_MODES = ("auto_install", "auto_download", "manual")
@@ -267,6 +268,7 @@ def load_pool() -> Pool:
             codex_home=p.get("codex_home"),
             codex_model=p.get("codex_model"),
             codex_reasoning_effort=p.get("codex_reasoning_effort"),
+            codex_user_id=p.get("codex_user_id"),
         )
         for p in data.get("profiles", [])
     ]
