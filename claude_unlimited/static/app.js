@@ -2583,6 +2583,17 @@ function setPortMessage(text, isError, linkUrl) {
 // happens, so it isn't a dead end: reload that link once the daemon is up.
 const PORT_MOVE_DELAY_MS = 2500;
 
+// POST /api/settings/port's error CODES mapped to locale keys. The server's
+// `message` for these is English and stays that way on purpose — it also
+// serves non-dashboard API callers, and curl output is not a localized
+// surface — so the dashboard translates the stable code instead of the prose.
+// Any code not listed here falls back to the server's message, so a newer
+// daemon's new error still says something useful to an older page.
+const PORT_ERROR_LOCALE_KEYS = {
+  invalid_port: 'settings.port.error_invalid_port',
+  port_in_use: 'settings.port.error_port_in_use',
+};
+
 async function applyPortSetting() {
   const input = document.getElementById('portInput');
   const btn = document.getElementById('portApplyBtn');
@@ -2618,9 +2629,15 @@ async function applyPortSetting() {
     initPortControl(port);
     btn.classList.remove('btn-disabled');
   } catch (e) {
-    // 400 invalid_port / 409 port_in_use: surface the server's message
-    // inline, keep the typed value so it can be corrected, no success toast.
-    setPortMessage(e.message, true);
+    // 400 invalid_port / 409 port_in_use: surface the failure inline, keep
+    // the typed value so it can be corrected, no success toast. Translate by
+    // error code where we know it (see PORT_ERROR_LOCALE_KEYS); otherwise
+    // fall back to the server's English message. t() returns the key itself
+    // when a locale is missing that string, which would put a raw key on
+    // screen — so that case falls back to the message too.
+    const localeKey = PORT_ERROR_LOCALE_KEYS[e.code];
+    const localized = localeKey ? t(localeKey) : null;
+    setPortMessage(localized && localized !== localeKey ? localized : e.message, true);
     btn.classList.remove('btn-disabled');
   }
 }

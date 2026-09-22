@@ -462,5 +462,7 @@
   "settings.port.foreground_saved": "Guardado — se aplicará la próxima vez que se inicie el daemon",
   "settings.port.moving_prefix": "Moviendo el panel al puerto",
   "settings.port.give_up_prefix": "No se pudo alcanzar el panel en el nuevo puerto. Ábrelo manualmente:",
-  "settings.port.manual_link_prefix": "Si esto no ocurre automáticamente, ábrelo manualmente:"
+  "settings.port.manual_link_prefix": "Si esto no ocurre automáticamente, ábrelo manualmente:",
+  "settings.port.error_invalid_port": "El puerto debe ser un número entero entre 1024 y 65535.",
+  "settings.port.error_port_in_use": "Ese puerto ya está en uso en esta máquina — no se cambió nada."
 }

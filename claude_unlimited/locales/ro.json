@@ -462,5 +462,7 @@
   "settings.port.foreground_saved": "Salvat — se aplică la următoarea pornire a daemonului",
   "settings.port.moving_prefix": "Se mută panoul pe portul",
   "settings.port.give_up_prefix": "Panoul nu a putut fi accesat pe noul port. Deschide-l manual:",
-  "settings.port.manual_link_prefix": "Dacă acest lucru nu se întâmplă automat, deschide-l manual:"
+  "settings.port.manual_link_prefix": "Dacă acest lucru nu se întâmplă automat, deschide-l manual:",
+  "settings.port.error_invalid_port": "Portul trebuie să fie un număr întreg între 1024 și 65535.",
+  "settings.port.error_port_in_use": "Acel port este deja utilizat pe această mașină — nu s-a schimbat nimic."
 }

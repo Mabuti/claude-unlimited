@@ -462,5 +462,7 @@
   "settings.port.foreground_saved": "Gespeichert — wird beim nächsten Start des Daemons angewendet",
   "settings.port.moving_prefix": "Dashboard wird zu Port",
   "settings.port.give_up_prefix": "Dashboard auf dem neuen Port nicht erreichbar. Manuell öffnen:",
-  "settings.port.manual_link_prefix": "Falls das nicht automatisch geschieht, öffne es manuell:"
+  "settings.port.manual_link_prefix": "Falls das nicht automatisch geschieht, öffne es manuell:",
+  "settings.port.error_invalid_port": "Der Port muss eine ganze Zahl zwischen 1024 und 65535 sein.",
+  "settings.port.error_port_in_use": "Dieser Port wird auf diesem Rechner bereits verwendet — es wurde nichts geändert."
 }
