@@ -526,15 +526,30 @@ def _apply_model_labels(forced_profile, enabled_profiles=None,
             os.environ.setdefault(f"ANTHROPIC_DEFAULT_{tier}_MODEL{suffix}", value)
 
 
+def _cwd_or_none() -> Path | None:
+    """Path.cwd(), or None when the working directory itself can't be read —
+    a WSL/drvfs I/O error, a directory deleted or unmounted out from under a
+    long-lived shell, or a permissions change. These probes are advisory
+    (project-local settings files), never worth taking the launch down over,
+    so callers just drop the cwd-derived candidates and fall back to what
+    they can still check."""
+    try:
+        return Path.cwd()
+    except OSError:
+        return None
+
+
 def _user_already_has_a_status_line() -> bool:
     """True if a settings file this project must not override already defines
     one. Checked so the Dashboard hint never replaces a status line the user
     configured themselves."""
-    candidates = [
-        Path.home() / ".claude" / "settings.json",
-        Path.cwd() / ".claude" / "settings.json",
-        Path.cwd() / ".claude" / "settings.local.json",
-    ]
+    cwd = _cwd_or_none()
+    candidates = [Path.home() / ".claude" / "settings.json"]
+    if cwd is not None:
+        candidates += [
+            cwd / ".claude" / "settings.json",
+            cwd / ".claude" / "settings.local.json",
+        ]
     for f in candidates:
         try:
             if "statusLine" in json.loads(f.read_text(encoding="utf-8")):
@@ -557,11 +572,13 @@ def _settings_files_pinning_routing() -> list:
 
     Only these three keys matter — everything else a project puts in `env` is
     its own business and is left alone."""
-    candidates = [
-        Path.home() / ".claude" / "settings.json",
-        Path.cwd() / ".claude" / "settings.json",
-        Path.cwd() / ".claude" / "settings.local.json",
-    ]
+    cwd = _cwd_or_none()
+    candidates = [Path.home() / ".claude" / "settings.json"]
+    if cwd is not None:
+        candidates += [
+            cwd / ".claude" / "settings.json",
+            cwd / ".claude" / "settings.local.json",
+        ]
     conflicting = []
     for f in candidates:
         try:

@@ -252,6 +252,55 @@ def test_a_user_supplied_settings_flag_still_wins(monkeypatch, tmp_path):
     assert cli._status_line_args(4317, ["--settings", "mine.json"]) == []
 
 
+def _break_cwd(monkeypatch):
+    """Simulate the WSL/drvfs failure: os.getcwd() raises mid-session (a
+    transient I/O error, a deleted directory, a stale mount)."""
+    from claude_unlimited import cli
+
+    def _raise():
+        raise OSError(5, "Input/output error")
+    monkeypatch.setattr(cli.Path, "cwd", staticmethod(_raise))
+
+
+def test_settings_pinning_routing_survives_a_broken_cwd(monkeypatch, tmp_path):
+    """Path.cwd() raising must not take the launch down over an advisory
+    settings probe — the project-local candidates just drop out."""
+    from claude_unlimited import cli
+
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path / "nohome"))
+    _break_cwd(monkeypatch)
+    _routing_env(monkeypatch)
+
+    assert cli._settings_files_pinning_routing() == []
+
+
+def test_status_line_args_survives_a_broken_cwd(monkeypatch, tmp_path):
+    from claude_unlimited import cli
+
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path))
+    _break_cwd(monkeypatch)
+
+    args = cli._status_line_args(4317, [])
+    assert args[0] == "--settings"
+    assert "127.0.0.1:4317" in args[1]
+
+
+def test_status_line_still_honours_home_settings_when_cwd_is_broken(monkeypatch, tmp_path):
+    """The HOME candidate doesn't depend on cwd at all, so it must still be
+    checked even when the project-local candidates can't be built."""
+    import json as _json
+    from claude_unlimited import cli
+
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text(
+        _json.dumps({"statusLine": {"type": "command", "command": "mine"}}))
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path))
+    _break_cwd(monkeypatch)
+
+    assert cli._user_already_has_a_status_line() is True
+    assert cli._status_line_args(4317, []) == []
+
+
 def test_codex_picker_reflects_saved_list_and_unsets_removed_tiers(monkeypatch):
     """The /model labels come from the saved parity list: a row matches its
     tier by FAMILY (so a dated id still labels the slot), and a family the
