@@ -751,3 +751,58 @@ def test_add_account_prints_plan_team_for_a_team_login(env, monkeypatch, tmp_pat
     out = capsys.readouterr().out
     assert "Plan: Team" in out
     assert "Plan: Max" not in out
+
+
+# ---------------------------------------------------------------------------
+# Resolution failure must always mean "unknown", never "crash".
+# ---------------------------------------------------------------------------
+
+def _raises(exc):
+    def _fetch(token, timeout=15.0):
+        raise exc
+    return _fetch
+
+
+@pytest.mark.parametrize("exc", [
+    # fetch_account_profile() parses the response body inside the same try
+    # that guards HTTPError/URLError, so a malformed body comes out as a
+    # bare JSONDecodeError. A caller catching only ProfileLookupError took
+    # this straight to the top: a 500 on the daemon's request handler, a
+    # traceback on the CLI.
+    json.JSONDecodeError("Expecting value", "", 0),
+    UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    OSError("connection reset"),
+    anthropic_oauth.ProfileLookupError("scoped token"),
+])
+def test_resolve_identity_from_access_token_returns_none_and_never_raises(env, monkeypatch, exc):
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", _raises(exc))
+    assert profile_repo.resolve_identity_from_access_token("some-token-long") is None
+
+
+def test_resolve_identity_from_access_token_returns_none_for_an_empty_token(env):
+    assert profile_repo.resolve_identity_from_access_token("") is None
+
+
+def test_malformed_response_while_resolving_incoming_org_never_overwrites(env, monkeypatch):
+    # The whole point of swallowing it: an unknown incoming organization is
+    # already handled safely (resolve_legacy_oauth_match() refuses to reuse
+    # on it), so a malformed response must degrade to "unknown" rather than
+    # propagate. Before the fix this raised out of upsert_oauth_profile().
+    legacy = profile_repo.create_profile(
+        name="Legacy", kind="oauth", credential="existing-token-long",
+        account_uuid="uuid-shared")
+    assert legacy.org_uuid is None
+    original_stored = env.get_token(legacy.id)
+
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile",
+                        _raises(json.JSONDecodeError("Expecting value", "", 0)))
+
+    new_profile, reused = profile_repo.upsert_oauth_profile(
+        name="Incoming", account_uuid="uuid-shared", credential="incoming-token-long")
+
+    assert reused is False                                  # never reused on an unknown org
+    assert new_profile.id != legacy.id
+    assert env.get_token(legacy.id) == original_stored       # byte-for-byte unchanged
+    reloaded = next(p for p in profile_repo.list_profiles() if p.id == legacy.id)
+    assert reloaded.name == "Legacy"                         # name untouched
+    assert reloaded.org_uuid is None                         # nothing guessed onto it

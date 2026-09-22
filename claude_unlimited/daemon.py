@@ -728,11 +728,15 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                         # left unset, and resolve_legacy_oauth_match() already
                         # treats a still-unknown incoming org as unsafe to
                         # reuse rather than this endpoint having to decide it.
-                        try:
-                            account = anthropic_oauth.fetch_account_profile(credential)
-                        except anthropic_oauth.ProfileLookupError:
-                            pass
-                        else:
+                        # resolve_identity_from_access_token() rather than a
+                        # local try/except: it is the shared never-raise
+                        # contract, and fetch_account_profile() can raise more
+                        # than ProfileLookupError (a malformed body raises
+                        # json.JSONDecodeError out of its own try). On a
+                        # request handler that difference is a 500 instead of
+                        # the documented "the organization stays unknown".
+                        account = profile_repo.resolve_identity_from_access_token(credential)
+                        if account is not None:
                             body.setdefault("plan", anthropic_oauth.plan_from_account(account))
                             body["org_uuid"] = account.org_uuid
                             body["organization_type"] = account.organization_type

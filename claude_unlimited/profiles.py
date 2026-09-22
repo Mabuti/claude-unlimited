@@ -271,6 +271,30 @@ def resolve_profile_own_identity(profile: Profile) -> Optional[anthropic_oauth.A
     return resolve_identity_from_encoded_credential(raw)
 
 
+def resolve_identity_from_access_token(access_token: str) -> Optional[anthropic_oauth.AccountProfile]:
+    """The fetch half on its own, for a caller holding a RAW access token
+    that is not (yet) any Profile's stored credential — the INCOMING login
+    on an add/import path, which has to be resolved before an unknown
+    organization is allowed to decide a match.
+
+    Same never-raise, never-refresh, never-logs contract as
+    resolve_profile_own_identity(). The breadth of the except is the point:
+    anthropic_oauth.fetch_account_profile() catches HTTPError and URLError
+    but parses the response body inside that same try, so a malformed body
+    raises json.JSONDecodeError straight through it. A caller catching only
+    ProfileLookupError would take that exception instead of the documented
+    "the organization simply stays None" — and on a request handler an
+    unhandled exception is a 500, on a CLI path a traceback. Resolution
+    failing must always mean "unknown", never "crash": unknown is already
+    handled safely (resolve_legacy_oauth_match() refuses to reuse on it)."""
+    if not access_token:
+        return None
+    try:
+        return anthropic_oauth.fetch_account_profile(access_token)
+    except Exception:
+        return None
+
+
 def resolve_identity_from_encoded_credential(encoded_credential: str) -> Optional[anthropic_oauth.AccountProfile]:
     """The decode-then-fetch half of resolve_profile_own_identity(), split
     out so a caller holding an ALREADY-ENCODED oauth credential blob that
@@ -285,12 +309,7 @@ def resolve_identity_from_encoded_credential(encoded_credential: str) -> Optiona
         access_token = oauth_credential.decode(encoded_credential).access_token
     except Exception:
         return None
-    if not access_token:
-        return None
-    try:
-        return anthropic_oauth.fetch_account_profile(access_token)
-    except Exception:
-        return None
+    return resolve_identity_from_access_token(access_token)
 
 
 @dataclass(frozen=True)
@@ -613,10 +632,7 @@ def upsert_oauth_profile(*, name: str, account_uuid: str, credential: str, plan:
     resolve_legacy_oauth_match() already treats that as unsafe to reuse."""
     existing, needs_backfill = find_by_account_and_org(account_uuid, org_uuid)
     if existing is not None and needs_backfill and org_uuid is None:
-        try:
-            resolved_incoming = anthropic_oauth.fetch_account_profile(credential)
-        except anthropic_oauth.ProfileLookupError:
-            resolved_incoming = None
+        resolved_incoming = resolve_identity_from_access_token(credential)
         if resolved_incoming is not None:
             org_uuid = resolved_incoming.org_uuid
             if organization_type is None:
