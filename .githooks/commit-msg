@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""commit-msg hook -- reject commit messages containing non-allowlisted email
+addresses.
+
+Why this exists: a commit message BODY is not covered by a diff scan -- two
+commits in this fork got real personal data into history by pasting terminal
+output into the message itself, not the code. See .githooks/README.md for
+the full story and for how to extend the allowlist below.
+
+Because the incident was PASTED TERMINAL OUTPUT, and pasted output wraps,
+the message is scanned twice: once line by line, then once over a dewrapped
+copy that rejoins hard wraps only. See dewrap().
+
+Allowed: anything @example.com / @example.org / @example.net / @example.test,
+anything @localhost, noreply@github.com, and any *@users.noreply.github.com
+address (GitHub's own commit-identity addresses).
+
+Escape hatch: `git commit --no-verify` skips this hook entirely. That is a
+deliberate, reviewed decision by the person committing, not a workaround --
+see .githooks/README.md.
+
+Usage: invoked by git as `commit-msg <path-to-commit-message-file>`.
+Python 3 standard library only.
+"""
+import re
+import sys
+import unicodedata
+
+ALLOWLISTED_DOMAINS = {
+    "example.com",
+    "example.org",
+    "example.net",
+    "example.test",
+    "localhost",
+}
+ALLOWLISTED_ADDRESSES = {
+    "noreply@github.com",
+}
+ALLOWLISTED_DOMAIN_SUFFIX = "users.noreply.github.com"
+
+# Suffixes that look like a TLD but are file extensions. Without this,
+# "logo@2x.png" and "icon@3x.png" read as addresses. Shadowing a handful of
+# real ccTLDs (.sh .md .py .rs .ts) is a deliberate trade -- see the
+# "Known limits" section of .githooks/README.md.
+#
+# This list is duplicated in .githooks/pre-commit: the two hooks are
+# standalone scripts on purpose, so both copies must be kept in step.
+NON_TLD_SUFFIXES = (
+    "png jpg jpeg gif svg webp ico bmp tiff avif "
+    "js mjs cjs jsx ts tsx map min "
+    "py pyc pyi rb go rs java php "
+    "md mdx txt log csv tsv rst "
+    "json yml yaml toml ini cfg conf lock xml "
+    "html htm css scss sass less "
+    "sh bash zsh ps1 psm1 bat cmd "
+    "zip gz tgz tar bz2 xz pdf docx xlsx pptx "
+    "woff woff2 ttf eot mp4 mp3 wav webm "
+    "exe dll dylib sql"
+).split()
+
+_EXT_ALT = "|".join(sorted(NON_TLD_SUFFIXES, key=len, reverse=True))
+
+# What counts as an email address here. Every restriction exists to kill a
+# specific class of false positive that was observed on this repo's own files:
+#
+#   local part >= 2 chars .......... kills "a@b.com" (test fixture)
+#   first domain label >= 2 chars .. kills "a@b.com", "pkg@1.2.3"
+#   TLD alphabetic, 2-24 chars ..... kills "python@3.14", "eslint@8.2.0"
+#   TLD not a file extension ....... kills "logo@2x.png", "icon@3x.png"
+#   no "@" without a local part .... kills "@media", "@scope/name",
+#                                    "@pytest.mark.parametrize"
+#   a dotted domain is required .... kills "image@sha256:abc..."
+#
+# The cost is missing a real address whose local part AND first domain label
+# are both a single character. That is vanishingly rare, and far cheaper than
+# the hook being disabled. See .githooks/README.md, "Known limits".
+EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+\-])"
+    r"[A-Za-z0-9._%+\-]{2,}"
+    r"@"
+    r"(?:"
+    r"localhost"
+    r"|"
+    r"[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9]"        # first label, >= 2 chars
+    r"(?:\.[A-Za-z0-9\-]+)*"                       # optional inner labels
+    r"\.(?!(?:" + _EXT_ALT + r")(?![A-Za-z]))"     # TLD dot, not a file ext
+    r"[A-Za-z]{2,24}"                              # TLD: alphabetic, 2-24
+    r")"
+    r"(?![A-Za-z0-9\-])"
+    r"(?!\.[A-Za-z])",                             # not "...@2x.dark.png"
+    re.IGNORECASE,
+)
+
+
+def is_allowlisted(address):
+    address_lower = address.lower()
+    if address_lower in ALLOWLISTED_ADDRESSES:
+        return True
+    domain = address_lower.rsplit("@", 1)[-1]
+    if domain in ALLOWLISTED_DOMAINS:
+        return True
+    if domain == ALLOWLISTED_DOMAIN_SUFFIX or domain.endswith("." + ALLOWLISTED_DOMAIN_SUFFIX):
+        return True
+    return False
+
+
+def normalize(text):
+    """NFKC-fold before matching, so a fullwidth or otherwise decomposed form
+    cannot walk past the matcher. NFKC maps U+FF20 FULLWIDTH COMMERCIAL AT
+    and friends onto their ASCII equivalents. A Cyrillic-homoglyph domain is
+    NOT covered -- see .githooks/README.md, "Known limits"."""
+    return unicodedata.normalize("NFKC", text)
+
+
+def dewrap(lines):
+    """Join HARD WRAPS only, and report where each surviving character came from.
+
+    A pasted address that a terminal (or an editor's reflow) broke mid-token
+    looks like "nobody@" / newline / "acme-corp.com" and neither half matches
+    on its own. Joining those two lines recovers it.
+
+    A newline is removed only when the character immediately before it AND the
+    character immediately after it are both non-whitespace -- that is what a
+    hard wrap looks like. Every other newline is kept. Stripping newlines
+    unconditionally would INVENT addresses that were never in the message
+    (e.g. a list item ending "...contact" followed by a line starting
+    "support@..."), which is a worse failure than the one being fixed.
+
+    Returns (dewrapped_text, owner) where owner[i] is the 1-based line number
+    the i-th character of dewrapped_text came from.
+    """
+    buf = []
+    owner = []
+    for lineno, line in enumerate(lines, start=1):
+        if buf:
+            prev_char = buf[-1]
+            next_char = line[0] if line else ""
+            hard_wrap = (
+                not prev_char.isspace()
+                and next_char != ""
+                and not next_char.isspace()
+            )
+            if not hard_wrap:
+                buf.append("\n")
+                owner.append(lineno)
+        for ch in line:
+            buf.append(ch)
+            owner.append(lineno)
+    return "".join(buf), owner
+
+
+def emit(text):
+    """Write to stderr without ever dying on a terminal that can't encode a
+    character we found in the message. A crashing hook is a disabled hook."""
+    try:
+        sys.stderr.write(text)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stderr, "encoding", None) or "ascii"
+        sys.stderr.write(text.encode(enc, "replace").decode(enc, "replace"))
+
+
+def main(argv):
+    if len(argv) < 2:
+        emit("commit-msg hook: no message file given\n")
+        return 1
+
+    msg_path = argv[1]
+    try:
+        with open(msg_path, "r", encoding="utf-8", errors="replace") as f:
+            raw_text = f.read()
+    except OSError as exc:
+        emit("commit-msg hook: could not read %s: %s\n" % (msg_path, exc))
+        return 1
+
+    # NFKC per line, so line numbers stay exact even when a fold changes length.
+    lines = [normalize(line) for line in raw_text.splitlines()]
+
+    hits = []
+
+    # Pass 1 -- line by line.
+    #
+    # NOTE: git only strips '#'-prefixed lines under --cleanup=strip, which is
+    # the DEFAULT ONLY when the message goes through an interactive editor.
+    # `git commit -m "..."` / `-F file` (including the
+    # `git commit -m "$(cat <<EOF ... )"` heredoc form) default to
+    # --cleanup=whitespace, which does NOT strip '#' lines -- they land in
+    # history unchanged. So every line is scanned unconditionally; skipping
+    # '#' lines would create a false negative in the common
+    # non-interactive-commit case.
+    for lineno, line in enumerate(lines, start=1):
+        for match in EMAIL_RE.finditer(line):
+            address = match.group(0)
+            if not is_allowlisted(address):
+                hits.append((lineno, line.strip(), address, None))
+
+    # Pass 2 -- the same scan over a dewrapped copy, to catch an address that a
+    # paste broke across a line wrap. Only hits that actually SPAN a rejoined
+    # newline are reported here; anything wholly inside one line was already
+    # found by pass 1.
+    joined, owner = dewrap(lines)
+    for match in EMAIL_RE.finditer(joined):
+        address = match.group(0)
+        if is_allowlisted(address):
+            continue
+        start, end = match.start(), match.end() - 1
+        first_line, last_line = owner[start], owner[end]
+        if first_line == last_line:
+            continue
+        hits.append((first_line, joined[start:end + 1], address, last_line))
+
+    if not hits:
+        return 0
+
+    emit("commit-msg hook: REJECTED -- possible personal data in commit message\n\n")
+    emit("Rule broken: CONTRIBUTING.md -- \"Never commit credentials, tokens, or\n")
+    emit("personal data -- including in tests, comments, and screenshots.\"\n\n")
+    for lineno, context, address, last_line in hits:
+        if last_line is None:
+            emit("  line %d: %s\n" % (lineno, context))
+            emit("    -> non-allowlisted address: %s\n" % address)
+        else:
+            emit("  lines %d-%d: %s\n" % (lineno, last_line, context))
+            emit(
+                "    -> non-allowlisted address SPLIT ACROSS LINES %d-%d "
+                "(a hard wrap hides it from a line-by-line read): %s\n"
+                % (lineno, last_line, address)
+            )
+    emit("\n")
+    emit("Fix: remove the address, replace it with a placeholder such as\n")
+    emit("someone@example.com, or add the domain to the allowlist in\n")
+    emit(".githooks/commit-msg if it is genuinely safe to share (see\n")
+    emit(".githooks/README.md).\n\n")
+    emit("Deliberate, reviewed exception: `git commit --no-verify`.\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
