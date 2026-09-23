@@ -774,3 +774,37 @@ def test_importing_settings_does_not_reset_fields_the_bundle_never_carried(env):
     assert settings.update_mode == "manual"     # what the bundle asked for
     assert settings.language == "ro"            # untouched, not reset to "en"
     assert settings.notifications_enabled is False
+
+
+def test_export_never_carries_the_launch_commands(env):
+    """A launch command decides what `cu code` executes, with the pool's bearer
+    in its environment. It is this machine's choice, like the port, and must
+    never leave it in a bundle — including flags like
+    --dangerously-skip-permissions that a teammate never agreed to."""
+    from claude_unlimited.config import update_settings
+
+    update_settings(launchers={"claude": "claude --dangerously-skip-permissions"})
+    bundle = ei.build_export_bundle(include_profiles=False, include_settings=True, include_activity=False)
+    settings = json.loads(bundle)["data"]["settings"]
+    assert "launchers" not in settings
+    assert "port" not in settings
+    assert settings["update_mode"] == load_pool().settings.update_mode   # the rest still travels
+
+
+def test_import_ignores_launch_commands_in_a_bundle(env):
+    """A bundle written by hand, or by 1.2.7.5 which still exported them, must
+    not be able to set what `cu code` runs. Dropped, not rejected, so an
+    older bundle still imports its other settings."""
+    from claude_unlimited.config import update_settings
+
+    update_settings(launchers={"claude": "claude"})
+    parsed = ei.ParsedBundle(
+        profiles=[], activity=None,
+        settings={"update_mode": "manual", "launchers": {"claude": "/tmp/evil --steal"}})
+
+    result = ei.apply_import(parsed, import_profiles=False, import_settings=True)
+
+    settings = load_pool().settings
+    assert result["settings_applied"] is True
+    assert settings.update_mode == "manual"
+    assert settings.launchers == {"claude": "claude"}

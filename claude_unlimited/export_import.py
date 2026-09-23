@@ -32,6 +32,20 @@ BUNDLE_VERSION = 1
 PBKDF2_ITERATIONS = 600_000  # OWASP 2023 recommendation floor for PBKDF2-HMAC-SHA256
 
 
+# Settings that describe THIS machine and never travel in a bundle, in
+# either direction.
+#   port      — a bundle that moved it would silently relocate the dashboard
+#               on whatever box imported it, with no way to know the new port
+#               is free. Changing it is POST /api/settings/port, which
+#               preflights the bind first.
+#   launchers — the command `cu code` / `cu codex` execute, with the pool's
+#               bearer in the environment. Imported, it would let whoever wrote
+#               a bundle run code as the importer; exported, it would hand this
+#               machine's flags (e.g. --dangerously-skip-permissions) to a
+#               teammate without the import preview ever showing them.
+_MACHINE_LOCAL_SETTINGS = frozenset({"port", "launchers"})
+
+
 class ExportImportError(RuntimeError):
     pass
 
@@ -121,13 +135,9 @@ def build_export_bundle(
         payload["profiles"] = exported
 
     if include_settings:
-        # `port` is deliberately withheld. It describes THIS machine's daemon,
-        # not a preference worth carrying: a bundle that moved the port would
-        # silently relocate the dashboard on whatever box imported it, and the
-        # import side has no way to know the new port is free. Changing it is
-        # POST /api/settings/port, which preflights the bind first.
+        # _MACHINE_LOCAL_SETTINGS are withheld — see there for why.
         payload["settings"] = {k: v for k, v in asdict(pool.settings).items()
-                               if k != "port"}
+                               if k not in _MACHINE_LOCAL_SETTINGS}
 
     if include_activity:
         payload["activity"] = [asdict(e) for e in activity_module.list_events(limit=activity_module.MAX_EVENTS)]
@@ -421,12 +431,12 @@ def apply_import(
         # picks which model every codex request runs on, which is what Codex
         # quota is spent on (docs/adr/0007). Importing that unchecked would let
         # a bundle silently change someone's spending.
-        # `port` is dropped rather than rejected: a bundle written by hand, or
-        # by a build that still exported it, must still import cleanly instead
-        # of 400-ing on a key the user never chose to send. See the export side
-        # for why it is not a portable setting.
+        # _MACHINE_LOCAL_SETTINGS are dropped rather than rejected: a bundle
+        # written by hand, or by a build that still exported them, must still
+        # import its other settings instead of 400-ing on a key the user never
+        # chose to send.
         incoming = {k: v for k, v in parsed.settings.items()
-                    if k in Settings.__dataclass_fields__ and k != "port"}
+                    if k in Settings.__dataclass_fields__ and k not in _MACHINE_LOCAL_SETTINGS}
         incoming = validated_settings_changes(incoming)
 
         with CONFIG_LOCK:
