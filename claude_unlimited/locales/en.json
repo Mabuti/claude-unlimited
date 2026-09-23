@@ -462,5 +462,7 @@
   "settings.port.foreground_saved": "Saved — applies the next time the daemon starts",
   "settings.port.moving_prefix": "Moving the dashboard to port",
   "settings.port.give_up_prefix": "Couldn't reach the dashboard on the new port. Open it manually:",
-  "settings.port.manual_link_prefix": "If this doesn't happen automatically, open it manually:"
+  "settings.port.manual_link_prefix": "If this doesn't happen automatically, open it manually:",
+  "settings.port.error_invalid_port": "Port must be a whole number between 1024 and 65535.",
+  "settings.port.error_port_in_use": "That port is already in use on this machine — nothing was changed."
 }

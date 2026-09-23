@@ -975,13 +975,18 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 self._send_json(400, {
                     "error": "invalid_port",
-                    "message": "port must be an integer between 1024 and 65535.",
+                    "message": f"port must be an integer between {config.MIN_PORT} "
+                               f"and {config.MAX_PORT}.",
                 })
                 return
-            if not (1024 <= new_port <= 65535):
+            # config owns the range, so this endpoint and config.resolve_port()
+            # (the --port flag and CLAUDE_UNLIMITED_PORT) can't drift apart:
+            # a port the CLI accepts is one the Dashboard accepts.
+            if not config.port_in_range(new_port):
                 self._send_json(400, {
                     "error": "invalid_port",
-                    "message": "port must be between 1024 and 65535 — anything below 1024 "
+                    "message": f"port must be between {config.MIN_PORT} and "
+                               f"{config.MAX_PORT} — anything below {config.MIN_PORT} "
                                "needs privileges this daemon does not run with.",
                 })
                 return
@@ -1746,8 +1751,12 @@ def _backfill_legacy_oauth_organizations() -> None:
 
     Best-effort and silent, by design: any failure for any one Profile —
     network, decode, ProfileLookupError, anything — just leaves that
-    Profile to be retried on the next pass. This must never raise, so it
-    can never take the daemon down or delay startup; codex-kind and
+    Profile alone until the NEXT DAEMON START, which is the only thing
+    that runs this again. Nothing retries it while the daemon is up: a
+    credential the profile endpoint refuses (a `claude setup-token` token
+    gets a permanent 403) would otherwise be re-fetched forever, which is
+    exactly the provider polling AGENTS.md forbids. This must never raise,
+    so it can never take the daemon down or delay startup; codex-kind and
     api-kind Profiles, and oauth Profiles that already have an org_uuid,
     are skipped with no network call at all."""
     try:
@@ -1776,19 +1785,19 @@ def _backfill_legacy_oauth_organizations() -> None:
 def _backfill_legacy_oauth_organizations_async() -> None:
     """Runs one backfill pass in the background right after startup.
 
-    _oauth_refresh_loop sleeps before its first iteration, so without this a
-    restarted daemon would show a legacy Profile's wrong plan badge for a
-    full _OAUTH_REFRESH_LOOP_INTERVAL_SECONDS before the loop ever gets to
-    it. Same fire-and-forget pattern as _prime_profile_async: the thread is
-    daemon=True so it can never block the process from exiting, and it
-    starts after the server has already bound its port, so a slow or
-    hanging network call in here can never delay that bind."""
+    This is the ONLY trigger for the backfill: one pass per daemon start,
+    never repeated while the daemon runs. It has to happen off the request
+    path because a legacy Profile would otherwise show the wrong plan badge
+    until someone re-authed it by hand. Same fire-and-forget pattern as
+    _prime_profile_async: the thread is daemon=True so it can never block
+    the process from exiting, and it starts after the server has already
+    bound its port, so a slow or hanging network call in here can never
+    delay that bind."""
     threading.Thread(target=_backfill_legacy_oauth_organizations, daemon=True).start()
 
 
 def _oauth_refresh_loop() -> None:
-    """Keeps OAuth Profiles' access tokens fresh independently of traffic,
-    and piggybacks the legacy-organization backfill on the same timer.
+    """Keeps OAuth Profiles' access tokens fresh independently of traffic.
 
     The Dashboard's poll only runs while someone has it open, and the
     proxy's per-request refresh only touches the Profile choose() just
@@ -1796,10 +1805,18 @@ def _oauth_refresh_loop() -> None:
     unrefreshed and land on AUTH_INVALID, with no way back except a manual
     re-auth, since choose() never picks an AUTH_INVALID Profile again.
 
-    The backfill pass runs right after runtime_snapshot() on purpose:
-    tokens are freshest at that moment, and reading them here — read-only,
-    never refreshing — cannot race the Gateway's own refresh of the same
-    credential.
+    The legacy-organization backfill deliberately does NOT run here. It
+    used to, piggybacked on this same timer, and that made the daemon poll
+    a provider: a Profile the profile endpoint will never identify — a
+    `claude setup-token` credential gets a permanent 403, see
+    anthropic_oauth.fetch_account_profile() — leaves org_uuid unset, so
+    every tick re-fetched it, about 1440 requests a day per such Profile,
+    forever. Both failure paths in the backfill `continue` without writing
+    anything, so there was nothing to make the retries stop. The backfill
+    is now a one-shot at startup only (see
+    _backfill_legacy_oauth_organizations_async, called from
+    run_foreground), which is what AGENTS.md's "no background polling of a
+    provider's API" rule requires.
 
     Runs for the life of the daemon process. Every call is best-effort, so
     a transient network failure can never crash the daemon."""
@@ -1807,10 +1824,6 @@ def _oauth_refresh_loop() -> None:
         time.sleep(_OAUTH_REFRESH_LOOP_INTERVAL_SECONDS)
         try:
             _gateway.runtime_snapshot()
-        except Exception:
-            pass
-        try:
-            _backfill_legacy_oauth_organizations()
         except Exception:
             pass
 

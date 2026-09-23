@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""pre-commit hook -- reject a staged diff that contains a non-allowlisted
+email address or an obvious credential shape.
+
+This is the secondary net: it catches personal data or secrets landing in
+the CODE. It does not see the commit message -- that is .githooks/commit-msg's
+job. See .githooks/README.md.
+
+Two properties this hook is required to keep, in priority order:
+
+1. It must not cry wolf. A hook that blocks legitimate work gets turned off,
+   and a hook that is turned off guards nothing. The email matcher below is
+   therefore deliberately conservative -- see EMAIL_RE and NON_TLD_SUFFIXES.
+2. It must never print a credential. A guard whose job is to stop a secret
+   leaking cannot itself copy that secret into terminal scrollback or a CI
+   job log. Every credential hit is masked -- see mask_credential().
+
+Escape hatch: `git commit --no-verify` skips this hook entirely. That is a
+deliberate, reviewed decision by the person committing, not a workaround --
+see .githooks/README.md.
+
+Usage: invoked by git as `pre-commit` (no arguments), cwd inside the repo.
+Python 3 standard library only.
+"""
+import re
+import subprocess
+import sys
+import unicodedata
+
+ALLOWLISTED_DOMAINS = {
+    "example.com",
+    "example.org",
+    "example.net",
+    "example.test",
+    "localhost",
+}
+ALLOWLISTED_ADDRESSES = {
+    "noreply@github.com",
+}
+ALLOWLISTED_DOMAIN_SUFFIX = "users.noreply.github.com"
+
+# Suffixes that look like a TLD but are file extensions. Without this,
+# "logo@2x.png" and "icon@3x.png" read as addresses. Shadowing a handful of
+# real ccTLDs (.sh .md .py .rs .ts) is a deliberate trade -- see the
+# "Known limits" section of .githooks/README.md.
+NON_TLD_SUFFIXES = (
+    "png jpg jpeg gif svg webp ico bmp tiff avif "
+    "js mjs cjs jsx ts tsx map min "
+    "py pyc pyi rb go rs java php "
+    "md mdx txt log csv tsv rst "
+    "json yml yaml toml ini cfg conf lock xml "
+    "html htm css scss sass less "
+    "sh bash zsh ps1 psm1 bat cmd "
+    "zip gz tgz tar bz2 xz pdf docx xlsx pptx "
+    "woff woff2 ttf eot mp4 mp3 wav webm "
+    "exe dll dylib sql"
+).split()
+
+_EXT_ALT = "|".join(sorted(NON_TLD_SUFFIXES, key=len, reverse=True))
+
+# What counts as an email address here. Every restriction exists to kill a
+# specific class of false positive that was observed on this repo's own files:
+#
+#   local part >= 2 chars .......... kills "a@b.com" (test fixture)
+#   first domain label >= 2 chars .. kills "a@b.com", "pkg@1.2.3"
+#   TLD alphabetic, 2-24 chars ..... kills "python@3.14", "eslint@8.2.0"
+#   TLD not a file extension ....... kills "logo@2x.png", "icon@3x.png"
+#   no "@" without a local part .... kills "@media", "@scope/name",
+#                                    "@pytest.mark.parametrize"
+#   a dotted domain is required .... kills "image@sha256:abc..."
+#
+# The cost is missing a real address whose local part AND first domain label
+# are both a single character. That is vanishingly rare, and far cheaper than
+# the hook being disabled. See .githooks/README.md, "Known limits".
+EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+\-])"
+    r"[A-Za-z0-9._%+\-]{2,}"
+    r"@"
+    r"(?:"
+    r"localhost"
+    r"|"
+    r"[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9]"        # first label, >= 2 chars
+    r"(?:\.[A-Za-z0-9\-]+)*"                       # optional inner labels
+    r"\.(?!(?:" + _EXT_ALT + r")(?![A-Za-z]))"     # TLD dot, not a file ext
+    r"[A-Za-z]{2,24}"                              # TLD: alphabetic, 2-24
+    r")"
+    r"(?![A-Za-z0-9\-])"
+    r"(?!\.[A-Za-z])",                             # not "...@2x.dark.png"
+    re.IGNORECASE,
+)
+
+# Credential shapes. Each requires enough entropy/length that a short
+# synthetic test placeholder (e.g. "sk-ant-12345678", 9 chars after the
+# prefix) will NOT match -- only a real-length secret will.
+#
+# The third field is how many leading characters may be shown when reporting
+# a hit: just enough to say WHICH kind of credential it is. The body is never
+# printed. See mask_credential().
+CRED_PATTERNS = [
+    ("Anthropic API key (sk-ant-...)", re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"), 7),
+    ("OpenAI project key (sk-proj-...)", re.compile(r"sk-proj-[A-Za-z0-9_-]{20,}"), 8),
+    ("API-style secret key (sk-...)", re.compile(r"sk-(?!ant-|proj-)[A-Za-z0-9]{20,}"), 3),
+    ("GitHub personal access token (ghp_...)", re.compile(r"ghp_[A-Za-z0-9]{20,}"), 4),
+    ("GitHub OAuth token (gho_...)", re.compile(r"gho_[A-Za-z0-9]{20,}"), 4),
+    ("GitHub fine-grained PAT (github_pat_...)", re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), 11),
+    ("Slack token (xox[baprs]-...)", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"), 5),
+    ("PEM private key header", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), 0),
+]
+
+FILE_HEADER_RE = re.compile(r"^\+\+\+ (?:b/(.*)|/dev/null)$")
+HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def mask_credential(value, prefix_len):
+    """Render a credential hit WITHOUT its body.
+
+    DELIBERATE: the whole point of this hook is that a secret does not escape
+    into a place it shouldn't be. stderr is such a place -- it lands in shell
+    scrollback and, on CI, in the job log. So a credential match is reported
+    as "<identifying prefix>...<redacted, N chars>" and never verbatim. The
+    prefix plus the rule name is enough for the author to find it; the author
+    already has the value.
+    """
+    return "%s...<redacted, %d chars>" % (value[:prefix_len], len(value))
+
+
+def is_allowlisted_email(address):
+    address_lower = address.lower()
+    if address_lower in ALLOWLISTED_ADDRESSES:
+        return True
+    domain = address_lower.rsplit("@", 1)[-1]
+    if domain in ALLOWLISTED_DOMAINS:
+        return True
+    if domain == ALLOWLISTED_DOMAIN_SUFFIX or domain.endswith("." + ALLOWLISTED_DOMAIN_SUFFIX):
+        return True
+    return False
+
+
+def normalize(text):
+    """NFKC-fold before matching, so a fullwidth or otherwise decomposed form
+    cannot walk past the matcher. NFKC maps U+FF20 FULLWIDTH COMMERCIAL AT
+    and friends onto their ASCII equivalents. A Cyrillic-homoglyph domain is
+    NOT covered -- see .githooks/README.md, "Known limits"."""
+    return unicodedata.normalize("NFKC", text)
+
+
+def get_staged_diff():
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--no-color", "--no-ext-diff", "-U0"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        # git diff exits 1 when there ARE differences with some option
+        # combinations; anything else is a real failure.
+        sys.stderr.write("pre-commit hook: `git diff --cached` failed:\n")
+        sys.stderr.write(result.stderr)
+        sys.exit(1)
+    return result.stdout
+
+
+def scan(diff_text):
+    """Yield (file, lineno, rule_name, reportable) for every hit in added lines.
+
+    `reportable` is already safe to print: an email address verbatim, a
+    credential masked.
+    """
+    current_file = None
+    current_line = None
+    for raw_line in diff_text.splitlines():
+        if raw_line.startswith("+++ "):
+            m = FILE_HEADER_RE.match(raw_line)
+            current_file = m.group(1) if (m and m.group(1)) else None
+            continue
+        if raw_line.startswith("@@"):
+            m = HUNK_HEADER_RE.match(raw_line)
+            if m:
+                current_line = int(m.group(1))
+            continue
+        if raw_line.startswith("+"):
+            # An added line (not the "+++ " file header, handled above).
+            content = normalize(raw_line[1:])
+            if current_file is not None and current_line is not None:
+                for match in EMAIL_RE.finditer(content):
+                    address = match.group(0)
+                    if not is_allowlisted_email(address):
+                        # DELIBERATE: an email address IS printed verbatim.
+                        # It is not a credential, the author has to know which
+                        # one of several to fix, and it is a string they just
+                        # typed. Credentials are masked; addresses are not.
+                        yield (current_file, current_line, "personal data (email)", address)
+                for rule_name, pattern, prefix_len in CRED_PATTERNS:
+                    for match in pattern.finditer(content):
+                        yield (
+                            current_file,
+                            current_line,
+                            rule_name,
+                            mask_credential(match.group(0), prefix_len),
+                        )
+            if current_line is not None:
+                current_line += 1
+            continue
+        # Removed lines ('-') and other diff metadata don't consume new-file
+        # line numbers and are never flagged -- we only guard what's being
+        # added, not what a commit removes.
+
+
+def emit(text):
+    """Write to stderr without ever dying on a terminal that can't encode a
+    character we found in the diff. A crashing hook is a disabled hook."""
+    try:
+        sys.stderr.write(text)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stderr, "encoding", None) or "ascii"
+        sys.stderr.write(text.encode(enc, "replace").decode(enc, "replace"))
+
+
+def main(argv):
+    diff_text = get_staged_diff()
+    if not diff_text.strip():
+        return 0
+
+    hits = list(scan(diff_text))
+    if not hits:
+        return 0
+
+    emit("pre-commit hook: REJECTED -- possible personal data or credential in staged diff\n\n")
+    emit("Rule broken: CONTRIBUTING.md -- \"Never commit credentials, tokens, or\n")
+    emit("personal data -- including in tests, comments, and screenshots.\"\n\n")
+    for file_, lineno, rule_name, reportable in hits:
+        emit("  %s:%d [%s]\n" % (file_, lineno, rule_name))
+        emit("    -> %s\n" % reportable)
+    emit("\n")
+    emit("Credential hits are shown masked on purpose -- this hook will not print a\n")
+    emit("secret into your scrollback or a CI log. Find it by prefix and line number.\n\n")
+    emit("Fix: remove the value from the diff, replace it with a placeholder\n")
+    emit("(e.g. someone@example.com, or a short obviously-fake token), or add an\n")
+    emit("allowlist entry in .githooks/pre-commit if it's genuinely safe (see\n")
+    emit(".githooks/README.md).\n\n")
+    emit("Deliberate, reviewed exception: `git commit --no-verify`.\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

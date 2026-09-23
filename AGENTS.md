@@ -144,9 +144,20 @@ injected, so the suite runs offline and cannot spend someone's quota.
 - Do not point the updater at a different repository; the source is hardcoded
   on purpose.
 - Do not add background polling of a provider's API. The daemon makes exactly
-  three kinds of request the user did not directly trigger, and no others: a
-  daily update check against GitHub's public API, an OAuth **token refresh**
+  four kinds of request the user did not directly trigger, and no others:
+  checks against GitHub's public API (the daily release check, and the
+  model-catalogue refresh from the litellm repo — both hard-backed-off and
+  neither one a provider); an OAuth **token refresh**
   when a stored token is near expiry (heavily throttled per account, and only
   ever the token endpoint — it keeps an idle account from expiring into a
-  needless re-auth), and the requests a user's own session actually makes.
-  Nothing polls a provider for quota, usage, or account state.
+  needless re-auth); a **one-shot legacy-organization backfill at startup**
+  (`daemon._backfill_legacy_oauth_organizations_async`, fired once from
+  `run_foreground` after the port is bound) — one pass per daemon start,
+  only for `oauth` Profiles whose `org_uuid` is still unset, read-only
+  against the account-profile endpoint, never repeated for the life of the
+  process; and the requests a user's own session actually makes. Nothing
+  polls a provider for quota, usage, or account state, and nothing puts that
+  backfill on a timer: a credential the profile endpoint permanently refuses
+  (a `claude setup-token` token gets a 403 no matter how often it is
+  retried) would turn a retry loop into exactly the polling this rule
+  forbids.

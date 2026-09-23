@@ -611,3 +611,40 @@ def test_is_our_daemon_matches_on_the_command_line(monkeypatch):
         stdout = "/usr/bin/some-other-server --port 4317"
     monkeypatch.setattr(cli.subprocess, "run", lambda *a, **kw: Other())
     assert cli._is_our_daemon(1) is False
+
+
+# ---------------------------------------------------------------------------
+# A bad --port is a typo, not a crash. config.resolve_port() raises ValueError
+# on an out-of-range explicit port on purpose, but main() calls it inside the
+# dispatch expression, so without _resolve_port_or_exit() the raise reaches
+# the terminal as a stack trace. argparse exits 2 with one line for a bad
+# flag; a bad flag VALUE has to look the same.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", ["0", "80", "1023", "65536", "99999"])
+def test_bad_port_flag_exits_cleanly_instead_of_tracebacking(bad, monkeypatch, capsys):
+    monkeypatch.delenv("CLAUDE_UNLIMITED_PORT", raising=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["start", "--port", bad])
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert err.startswith("claude-unlimited: ")
+    assert bad in err
+    assert "Traceback" not in err
+    assert err.count("\n") == 1, "a bad flag value gets one line, like argparse"
+
+
+def test_every_port_taking_subcommand_uses_the_guarded_resolver():
+    """main() must never call resolve_port() bare — one unguarded call site is
+    one subcommand that still tracebacks on a typo."""
+    import inspect
+
+    source = inspect.getsource(cli.main)
+    assert "resolve_port(args.port)" not in source
+    assert source.count("_resolve_port_or_exit(args.port)") == 7
+
+
+def test_a_good_port_flag_still_resolves():
+    assert cli._resolve_port_or_exit(4400) == 4400

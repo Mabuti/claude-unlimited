@@ -84,7 +84,10 @@ class PoolSnapshot:
 @dataclass(frozen=True)
 class RoutingDecision:
     profile_id: Optional[str]
-    reason: str  # "sticky" | "rotated" | "drained_fallback" | "no_eligible_profile"
+    reason: str  # choose() returns: "sticky" | "rotated" | "drained_fallback" | "no_eligible_profile"
+    # gateway.py builds RoutingDecisions of its own too: "transient_failover", and the
+    # pinned-Profile set "forced" | "forced_profile_missing" | "forced_profile_disabled" |
+    # "forced_profile_needs_reauth". Anything reading .reason has to expect all of them.
 
 
 def choose(pool: PoolSnapshot, now: datetime, exclude: Optional[set] = None) -> RoutingDecision:

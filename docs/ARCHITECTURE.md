@@ -26,7 +26,10 @@ forwarded upstream**. Adding a Dashboard route means adding it to `_VIEW_ROUTES`
 
 ## Profile kinds
 
-A Profile is one account. Three kinds share the same rotation, thresholds and Dashboard:
+A Profile is one account under one organization — an `oauth` account that holds both a
+personal plan and an organization seat is legitimately two Profiles on the same email
+address (see [ADR 0008](adr/0008-anthropic-identity-is-the-account-org-pair.md)). Three
+kinds share the same rotation, thresholds and Dashboard:
 
 | kind | What it is | How it talks upstream |
 |---|---|---|
@@ -109,6 +112,15 @@ Profile and an import is blocked; neither overwrites.
 - When a window resets, the Profile rejoins rotation automatically.
 - An account whose credential was rejected shows "needs re-auth" and tries its own refresh
   token to recover, rather than waiting for a manual re-login.
+- DRAINING is not a ban. If no ELIGIBLE Profile exists, `router.choose()` falls back to a
+  DRAINING one (past `switch_threshold` but not exhausted) rather than emptying the pool —
+  `switch_threshold` is conservative precisely so there's headroom left for this.
+- When the router has nothing left to route to — no ELIGIBLE Profile, and no DRAINING one that
+  qualifies for the fallback above — the status depends on WHY. Out of quota (something is
+  exhausted, draining or cooling down) answers `429`/`rate_limit_error` with a `Retry-After`:
+  this daemon is out of accounts, not Anthropic overloaded. Nothing usable for any other reason
+  (none configured, all disabled or needing re-auth) still answers `503`, because waiting
+  doesn't help.
 
 ## Usage tracking
 

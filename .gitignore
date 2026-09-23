@@ -55,3 +55,10 @@ tools/diagnose.py
 temp/
 tools/screenshot_fixtures.py
 tools/nobanner.py
+
+# The backend ships one runtime dependency (cryptography) and one dev extra
+# (pytest), both pinned by range in pyproject.toml -- that file is the
+# dependency source of truth, and nothing here installs from a lockfile.
+# uv.lock shows up as an untracked byproduct of running uv locally;
+# committing it would imply a locked build this project does not have.
+uv.lock

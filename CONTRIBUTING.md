@@ -8,7 +8,15 @@ Run the suite with `python -m pip install -e ".[dev]"` then `python -m pytest te
 
 - **Backend stays dependency-free, with one recorded exception.** Python standard library only — no `pip install` required to run the daemon, except `cryptography`, used exclusively by `export_import.py` for authenticated encryption of credential-containing Export bundles. If a feature seems to need a package, look for a stdlib way first; if there truly isn't one, that's a decision for a new ADR, not a quiet addition to `pyproject.toml`.
 - **Frontend stays dependency-free too**, in the same sense: no `npm install`, no build step. A static asset (an icon font, a small chart library) may be vendored as a committed file and referenced locally — never fetched from a CDN at runtime.
-- **OS-specific code lives behind its interface, always.** Secret storage and daemon auto-start each have one implementation per OS (macOS/Linux/Windows — see `docs/adr/0005-*.md`) behind a single small interface. Never hardcode an OS-only assumption (`security`/`secret-tool`/DPAPI, `launchd`/`systemd`/`schtasks`, a Keychain or credential-store path) outside that interface's implementation file — the rest of the daemon never checks `platform.system()` directly except the two `__init__.py` dispatch points and the one POSIX-only-stdlib guard in `daemon.py` (`resource`, not available on Windows).
+- **OS-specific *backends* live behind their interface, always.** This rule is about the three things this daemon implements per-OS for itself: secret storage (`claude_unlimited/secret_store/`), daemon install/auto-start (`claude_unlimited/daemon_installer/`) and desktop notifications (`claude_unlimited/notifications.py`) — each one implementation per OS behind a single small interface (see `docs/adr/0005-*.md`). Never add a second way to store a credential, install the daemon, or raise a notification outside those files, and never branch on `platform.system()` to pick between them outside the two `__init__.py` dispatch points and the one POSIX-only-stdlib guard in `daemon.py` (`resource`, not available on Windows).
+
+  Three things are deliberately NOT covered by it, because they are not this daemon's own backends:
+
+  - **Reporting on the environment.** `doctor` probes for `osascript`/`notify-send`/`powershell` on PATH so it can tell the user whether notifications will work at all. Naming a mechanism to report on it is not implementing it.
+  - **Driving another application.** Reading or clearing Claude Code's OWN Keychain item (`security find/delete-generic-password` in `anthropic_oauth.py`) and starting or quitting the Claude desktop app (`osascript` and `_powershell` in `cli.py`) are integrations with someone else's program. They are not a second credential store or a second install path, and they belong where they are used.
+  - **Narrow launch/path/quoting mechanics.** An `os.name == "nt"` branch for detached-process flags and `.cmd`/`.bat` shims (`cli.py`), the Windows socket option (`daemon.py`), the venv layout (`updater.py`) or `shlex` quoting (`config.py`) is fine inline where that mechanic is used.
+
+  The line that matters: none of those may grow into a second credential store or a second daemon-install path living outside the interface.
 - **The Dashboard is the only place profiles are managed.** Profile CRUD — listing, editing, deleting, thresholds, priority, enable/disable — has no CLI and should not grow one. A feature that needs a form belongs in the Dashboard, not a new CLI flag. The CLI covers what a browser form cannot do: daemon lifecycle (`start`/`status`/`restart`/`install`/`uninstall`/`service-*`), `doctor`, `purge`, launching a routed session (`code`) or the desktop app (`desktop`), and the interactive browser logins that must happen at a terminal (`add-account`, `add-codex-account`, `reauth`).
 
 ## Vocabulary
@@ -133,6 +141,17 @@ A PR description says:
 The title follows the same convention as a commit subject, because a squashed
 merge becomes one. `.github/PULL_REQUEST_TEMPLATE.md` carries the checklist.
 
+### On this fork
+
+`main` is not protected here, and nothing above has ever actually happened on this fork —
+every commit lands straight on `main`, and `gh pr list --repo Mabuti/claude-unlimited
+--state all` returns none. This is a single-maintainer fork: there is no second reviewer
+for a PR to route to, so a pull request would be process for its own sake.
+
+The rule above still governs upstream. On this fork, the three things a PR description
+would say — what changed, why, how it was verified — belong in the commit body instead,
+since there's no PR description to carry them.
+
 ## Never let untrusted text reach a shell
 
 This bit us once and is worth stating outright.
@@ -155,6 +174,9 @@ This bit us once and is worth stating outright.
 - Keep changes scoped to what was asked. A bug fix doesn't carry a drive-by refactor.
 - If a change touches config schema or an architectural decision, the corresponding doc/ADR update is part of the same change, not a follow-up task.
 - Never commit credentials, tokens, or personal data — including in tests, comments, and screenshots.
+- This repo ships git hooks under `.githooks/` that enforce the line above — run `git config
+  core.hooksPath .githooks` once to enable them. They block a real email address from a commit
+  message or a staged diff; see `.githooks/README.md` for the allowlist and the escape hatch.
 
 ## Releases
 
