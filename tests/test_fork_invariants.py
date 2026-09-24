@@ -448,3 +448,51 @@ def test_no_usable_profile_message_says_it_will_not_fix_itself():
     assert "no_usable_profile" in daemon._FORCED_PROFILE_ERROR_MESSAGES
     message = daemon._FORCED_PROFILE_ERROR_MESSAGES["no_usable_profile"]
     assert "will not fix itself by waiting" in message
+
+def test_api_base_url_accepts_local_http_but_never_public_http():
+    """Upstream v1.3.1 (80db304 "feat(api): local model servers") replaced this
+    fork's https-only rule for Profile base_url with
+    net_scope.validate(allow_local_http=kind != "codex"), so a local model
+    server can be reached over plain http.
+
+    That relaxation was reviewed and ACCEPTED deliberately on 2026-09-24 — it
+    was not inherited by accident. The fork's previous rule refused even
+    loopback http, reasoning that base_url validates the UPSTREAM target and
+    so is a different trust boundary from the daemon's own local listener.
+
+    This test pins where the line now sits, so that a future merge which
+    widens or narrows it fails here and the change becomes a decision again
+    instead of a surprise. A key may cross localhost or a private LAN in the
+    clear; it must never cross the public internet that way, and never for a
+    Codex profile, whose bridge speaks https only.
+    """
+    from claude_unlimited import profiles
+
+    for ok in ("https://api.anthropic.com",
+               "https://example.com/v1",
+               "http://localhost:11434",
+               "http://127.0.0.1:8080",
+               "http://192.168.1.10:11434",
+               "http://10.0.0.5:11434"):
+        profiles._validate_base_url(ok, "api")  # must not raise
+
+    for blocked in ("http://api.example.com",
+                    "http://8.8.8.8",
+                    "http://example.com/v1"):
+        try:
+            profiles._validate_base_url(blocked, "api")
+        except profiles.ValidationError:
+            pass
+        else:
+            raise AssertionError(
+                f"public plain-http base_url {blocked!r} was accepted — a Profile key "
+                "would cross the internet in the clear")
+
+    # A Codex profile is https-only whatever the host.
+    try:
+        profiles._validate_base_url("http://localhost:11434", "codex")
+    except profiles.ValidationError:
+        pass
+    else:
+        raise AssertionError("codex profile accepted plain http; the Codex bridge is https-only")
+
