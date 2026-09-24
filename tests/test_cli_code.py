@@ -20,7 +20,7 @@ def test_codex_pinned_session_relabels_the_model_picker(monkeypatch):
     # AND must equal Claude Code's native tier default so our override REPLACES
     # the native picker entry rather than adding a duplicate beside it.
     assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5[1m]"
-    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1[1m]"
+    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1"
     assert os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-haiku-4-5"
     # ...while the visible label names BOTH the Claude tier and the backing GPT.
     assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5 | GPT-5.6 Terra"
@@ -115,7 +115,7 @@ def test_codex_labels_come_from_the_live_parity_map_when_reachable(monkeypatch):
 
     # Live value, not the module literal (which says GPT-5.6 Terra for FABLE).
     assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "Fable 5.1 | GPT-6 Astra"
-    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1[1m]"
+    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1"
     desc = os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION"]
     assert "Served by Codex" in desc and "high" in desc, desc
 
@@ -318,7 +318,7 @@ def test_codex_picker_reflects_saved_list_and_unsets_removed_tiers(monkeypatch):
         [], host="h", port=1, token="t")
 
     # Fable labelled via family match; the tier id stays the native default.
-    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1[1m]"
+    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1"
     assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "Fable 5.1 | GPT-6 Astra"
     assert os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"] == "Opus 5 | GPT-5.6 Terra"
     # Sonnet and Haiku are not in the saved list -> left unset.
@@ -327,22 +327,39 @@ def test_codex_picker_reflects_saved_list_and_unsets_removed_tiers(monkeypatch):
 
 
 def test_1m_tiers_are_labelled_1m_context_and_haiku_is_not(monkeypatch):
-    """Opus, Sonnet and Fable default to the 1M-context id, so their picker
-    description must say so; Haiku has no 1M variant and must not claim it —
-    in both the offline-fallback path and the live-parity path."""
+    """Opus and Sonnet default to the 1M-context id, so their picker
+    description must say so. Fable and Haiku must NOT claim it, in both the
+    offline-fallback path and the live-parity path.
+
+    Re-measured 2026-09-22 against the installed Claude Code binary 2.1.281's
+    model table: `claude-opus-5-5[1m]` and `claude-sonnet-5[1m]` are real,
+    current tier-default ids there. `claude-fable-5-1[1m]` does NOT exist in
+    that table at all -- the entry for the fable family is bare
+    `{id:"claude-fable-5-1",family:"fable",display_name:"Fable 5.1"}`.
+    `claude-fable-5[1m]` does exist, but only inside the binary's legacy
+    migration path (`tengu_legacy_opus_migration`, "Failed to migrate Fable 5
+    model setting") -- an id being migrated AWAY from, not a current tier
+    default -- and it is a different id family (`claude-fable-5`, not
+    `claude-fable-5-1`) besides. `claude-haiku-4-5[1m]` likewise does not
+    exist. So `_MODEL_TIER_IDS` suffixes only OPUS and SONNET, and this test's
+    expectations follow that."""
     from claude_unlimited import cli
     from claude_unlimited.config import Profile
     import os
+
+    def _assert_prefixes(no_prefix_tiers):
+        for tier in ("FABLE", "OPUS", "SONNET", "HAIKU"):
+            desc = os.environ[f"ANTHROPIC_DEFAULT_{tier}_MODEL_DESCRIPTION"]
+            if tier in no_prefix_tiers:
+                assert not desc.startswith("1M context · "), (tier, desc)
+            else:
+                assert desc.startswith("1M context · "), (tier, desc)
 
     # Offline fallback (no host/port/token -> no daemon fetch).
     _clear(monkeypatch)
     cli._apply_model_labels(Profile(id="c", name="Codex", kind="codex", priority=1,
                                      automatic=True, enabled=True), [])
-    for tier in ("FABLE", "OPUS", "SONNET"):
-        desc = os.environ[f"ANTHROPIC_DEFAULT_{tier}_MODEL_DESCRIPTION"]
-        assert desc.startswith("1M context · "), (tier, desc)
-    haiku_desc = os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION"]
-    assert not haiku_desc.startswith("1M context · "), haiku_desc
+    _assert_prefixes(no_prefix_tiers={"FABLE", "HAIKU"})
 
     # Live-parity path (daemon reachable, matched via family prefix).
     _clear(monkeypatch)
@@ -355,8 +372,4 @@ def test_1m_tiers_are_labelled_1m_context_and_haiku_is_not(monkeypatch):
     cli._apply_model_labels(
         Profile(id="c", name="Codex", kind="codex", priority=1, automatic=True, enabled=True),
         [], host="127.0.0.1", port=4317, token="tok")
-    for tier in ("FABLE", "OPUS", "SONNET"):
-        desc = os.environ[f"ANTHROPIC_DEFAULT_{tier}_MODEL_DESCRIPTION"]
-        assert desc.startswith("1M context · "), (tier, desc)
-    haiku_desc = os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION"]
-    assert not haiku_desc.startswith("1M context · "), haiku_desc
+    _assert_prefixes(no_prefix_tiers={"FABLE", "HAIKU"})

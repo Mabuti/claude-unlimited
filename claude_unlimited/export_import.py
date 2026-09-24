@@ -26,7 +26,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from . import activity as activity_module
 from . import profiles as profile_repo
 from . import secret_store
-from .config import CONFIG_LOCK, Profile, load_pool, save_pool
+from .config import CONFIG_LOCK, Profile, load_pool, normalize_forced_subagents, save_pool
 
 BUNDLE_VERSION = 1
 PBKDF2_ITERATIONS = 600_000  # OWASP 2023 recommendation floor for PBKDF2-HMAC-SHA256
@@ -70,6 +70,7 @@ class ExportedProfile:
     enabled: bool
     automatic: bool
     default_model: Optional[str]
+    force_model: Optional[str]
     monthly_budget_cap: Optional[float]
     token_threshold: Optional[int]
     tag_color: Optional[str]
@@ -100,6 +101,11 @@ class ExportedProfile:
     # account_uuid alone, which is exactly the 2026-09-22 incident's
     # ambiguity on the import side too.
     codex_user_id: Optional[str] = None
+    # "Every subagent goes here". Defaulted so bundles written before the
+    # field existed still import.
+    forced_for_subagents: bool = False
+    # "Leave when Fable is spent". Same reason for the default.
+    leave_on_fable_limit: bool = False
 
 
 def build_export_bundle(
@@ -125,12 +131,15 @@ def build_export_bundle(
             exported.append(asdict(ExportedProfile(
                 name=p.name, kind=p.kind, base_url=p.base_url, auth_mode=p.auth_mode,
                 priority=p.priority, switch_threshold=p.switch_threshold, enabled=p.enabled,
-                automatic=p.automatic, default_model=p.default_model, monthly_budget_cap=p.monthly_budget_cap,
+                automatic=p.automatic, default_model=p.default_model, force_model=p.force_model,
+                monthly_budget_cap=p.monthly_budget_cap,
                 token_threshold=p.token_threshold,
                 tag_color=p.tag_color, account_uuid=p.account_uuid, credential=cred,
                 plan=p.plan, org_uuid=p.org_uuid, organization_type=p.organization_type,
                 codex_model=p.codex_model, codex_reasoning_effort=p.codex_reasoning_effort,
                 codex_user_id=p.codex_user_id,
+                forced_for_subagents=p.forced_for_subagents,
+                leave_on_fable_limit=p.leave_on_fable_limit,
             )))
         payload["profiles"] = exported
 
@@ -391,13 +400,21 @@ def apply_import(
                         auth_mode=item.get("auth_mode", "api_key"), priority=item.get("priority", 1),
                         switch_threshold=item.get("switch_threshold", 98.0), enabled=item.get("enabled", True),
                         automatic=item.get("automatic", True), default_model=item.get("default_model"),
+                        force_model=item.get("force_model"),
                         monthly_budget_cap=item.get("monthly_budget_cap"), token_threshold=item.get("token_threshold"),
                         tag_color=item.get("tag_color"), plan=item.get("plan"),
                         org_uuid=item_org_uuid, organization_type=item_organization_type,
                         codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
                         codex_user_id=item_codex_user_id,
+                        forced_for_subagents=bool(item.get("forced_for_subagents", False)),
+                        leave_on_fable_limit=item.get("leave_on_fable_limit") is True,
                     )
                     pool.profiles = [updated if p.id == existing.id else p for p in pool.profiles]
+                    # A bundle can bring a forced-subagent Profile into a pool
+                    # that already has one; the holder already routing
+                    # (earlier in the list) keeps it, rather than save_pool()
+                    # rejecting the import.
+                    pool.profiles = normalize_forced_subagents(pool.profiles)
                     save_pool(pool)
                 result["profiles_updated"] += 1
                 continue
@@ -409,17 +426,25 @@ def apply_import(
                 auth_mode=item.get("auth_mode", "api_key"), priority=item.get("priority", 1),
                 switch_threshold=item.get("switch_threshold", 98.0), enabled=item.get("enabled", True),
                 automatic=item.get("automatic", True), default_model=item.get("default_model"),
+                force_model=item.get("force_model"),
                 monthly_budget_cap=item.get("monthly_budget_cap"), token_threshold=item.get("token_threshold"),
                 tag_color=item.get("tag_color"),
                 account_uuid=item.get("account_uuid"), plan=item.get("plan"),
                 org_uuid=item_org_uuid, organization_type=item_organization_type,
                 codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
                 codex_user_id=item_codex_user_id,
+                forced_for_subagents=bool(item.get("forced_for_subagents", False)),
+                leave_on_fable_limit=item.get("leave_on_fable_limit") is True,
             )
             secret_store.set_token(new_profile.id, item["credential"])
             with CONFIG_LOCK:
                 pool = load_pool()
                 pool.profiles.append(new_profile)
+                # A bundle can bring a forced-subagent Profile into a pool
+                # that already has one; the holder already routing (earlier
+                # in the list) keeps it, rather than save_pool() rejecting
+                # the import.
+                pool.profiles = normalize_forced_subagents(pool.profiles)
                 save_pool(pool)
             result["profiles_added"] += 1
 

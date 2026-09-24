@@ -4,6 +4,8 @@ Standards for working on Claude Unlimited, so features added later — including
 
 Run the suite with `python -m pip install -e ".[dev]"` then `python -m pytest tests/`. The `dev` extra adds `pytest` and nothing else.
 
+Changing the macOS HUD (`macos-widget/`)? Its tests are separate: `cd macos-widget && swift test`, then `./build.sh` to install and run your build.
+
 ## Ground rules
 
 - **Backend stays dependency-free, with one recorded exception.** Python standard library only — no `pip install` required to run the daemon, except `cryptography`, used exclusively by `export_import.py` for authenticated encryption of credential-containing Export bundles. If a feature seems to need a package, look for a stdlib way first; if there truly isn't one, that's a decision for a new ADR, not a quiet addition to `pyproject.toml`.
@@ -17,7 +19,7 @@ Run the suite with `python -m pip install -e ".[dev]"` then `python -m pytest te
   - **Narrow launch/path/quoting mechanics.** An `os.name == "nt"` branch for detached-process flags and `.cmd`/`.bat` shims (`cli.py`), the Windows socket option (`daemon.py`), the venv layout (`updater.py`) or `shlex` quoting (`config.py`) is fine inline where that mechanic is used.
 
   The line that matters: none of those may grow into a second credential store or a second daemon-install path living outside the interface.
-- **The Dashboard is the only place profiles are managed.** Profile CRUD — listing, editing, deleting, thresholds, priority, enable/disable — has no CLI and should not grow one. A feature that needs a form belongs in the Dashboard, not a new CLI flag. The CLI covers what a browser form cannot do: daemon lifecycle (`start`/`status`/`restart`/`install`/`uninstall`/`service-*`), `doctor`, `purge`, launching a routed session (`code`) or the desktop app (`desktop`), and the interactive browser logins that must happen at a terminal (`add-account`, `add-codex-account`, `reauth`).
+- **The Dashboard is the only place profiles are managed.** Profile CRUD — listing, editing, deleting, thresholds, priority, enable/disable — has no CLI and should not grow one. A feature that needs a form belongs in the Dashboard, not a new CLI flag. The CLI covers what a browser form cannot do: daemon lifecycle (`start`/`status`/`restart`/`install`/`uninstall`/`service-*`), `doctor`, `purge`, launching a routed session (`code`) or the desktop app (`desktop`), installing or removing the macOS HUD (`hud`), and the interactive browser logins that must happen at a terminal (`add-account`, `add-codex-account`, `reauth`).
 
 ## Vocabulary
 
@@ -65,6 +67,25 @@ Do these in order; each line is something a static review can't confirm. Report 
 11. `pip install`, then `claude-unlimited install` from an **elevated** prompt — the logon task is created; confirm it runs unelevated (`/rl limited`).
 12. Close the terminal you ran `claude-unlimited code` from — the background daemon keeps running (detached), and Ctrl-C in that terminal didn't kill it.
 13. Whichever `claude` you have (native `.exe` or npm `.cmd`) — `code` and `add-account` both launch it.
+
+## Before you push: the GPT window table
+
+`claude_unlimited/gpt_windows.py` hardcodes the context windows of the GPT
+models a ChatGPT/Codex Profile can be served by (docs/adr/0009). They are a
+fact about the provider, not something the daemon learns at runtime, so they
+must be re-verified before every push:
+
+```bash
+python3 scripts/check_gpt_windows.py
+```
+
+It diffs the table against the Codex CLI's own cache of the backend listing
+(`~/.codex/models_cache.json`, written by any recent `codex` run) and fails
+when a listed model is missing or its window changed. It is deliberately not
+part of `pytest` — the suite never reads a user's files — so run it by hand,
+or install it as `.git/hooks/pre-push` (the script's docstring shows how).
+Changing a row is a spending decision: past a model's `context_window` a
+subscription is charged at a higher usage rate.
 
 ## Translations
 
