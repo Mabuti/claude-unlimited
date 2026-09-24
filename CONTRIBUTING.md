@@ -4,6 +4,8 @@ Standards for working on Claude Unlimited, so features added later — including
 
 Run the suite with `python -m pip install -e ".[dev]"` then `python -m pytest tests/`. The `dev` extra adds `pytest` and nothing else.
 
+Changing the macOS HUD (`macos-widget/`)? Its tests are separate: `cd macos-widget && swift test`, then `./build.sh` to install and run your build.
+
 ## Ground rules
 
 - **Backend stays dependency-free, with one recorded exception.** Python standard library only — no `pip install` required to run the daemon, except `cryptography`, used exclusively by `export_import.py` for authenticated encryption of credential-containing Export bundles. If a feature seems to need a package, look for a stdlib way first; if there truly isn't one, that's a decision for a new ADR, not a quiet addition to `pyproject.toml`.
@@ -15,9 +17,10 @@ Run the suite with `python -m pip install -e ".[dev]"` then `python -m pytest te
   - **Reporting on the environment.** `doctor` probes for `osascript`/`notify-send`/`powershell` on PATH so it can tell the user whether notifications will work at all. Naming a mechanism to report on it is not implementing it.
   - **Driving another application.** Reading or clearing Claude Code's OWN Keychain item (`security find/delete-generic-password` in `anthropic_oauth.py`) and starting or quitting the Claude desktop app (`osascript` and `_powershell` in `cli.py`) are integrations with someone else's program. They are not a second credential store or a second install path, and they belong where they are used.
   - **Narrow launch/path/quoting mechanics.** An `os.name == "nt"` branch for detached-process flags and `.cmd`/`.bat` shims (`cli.py`), the Windows socket option (`daemon.py`), the venv layout (`updater.py`) or `shlex` quoting (`config.py`) is fine inline where that mechanic is used.
+  - **A subsystem that only exists on one OS.** The macOS HUD (`hud.py`, `macos-widget/`) is not a fourth per-OS backend, because there is no Windows or Linux implementation for an interface to dispatch to — there is nothing there to implement. It reports its own availability with a capability check (`hud.is_supported()`, `sys.platform == "darwin"`) and every caller is expected to ask before acting, so the absence is handled honestly rather than discovered late. A platform-only subsystem belongs here; what it must never do is become the place a second credential store or a second install path quietly lives.
 
   The line that matters: none of those may grow into a second credential store or a second daemon-install path living outside the interface.
-- **The Dashboard is the only place profiles are managed.** Profile CRUD — listing, editing, deleting, thresholds, priority, enable/disable — has no CLI and should not grow one. A feature that needs a form belongs in the Dashboard, not a new CLI flag. The CLI covers what a browser form cannot do: daemon lifecycle (`start`/`status`/`restart`/`install`/`uninstall`/`service-*`), `doctor`, `purge`, launching a routed session (`code`) or the desktop app (`desktop`), and the interactive browser logins that must happen at a terminal (`add-account`, `add-codex-account`, `reauth`).
+- **The Dashboard is the only place profiles are managed.** Profile CRUD — listing, editing, deleting, thresholds, priority, enable/disable — has no CLI and should not grow one. A feature that needs a form belongs in the Dashboard, not a new CLI flag. The CLI covers what a browser form cannot do: daemon lifecycle (`start`/`status`/`restart`/`install`/`uninstall`/`service-*`), `doctor`, `purge`, launching a routed session (`code`) or the desktop app (`desktop`), installing or removing the macOS HUD (`hud`), and the interactive browser logins that must happen at a terminal (`add-account`, `add-codex-account`, `reauth`).
 
 ## Vocabulary
 
@@ -65,6 +68,25 @@ Do these in order; each line is something a static review can't confirm. Report 
 11. `pip install`, then `claude-unlimited install` from an **elevated** prompt — the logon task is created; confirm it runs unelevated (`/rl limited`).
 12. Close the terminal you ran `claude-unlimited code` from — the background daemon keeps running (detached), and Ctrl-C in that terminal didn't kill it.
 13. Whichever `claude` you have (native `.exe` or npm `.cmd`) — `code` and `add-account` both launch it.
+
+## Before you push: the GPT window table
+
+`claude_unlimited/gpt_windows.py` hardcodes the context windows of the GPT
+models a ChatGPT/Codex Profile can be served by (docs/adr/0009). They are a
+fact about the provider, not something the daemon learns at runtime, so they
+must be re-verified before every push:
+
+```bash
+python3 scripts/check_gpt_windows.py
+```
+
+It diffs the table against the Codex CLI's own cache of the backend listing
+(`~/.codex/models_cache.json`, written by any recent `codex` run) and fails
+when a listed model is missing or its window changed. It is deliberately not
+part of `pytest` — the suite never reads a user's files — so run it by hand,
+or install it as `.git/hooks/pre-push` (the script's docstring shows how).
+Changing a row is a spending decision: past a model's `context_window` a
+subscription is charged at a higher usage rate.
 
 ## Translations
 
@@ -143,14 +165,24 @@ merge becomes one. `.github/PULL_REQUEST_TEMPLATE.md` carries the checklist.
 
 ### On this fork
 
-`main` is not protected here, and nothing above has ever actually happened on this fork —
-every commit lands straight on `main`, and `gh pr list --repo Mabuti/claude-unlimited
---state all` returns none. This is a single-maintainer fork: there is no second reviewer
-for a PR to route to, so a pull request would be process for its own sake.
+`main` is not protected here and a small change lands on it directly. Anything
+non-trivial goes through a pull request: an upstream merge, a change touching the
+gateway or a credential path, or anything large enough that a reviewable diff is worth
+more than the minute it costs to open one.
 
-The rule above still governs upstream. On this fork, the three things a PR description
-would say — what changed, why, how it was verified — belong in the commit body instead,
-since there's no PR description to carry them.
+This is a single-maintainer fork, so a PR here is not about routing to a second
+reviewer — there isn't one. It is about getting CI to run before `main` moves, and
+leaving a diff that can be read later by someone who has forgotten the context,
+including the author.
+
+An earlier version of this section claimed no PR had ever been opened here. That
+stopped being true the moment the PR carrying the claim was merged; it is corrected
+rather than quietly deleted, because a contributing guide that is confidently wrong
+about its own process is worse than one that says nothing.
+
+The rule above still governs upstream. Where a change does land straight on `main`,
+the three things a PR description would say — what changed, why, how it was verified —
+belong in the commit body instead.
 
 ## Never let untrusted text reach a shell
 

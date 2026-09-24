@@ -1,3 +1,4 @@
+import json
 import time
 import time as real_time
 from datetime import datetime, timedelta, timezone
@@ -80,7 +81,7 @@ def test_no_eligible_profile_client_payload_is_rate_limit_error_not_overloaded(p
 
     empty_pool_result = gateway_module.GatewayResult(status=429, headers={}, body_chunks=None,
                                                        profile_id=None, error="no_eligible_profile")
-    payload = daemon_module._proxy_error_payload(empty_pool_result)
+    _status, payload = daemon_module._proxy_error_payload(empty_pool_result)
     assert payload["error"]["type"] == "rate_limit_error"
     assert "No eligible Profile" in payload["error"]["message"]
 
@@ -89,14 +90,14 @@ def test_no_eligible_profile_client_payload_is_rate_limit_error_not_overloaded(p
     # be dressed as provider overload either.
     exhausted = gateway_module.GatewayResult(status=429, headers={}, body_chunks=None,
                                                profile_id=None, error="rotation_attempts_exhausted")
-    assert daemon_module._proxy_error_payload(exhausted)["error"]["type"] == "rate_limit_error"
+    assert daemon_module._proxy_error_payload(exhausted)[1]["error"]["type"] == "rate_limit_error"
 
     # But a pool with nothing usable for a NON-quota reason keeps the old
     # mapping: telling the user "rate limited" when the credential is dead
     # sends them away to wait for something that will never change.
     unusable = gateway_module.GatewayResult(status=503, headers={}, body_chunks=None,
                                               profile_id=None, error="no_usable_profile")
-    unusable_payload = daemon_module._proxy_error_payload(unusable)
+    _unusable_status, unusable_payload = daemon_module._proxy_error_payload(unusable)
     assert unusable_payload["error"]["type"] == "overloaded_error"
     assert "will not fix itself by waiting" in unusable_payload["error"]["message"]
 
@@ -249,7 +250,13 @@ def test_non_automatic_profile_not_auto_selected_when_no_current(pool_env):
 def test_all_profiles_exhausted_returns_429_not_infinite_loop(pool_env):
     # Renamed from test_all_profiles_exhausted_returns_503_not_infinite_loop:
     # the "not infinite loop" guarantee is unchanged, only the status this
-    # no_eligible_profile outcome carries.
+    # outcome carries. The error string itself is stale from before the
+    # upstream all_profiles_exhausted/no_eligible_profile split existed:
+    # both Profiles here are genuinely EXHAUSTED (every enabled account out
+    # of capacity), which is exactly the all_profiles_exhausted case now
+    # that the two are distinguished -- see
+    # test_quota_blocked_pool_returns_429_rate_limit_error's own port of
+    # this same fix. Status stays 429 either way (quota_blocked).
     save_pool(Pool(profiles=[
         Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
         Profile(id="b", name="B", kind="oauth", priority=2, automatic=True, enabled=True),
@@ -257,7 +264,7 @@ def test_all_profiles_exhausted_returns_429_not_infinite_loop(pool_env):
     gw = Gateway(transport=lambda req: fake_response(429, {"anthropic-ratelimit-unified-5h-status": "rejected"}))
     result = gw.handle("POST", "/v1/messages", {}, b"{}")
     assert result.status == 429
-    assert result.error == "no_eligible_profile"
+    assert result.error == "all_profiles_exhausted"
 
 
 def test_transport_network_error_rotates_to_next_profile_instead_of_crashing(pool_env):
@@ -365,6 +372,10 @@ def test_reauthenticating_a_profile_clears_stuck_auth_invalid_state(pool_env):
     recovered = gw.handle("POST", "/v1/messages", {}, b"{}")
     assert recovered.status == 200
     assert recovered.profile_id == "a"
+    # And its usage is read straight away, not at the next scheduled read, so
+    # the Dashboard fills in the moment the account is back.
+    assert gw.take_usage_recheck_requests() == {"a"}
+    assert gw.usage_recheck_wakeup.is_set()
     assert transport.calls == 2  # the refreshed credential got tried
 
 
@@ -409,10 +420,13 @@ def test_auth_invalid_oauth_profile_self_recovers_via_refresh_token_on_sync(pool
 
     monkeypatch.setattr(gateway_module.oauth_login, "refresh_access_token", fake_refresh)
 
+    gw.runtime_snapshot()              # a poll schedules the check...
+    gw.wait_for_credential_checks()    # ...which runs off the request thread
     snapshot = gw.runtime_snapshot()  # a bare sync, with no request and no manual re-auth
 
     assert refresh_calls == ["ref-a"]
     assert snapshot["a"].state == gateway_module.ProfileState.ELIGIBLE
+    assert gw.take_usage_recheck_requests() == {"a"}   # its usage is read now
     persisted = oauth_credential.decode(fake_store.tokens["a"])
     assert persisted.access_token == "tok-recovered"
 
@@ -1259,7 +1273,10 @@ def test_an_auth_invalid_codex_profile_recovers_via_its_refresh_token(pool_env, 
     gw._observe("a", AuthInvalid(), datetime(2026, 1, 1, tzinfo=timezone.utc))
     assert gw._runtime["a"].state == ProfileState.AUTH_INVALID
 
+    gw.runtime_snapshot()
+    gw.wait_for_credential_checks()
     assert gw.runtime_snapshot()["a"].state == ProfileState.ELIGIBLE
+    assert gw.take_usage_recheck_requests() == {"a"}   # codex too: read its usage now
     assert calls == ["a"], "the refresh was never attempted for a codex profile"
 
 
@@ -1546,7 +1563,14 @@ def test_far_off_deadline_omits_retry_after_rather_than_lying(pool_env):
     """Retry-After is a promise that the request will succeed after it. A 7d
     exhaustion clamped to 1800 would send the client back in 30 minutes to
     an account still dead for six more days, so the header is omitted
-    instead. See _MAX_TRUTHFUL_RETRY_AFTER_SECONDS."""
+    instead. See _MAX_TRUTHFUL_RETRY_AFTER_SECONDS.
+
+    error is all_profiles_exhausted, not the older no_eligible_profile: the
+    only enabled Profile is genuinely EXHAUSTED with a known (if distant)
+    resets_at, which is exactly what _capacity_exhaustion now reports as
+    exhausted. That naming predates the upstream all_profiles_exhausted /
+    no_eligible_profile split; only the Retry-After omission this test is
+    actually about is the fork-measured behaviour."""
     save_pool(Pool(profiles=[
         Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
     ]))
@@ -1561,14 +1585,16 @@ def test_far_off_deadline_omits_retry_after_rather_than_lying(pool_env):
     result = gw.handle("POST", "/v1/messages", {}, b"{}")  # now the pool is empty
 
     assert result.status == 429
-    assert result.error == "no_eligible_profile"
+    assert result.error == "all_profiles_exhausted"
     assert "retry-after" not in result.headers
 
 
 def test_quota_blocked_pool_returns_429_rate_limit_error(pool_env):
     """The counterpart to test_no_profiles_returns_503_not_a_rate_limit: when
     the pool IS empty for a quota reason, 429/rate_limit_error is correct and
-    a truthful Retry-After comes with it."""
+    a truthful Retry-After comes with it. error is all_profiles_exhausted
+    (see test_far_off_deadline_omits_retry_after_rather_than_lying above for
+    why that's not the older no_eligible_profile)."""
     soon = datetime.now(timezone.utc) + timedelta(minutes=5)
 
     def transport(req):
@@ -1581,7 +1607,7 @@ def test_quota_blocked_pool_returns_429_rate_limit_error(pool_env):
     result = gw.handle("POST", "/v1/messages", {}, b"{}")  # pool now quota-empty
 
     assert result.status == 429
-    assert result.error == "no_eligible_profile"
+    assert result.error == "all_profiles_exhausted"
     assert 0 < int(result.headers["retry-after"]) <= 1800
 
 
@@ -1671,3 +1697,612 @@ def test_transient_429_failover_is_capped_at_one_hop(pool_env):
 
     assert len(served) <= 2, f"expected at most one failover hop, touched {served}"
     assert result.status == 429
+
+
+def test_the_gateway_lock_is_free_while_a_credential_refresh_runs(pool_env, monkeypatch):
+    """The refresh reads the keychain (a subprocess on macOS) and calls the
+    provider's token endpoint. Holding the gateway lock across that made every
+    Dashboard and widget poll queue behind it — 20-45s on a loaded machine,
+    with the widget falling back to "loading" each time."""
+    import claude_unlimited.oauth_credential as oauth_credential
+    import claude_unlimited.oauth_login as oauth_login
+    import claude_unlimited.profiles as profile_repo
+
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True)]))
+
+    class SettableFakeSecretStore(FakeSecretStore):
+        def set_token(self, profile_id, token):
+            self.tokens[profile_id] = token
+
+    expiring = oauth_credential.encode(oauth_credential.StoredOAuthCredential(
+        access_token="tok-old", refresh_token="ref-a", expires_at=1))
+    store = SettableFakeSecretStore({"a": expiring})
+    monkeypatch.setattr(gateway_module, "secret_store", store)
+    monkeypatch.setattr(profile_repo, "secret_store", store)
+
+    gw = Gateway(transport=lambda req: fake_response(200))
+    lock_free_during_refresh = []
+    keychain_lock_free = []
+
+    def watching_get_token(profile_id, _real=store.get_token):
+        keychain_lock_free.append(gw._lock.acquire(blocking=False))
+        if keychain_lock_free[-1]:
+            gw._lock.release()
+        return _real(profile_id)
+
+    monkeypatch.setattr(store, "get_token", watching_get_token)
+
+    def fake_refresh(refresh_token, timeout=30.0):
+        # Whoever holds the lock here blocks every other caller for as long
+        # as this network call takes.
+        lock_free_during_refresh.append(gw._lock.acquire(blocking=False))
+        if lock_free_during_refresh[-1]:
+            gw._lock.release()
+        return oauth_login.LoginTokens(access_token="tok-new", refresh_token="ref-a",
+                                        expires_at=9_999_999_999_999)
+
+    monkeypatch.setattr(gateway_module.oauth_login, "refresh_access_token", fake_refresh)
+
+    gw.runtime_snapshot()            # schedules the check on a background thread
+    gw.wait_for_credential_checks()  # and here it finishes, off this thread
+    assert lock_free_during_refresh == [True], "the token refresh ran while holding the gateway lock"
+    assert all(keychain_lock_free), "the keychain was read while holding the gateway lock"
+
+
+def test_a_test_can_never_write_the_users_real_config(monkeypatch):
+    """The backstop for what actually happened: a credential-check thread
+    outlived its test, monkeypatch restored the real CONFIG_FILE, and the
+    thread wrote its test pool over four live Profiles."""
+    import claude_unlimited.config as config
+    from pathlib import Path
+
+    monkeypatch.setattr(config, "CONFIG_FILE", Path.home() / ".claude-unlimited" / "config.json")
+    with pytest.raises(RuntimeError, match="refusing to write the real config"):
+        config.save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth")]))
+
+
+# ---- "everything is out of capacity" is said once, and says what it means --
+
+def _exhausted_pool_gateway(monkeypatch, percent=99.0):
+    """One enabled Profile, at its limit, with a known reset time."""
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=True,
+                                     switch_threshold=98.0)]))
+    resets = datetime.now(timezone.utc) + timedelta(minutes=30)
+
+    def transport(req):
+        # The shape Anthropic actually sends when a window is spent: the
+        # explicit "rejected" status, not just a high utilization.
+        return fake_response(429, {"anthropic-ratelimit-unified-5h-status": "rejected",
+                                   "anthropic-ratelimit-unified-5h-utilization": str(percent / 100),
+                                   "anthropic-ratelimit-unified-5h-reset": str(int(resets.timestamp()))})
+
+    gw = Gateway(transport=transport)
+    gw.handle("POST", "/v1/messages", {}, b"{}")  # the request that uses it up
+    return gw, resets
+
+
+def test_exhaustion_is_announced_once_however_many_requests_are_rejected(monkeypatch, pool_env):
+    # 429, not upstream's 503: this pool is quota_blocked (its one Profile is
+    # EXHAUSTED), and the fork's measured rule is 429/rate_limit_error for
+    # exactly that case -- a 503/overloaded_error here is what caused the
+    # 12-minute Claude Code hang the rule exists to prevent. The
+    # announced-once guarantee this test is actually about is unaffected by
+    # the status code.
+    recorded = []
+    monkeypatch.setattr("claude_unlimited.gateway.activity.record",
+                        lambda category, text, meta=None: recorded.append(text))
+    notified = []
+    monkeypatch.setattr("claude_unlimited.gateway.notifications.notify_if_enabled",
+                        lambda kind, title, body, settings: notified.append(body))
+    gw, _ = _exhausted_pool_gateway(monkeypatch)
+
+    for _ in range(25):
+        result = gw.handle("POST", "/v1/messages", {}, b"{}")
+        assert result.status == 429
+
+    assert len([t for t in recorded if "out of capacity" in t]) == 1, recorded
+    assert len(notified) == 1
+
+
+def test_an_exhausted_pool_says_so_specifically_and_when_it_comes_back(pool_env):
+    # 429, not upstream's 503 -- same fork rule as
+    # test_exhaustion_is_announced_once_however_many_requests_are_rejected
+    # above: this pool is quota_blocked, so it gets the rate_limit_error
+    # status, not overloaded_error.
+    gw, resets = _exhausted_pool_gateway(None)
+    result = gw.handle("POST", "/v1/messages", {}, b"{}")
+
+    assert result.status == 429
+    assert result.error == "all_profiles_exhausted"
+    assert "all profiles are out of capacity" in result.error_detail.lower()
+    assert f"{resets.astimezone():%H:%M}" in result.error_detail
+    # Retry-After, so a client that honours it waits for real capacity.
+    assert 0 < int(result.headers["retry-after"]) <= 30 * 60
+
+
+def test_a_pool_that_is_merely_unreachable_is_not_reported_as_exhausted(pool_env):
+    """A cooldown from a refused connection is not a quota problem, and must
+    not tell the user they are out of capacity."""
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=True)]))
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(ConnectionRefusedError("refused")))
+    result = gw.handle("POST", "/v1/messages", {}, b"{}")
+    assert result.error == "no_eligible_profile" and result.error_detail is None
+
+
+def test_capacity_coming_back_is_recorded_and_re_arms_the_announcement(monkeypatch, pool_env):
+    recorded = []
+    monkeypatch.setattr("claude_unlimited.gateway.activity.record",
+                        lambda category, text, meta=None: recorded.append(text))
+    monkeypatch.setattr("claude_unlimited.gateway.notifications.notify_if_enabled",
+                        lambda kind, title, body, settings: None)
+    gw, _ = _exhausted_pool_gateway(monkeypatch)   # announces
+    gw.handle("POST", "/v1/messages", {}, b"{}")   # stays quiet
+
+    # The window reopens and a request succeeds: the runtime's reset time is
+    # in the past by then, so the Profile recovers on the next request.
+    gw._transport = lambda req: fake_response(200, {"anthropic-ratelimit-unified-5h-utilization": "0.1"})
+    for rt in gw._runtime.values():
+        rt.resets_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        rt.cooldown_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+    assert gw.handle("POST", "/v1/messages", {}, b"{}").status == 200
+    assert any("Capacity is back" in t for t in recorded), recorded
+
+    # Out again: the next outage is announced afresh, not swallowed.
+    recorded.clear()
+    gw._transport = lambda req: fake_response(429, {"anthropic-ratelimit-unified-5h-status": "rejected",
+                                                    "anthropic-ratelimit-unified-5h-utilization": "0.99"})
+    gw.handle("POST", "/v1/messages", {}, b"{}")
+    gw.handle("POST", "/v1/messages", {}, b"{}")
+    assert len([t for t in recorded if "out of capacity" in t]) == 1, recorded
+
+
+# ---- a request must never carry an empty text block upstream ---------------
+
+def test_an_empty_text_block_in_the_history_is_dropped_before_forwarding(pool_env):
+    """Anthropic rejects the whole request with "400 messages: text content
+    blocks must be non-empty". A client re-sends its entire conversation every
+    turn, so one empty block recorded in a session breaks every later request
+    in it — including on accounts that never produced it."""
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=True)]))
+    sent = []
+
+    def transport(req):
+        sent.append(json.loads(req.body))
+        return fake_response(200, {"anthropic-ratelimit-unified-5h-utilization": "0.1"})
+
+    body = json.dumps({
+        "model": "claude-sonnet-5",
+        "system": [{"type": "text", "text": "be helpful"}, {"type": "text", "text": ""}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            # What the Codex bridge used to write: a reply that went straight
+            # to a tool call, recorded as an empty text block.
+            {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "  "},
+                {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}},
+            ]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}]},
+        ],
+    }).encode()
+
+    result = Gateway(transport=transport).handle("POST", "/v1/messages", {}, body)
+    assert result.status == 200
+
+    forwarded = sent[0]
+    assert forwarded["system"] == [{"type": "text", "text": "be helpful"}]
+    # The message that was nothing but an empty block is gone; the one that
+    # also carried a tool_use keeps it, so the tool_result still has its pair.
+    assert [m["role"] for m in forwarded["messages"]] == ["user", "assistant", "user"]
+    assert [b["type"] for b in forwarded["messages"][1]["content"]] == ["tool_use"]
+    assert forwarded["messages"][2]["content"][0]["tool_use_id"] == "toolu_1"
+
+
+def test_a_request_with_no_empty_blocks_is_forwarded_byte_for_byte(pool_env):
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=True)]))
+    sent = []
+
+    def transport(req):
+        sent.append(req.body)
+        return fake_response(200, {"anthropic-ratelimit-unified-5h-utilization": "0.1"})
+
+    body = json.dumps({"model": "claude-sonnet-5",
+                       "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}).encode()
+    Gateway(transport=transport).handle("POST", "/v1/messages", {}, body)
+    assert sent[0] == body
+
+
+# ---------------------------------------------------------------------------
+# Issue #4 — returning to the highest-priority account after a failover.
+# ---------------------------------------------------------------------------
+
+_OK_HEADERS = {"anthropic-ratelimit-unified-5h-utilization": "0.4",
+               "anthropic-ratelimit-unified-5h-reset": "1787191800"}
+
+
+def _two_profiles(**settings_kwargs):
+    from claude_unlimited.config import Settings
+    return Pool(profiles=[
+        Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
+        Profile(id="b", name="B", kind="oauth", priority=2, automatic=True, enabled=True),
+    ], settings=Settings(**settings_kwargs))
+
+
+def _drain(result):
+    """A Profile stays marked in-flight until its response body is read to the
+    end, and an in-flight request means the pool is NOT idle. A test that
+    leaves the body unread is a pool that never goes idle."""
+    list(result.body_chunks or ())
+    return result
+
+
+def _fail_over_to_b(gw, calls):
+    """Drive the pool onto the fallback, then let A recover."""
+    result = _drain(gw.handle("POST", "/v1/messages", {}, b"{}"))
+    assert result.profile_id == "b", "the failover itself did not happen"
+    # A's quota window has reset; it is eligible again.
+    gw._runtime["a"].state = gateway_module.ProfileState.ELIGIBLE
+    gw._runtime["a"].resets_at = None
+
+
+def _transport_failing_a_once():
+    calls = []
+
+    def transport(req):
+        calls.append(req.headers.get("Authorization"))
+        if calls[-1] == "Bearer tok-a" and len(calls) == 1:
+            return fake_response(429, {"anthropic-ratelimit-unified-5h-status": "rejected"})
+        return fake_response(200, _OK_HEADERS)
+
+    return transport, calls
+
+
+def test_the_pool_stays_on_the_fallback_by_default(pool_env):
+    """The sticky behaviour issue #4 reports is deliberate — it keeps the
+    prompt cache warm — so it must be what happens with the setting off."""
+    save_pool(_two_profiles())
+    transport, calls = _transport_failing_a_once()
+    gw = Gateway(transport=transport)
+    _fail_over_to_b(gw, calls)
+
+    assert _drain(gw.handle("POST", "/v1/messages", {}, b"{}")).profile_id == "b"
+
+
+def test_an_idle_pool_returns_to_the_preferred_account_when_asked(pool_env):
+    save_pool(_two_profiles(return_to_preferred=True))
+    transport, calls = _transport_failing_a_once()
+    gw = Gateway(transport=transport)
+    _fail_over_to_b(gw, calls)
+
+    # Nothing has been served for longer than the idle gate.
+    for pid in list(gw._last_active):
+        gw._last_active[pid] -= gw._RETURN_TO_PREFERRED_IDLE_SECONDS + 1
+    assert _drain(gw.handle("POST", "/v1/messages", {}, b"{}")).profile_id == "a"
+
+
+def test_a_busy_pool_is_never_moved_mid_session(pool_env):
+    """The whole risk in this feature is yanking a live session off its
+    account. The idle gate is what prevents it."""
+    save_pool(_two_profiles(return_to_preferred=True))
+    transport, calls = _transport_failing_a_once()
+    gw = Gateway(transport=transport)
+    _fail_over_to_b(gw, calls)
+
+    # The last request was seconds ago, not ten minutes.
+    assert gw.handle("POST", "/v1/messages", {}, b"{}").profile_id == "b"
+
+
+def test_take_over_outranks_the_return(pool_env):
+    """A standing manual override is an explicit choice made now; the setting
+    is a preference made once."""
+    save_pool(_two_profiles(return_to_preferred=True))
+    transport, calls = _transport_failing_a_once()
+    gw = Gateway(transport=transport)
+    _fail_over_to_b(gw, calls)
+    gw._manual_profile_id = "b"
+    for pid in list(gw._last_active):
+        gw._last_active[pid] -= gw._RETURN_TO_PREFERRED_IDLE_SECONDS + 1
+
+    assert gw.handle("POST", "/v1/messages", {}, b"{}").profile_id == "b"
+
+
+def test_the_return_never_moves_down_the_priority_order(pool_env):
+    """It only ever goes UP. With the preferred account still spent, an idle
+    pool must stay exactly where it is rather than churn."""
+    save_pool(_two_profiles(return_to_preferred=True))
+    transport, calls = _transport_failing_a_once()
+    gw = Gateway(transport=transport)
+    result = _drain(gw.handle("POST", "/v1/messages", {}, b"{}"))
+    assert result.profile_id == "b"
+    # A is left EXHAUSTED this time — no recovery.
+    for pid in list(gw._last_active):
+        gw._last_active[pid] -= gw._RETURN_TO_PREFERRED_IDLE_SECONDS + 1
+
+    assert gw.handle("POST", "/v1/messages", {}, b"{}").profile_id == "b"
+
+
+# ---------------------------------------------------------------------------
+# Rejection-triggered usage re-read.
+#
+# Polling gives up to ~10 minutes of staleness, during which requests for a
+# spent model keep landing on the account that cannot serve them. A 429 the
+# ACCOUNT-level windows cannot explain is the event that says "the data is
+# already wrong", so the usage endpoint is worth re-reading now.
+# ---------------------------------------------------------------------------
+
+def _rate_limited_transport():
+    def transport(req):
+        # 429 with no retry-after and no "rejected" status: a ShortRateLimit,
+        # not a quota exhaustion.
+        return fake_response(429, {})
+    return transport
+
+
+def test_a_429_the_account_windows_cannot_explain_asks_for_a_usage_reread(pool_env):
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True)]))
+    gw = Gateway(transport=_rate_limited_transport())
+    gw.runtime_snapshot()
+    with gw._lock:
+        # Comfortably below the switch threshold: nothing we already know
+        # explains a refusal.
+        gw._runtime["a"].last_usage_percent = 12.0
+        gw._runtime["a"].last_usage_percent_7d = 20.0
+
+    _drain(gw.handle("POST", "/v1/messages", {}, b"{}"))
+    assert gw.take_usage_recheck_requests() == {"a"}
+
+
+def test_a_429_on_an_account_near_its_threshold_asks_for_nothing(pool_env):
+    """The numbers we already hold explain this one, so a re-read would tell
+    us nothing — and an account being rate-limited is the last one to send
+    extra requests to."""
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True)]))
+    gw = Gateway(transport=_rate_limited_transport())
+    gw.runtime_snapshot()
+    with gw._lock:
+        gw._runtime["a"].last_usage_percent = 97.0   # inside the approaching band
+        gw._runtime["a"].last_usage_percent_7d = 10.0
+
+    _drain(gw.handle("POST", "/v1/messages", {}, b"{}"))
+    assert gw.take_usage_recheck_requests() == set()
+
+
+def test_a_successful_request_asks_for_nothing(pool_env):
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True)]))
+    gw = Gateway(transport=lambda req: fake_response(200, _OK_HEADERS))
+    _drain(gw.handle("POST", "/v1/messages", {}, b"{}"))
+    assert gw.take_usage_recheck_requests() == set()
+
+
+def test_at_most_one_reread_per_profile_per_interval(pool_env):
+    """The point is to replace a scheduled read, not to add a burst of them."""
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True)]))
+    gw = Gateway(transport=_rate_limited_transport())
+    gw.runtime_snapshot()
+    with gw._lock:
+        gw._runtime["a"].last_usage_percent = 5.0
+
+    assert gw._request_usage_recheck("a") is True
+    assert gw._request_usage_recheck("a") is False     # immediately after
+    assert gw.take_usage_recheck_requests() == {"a"}
+    # Draining does NOT reset the clock: a honoured request still counts.
+    assert gw._request_usage_recheck("a") is False
+    assert gw.take_usage_recheck_requests() == set()
+
+
+def test_the_interval_eventually_allows_another_reread(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True)]))
+    gw = Gateway(transport=_rate_limited_transport())
+    assert gw._request_usage_recheck("a") is True
+
+    base = real_time.monotonic()
+    monkeypatch.setattr(gateway_module.time, "monotonic",
+                        lambda: base + gw._USAGE_RECHECK_MIN_INTERVAL + 1)
+    assert gw._request_usage_recheck("a") is True
+
+
+def test_draining_is_one_shot(pool_env):
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True)]))
+    gw = Gateway(transport=_rate_limited_transport())
+    gw._request_usage_recheck("a")
+    assert gw.take_usage_recheck_requests() == {"a"}
+    assert gw.take_usage_recheck_requests() == set()
+
+
+def test_a_rejected_model_is_only_looked_up_once(pool_env):
+    """A single-model endpoint (a local model server, a one-deployment
+    gateway) answers 404 for a Claude model name. The first request learns it
+    and retries; every later one sends the default model straight away instead
+    of paying the same 404 + retry forever."""
+    save_pool(Pool(profiles=[Profile(id="a", name="Local", kind="api", priority=1, automatic=True,
+                                     enabled=True, base_url="http://127.0.0.1:5566",
+                                     default_model="local-model-1")]))
+    sent = []
+
+    def transport(req):
+        sent.append(json.loads(req.body)["model"])
+        if sent[-1] != "local-model-1":
+            return fake_response(404, body=b'{"error":{"message":"Model not found"}}')
+        return fake_response(200)
+
+    gw = Gateway(transport=transport)
+    body = json.dumps({"model": "claude-haiku-4-5", "max_tokens": 1,
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+    first = gw.handle("POST", "/v1/messages", {}, body)
+    assert first.status == 200
+    assert sent == ["claude-haiku-4-5", "local-model-1"]   # asked, refused, retried
+
+    second = gw.handle("POST", "/v1/messages", {}, body)
+    assert second.status == 200
+    assert sent[2:] == ["local-model-1"]                    # no wasted round trip
+
+
+def test_a_multi_model_endpoint_is_not_second_guessed(pool_env):
+    """Only a model this endpoint actually refused is rewritten. A gateway
+    that serves several models keeps getting exactly what was asked for."""
+    save_pool(Pool(profiles=[Profile(id="a", name="Gateway", kind="api", priority=1, automatic=True,
+                                     enabled=True, base_url="https://gw.example",
+                                     default_model="fallback-model")]))
+    sent = []
+
+    def transport(req):
+        sent.append(json.loads(req.body)["model"])
+        return fake_response(200)
+
+    gw = Gateway(transport=transport)
+    for model in ("claude-opus-5", "claude-sonnet-5"):
+        body = json.dumps({"model": model, "max_tokens": 1,
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+        assert gw.handle("POST", "/v1/messages", {}, body).status == 200
+    assert sent == ["claude-opus-5", "claude-sonnet-5"]
+
+
+# ---- force_model: "always this model, exactly" ------------------------------
+
+def _api_pool(**fields):
+    save_pool(Pool(profiles=[Profile(id="a", name="Local", kind="api", priority=1, automatic=True,
+                                     enabled=True, base_url="http://127.0.0.1:5566", **fields)]))
+
+
+def _msg(model="claude-sonnet-5"):
+    return json.dumps({"model": model, "max_tokens": 1,
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+
+def test_force_model_is_sent_whatever_the_client_asked_for(pool_env):
+    _api_pool(force_model="qwen3-coder", default_model="qwen-fallback")
+    sent = []
+    gw = Gateway(transport=lambda req: (sent.append(json.loads(req.body)["model"]), fake_response(200))[1])
+    for asked in ("claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5-5"):
+        assert gw.handle("POST", "/v1/messages", {}, _msg(asked)).status == 200
+    assert sent == ["qwen3-coder"] * 3   # never the default, never the Claude name
+
+
+def test_the_default_model_is_only_the_fallback_for_a_refused_forced_model(pool_env):
+    _api_pool(force_model="qwen3-coder", default_model="qwen-fallback")
+    sent = []
+
+    def transport(req):
+        sent.append(json.loads(req.body)["model"])
+        if sent[-1] == "qwen3-coder":
+            return fake_response(404, body=b'{"error":{"message":"Model qwen3-coder not found"}}')
+        return fake_response(200)
+
+    gw = Gateway(transport=transport)
+    assert gw.handle("POST", "/v1/messages", {}, _msg()).status == 200
+    assert sent == ["qwen3-coder", "qwen-fallback"]
+    assert gw.handle("POST", "/v1/messages", {}, _msg()).status == 200
+    assert sent[2:] == ["qwen-fallback"]   # the refusal is remembered: no repeat 404
+
+
+def test_prompt_too_long_is_not_mistaken_for_a_refused_model(pool_env):
+    # A real failure: a 64K local model answered 400 "Prompt too long".
+    # That used to trigger the default-model retry and remember the model as
+    # refused, which with a forced model would abandon it for good.
+    _api_pool(force_model="qwen3-coder", default_model="qwen-fallback")
+    sent = []
+    too_long = b'{"error":{"message":"Prompt too long: 100812 tokens exceeds max context window of 65536 tokens"}}'
+
+    def transport(req):
+        sent.append(json.loads(req.body)["model"])
+        return fake_response(400, body=too_long)
+
+    gw = Gateway(transport=transport)
+    result = gw.handle("POST", "/v1/messages", {}, _msg())
+    assert result.status == 400
+    assert sent == ["qwen3-coder"]                           # no pointless retry
+    assert b"".join(result.body_chunks) == too_long          # the real error reaches the client intact
+    assert gw.handle("POST", "/v1/messages", {}, _msg()).status == 400
+    assert sent == ["qwen3-coder", "qwen3-coder"]            # still the forced model, not "learned" away
+
+
+def test_a_400_that_names_the_model_still_falls_back(pool_env):
+    _api_pool(default_model="qwen-fallback")
+    sent = []
+
+    def transport(req):
+        sent.append(json.loads(req.body)["model"])
+        if sent[-1] != "qwen-fallback":
+            return fake_response(400, body=b'{"error":{"message":"invalid model: claude-sonnet-5"}}')
+        return fake_response(200)
+
+    gw = Gateway(transport=transport)
+    assert gw.handle("POST", "/v1/messages", {}, _msg()).status == 200
+    assert sent == ["claude-sonnet-5", "qwen-fallback"]
+
+
+def test_a_400_that_only_mentions_the_word_model_is_not_a_refusal(pool_env):
+    # "max_tokens is too large for this model" is a malformed request; taking
+    # it for a refusal would move every later request off a working model.
+    _api_pool(force_model="qwen3-coder", default_model="qwen-fallback")
+    sent = []
+    bad = b'{"error":{"message":"max_tokens: 99999 > 8192, the maximum allowed for this model"}}'
+
+    def transport(req):
+        sent.append(json.loads(req.body)["model"])
+        return fake_response(400, body=bad)
+
+    gw = Gateway(transport=transport)
+    assert gw.handle("POST", "/v1/messages", {}, _msg()).status == 400
+    assert gw.handle("POST", "/v1/messages", {}, _msg()).status == 400
+    assert sent == ["qwen3-coder", "qwen3-coder"]
+
+
+def test_a_large_error_body_is_forwarded_whole_past_the_peek_cap():
+    head = b"x" * gateway_module._MAX_ERROR_BODY_PEEK
+    tail = b"tail"
+
+    def chunks():
+        yield head
+        yield tail
+
+    resp = UpstreamResponse(status=400, headers={}, body_chunks=chunks(), connection=None)
+    peeked, forwarded = gateway_module._peek_error_body(resp)
+    assert peeked == head
+    assert b"".join(forwarded.body_chunks) == head + tail
+
+
+def test_a_connection_dropped_while_reading_the_error_body_rotates_like_a_network_error(pool_env):
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="Local", kind="api", priority=1, automatic=True, enabled=True,
+                base_url="http://127.0.0.1:5566", default_model="qwen-fallback"),
+        Profile(id="b", name="B", kind="api", priority=2, automatic=True, enabled=True,
+                base_url="https://gw.example"),
+    ]))
+
+    class Closable:
+        closed = False
+
+        def close(self):
+            Closable.closed = True
+
+    def broken():
+        raise ConnectionResetError("reset mid-body")
+        yield b""  # pragma: no cover
+
+    def transport(req):
+        if req.url.startswith("http://127.0.0.1"):
+            return UpstreamResponse(status=404, headers={}, body_chunks=broken(), connection=Closable())
+        return fake_response(200)
+
+    gw = Gateway(transport=transport)
+    result = gw.handle("POST", "/v1/messages", {}, _msg())
+    assert result.status == 200 and result.profile_id == "b"
+    assert Closable.closed
+    assert gw.handle("POST", "/v1/messages", {}, _msg(), forced_profile_id="a").error == "upstream_unreachable"
+
+
+def test_is_model_refusal_wording():
+    refusal = gateway_module._is_model_refusal
+    assert refusal(404, b"")
+    assert refusal(403, b'{"error":{"message":"not allowed"}}')
+    assert refusal(400, b'{"error":{"message":"model claude-x does not exist"}}')
+    assert not refusal(400, b'{"error":{"message":"model: field required"}}')
+    assert not refusal(404, b'{"error":{"message":"prompt is too long"}}')

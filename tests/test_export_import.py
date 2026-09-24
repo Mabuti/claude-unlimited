@@ -238,6 +238,23 @@ def test_export_then_apply_import_roundtrips_token_threshold(env):
     assert imported.token_threshold == 250000
 
 
+def test_export_then_apply_import_roundtrips_both_model_fields(env):
+    # force_model and default_model together, through export, import's ADD
+    # path, and its "use imported" UPDATE path.
+    profile_repo.create_profile(name="Local", kind="api", credential="tok-long-enough-key",
+                                base_url="http://127.0.0.1:5566",
+                                force_model="local-coder-model", default_model="local-fallback-model")
+    bundle = ei.build_export_bundle(include_profiles=True, include_settings=False, include_activity=False,
+                                     passphrase="correct horse battery staple")
+    parsed = ei.import_bundle(bundle, passphrase="correct horse battery staple")
+    assert parsed.profiles[0]["force_model"] == "local-coder-model"
+    assert parsed.profiles[0]["default_model"] == "local-fallback-model"
+
+    ei.apply_import(parsed, import_profiles=True, import_settings=False)
+    imported = [p for p in load_pool().profiles if p.name == "Local"][-1]
+    assert (imported.force_model, imported.default_model) == ("local-coder-model", "local-fallback-model")
+
+
 def test_apply_import_settings(env):
     parsed = ei.ParsedBundle(profiles=[], settings={"update_mode": "manual"}, activity=None)
     result = ei.apply_import(parsed, import_profiles=False, import_settings=True)
@@ -808,3 +825,58 @@ def test_import_ignores_launch_commands_in_a_bundle(env):
     assert result["settings_applied"] is True
     assert settings.update_mode == "manual"
     assert settings.launchers == {"claude": "claude"}
+
+
+def _round_trip_bundle():
+    return ei.build_export_bundle(include_profiles=True, include_settings=False,
+                                  include_activity=False, passphrase="hunter22")
+
+
+def test_forced_in_subagents_survives_an_export_import_round_trip(env):
+    profile_repo.create_profile(name="GPT", kind="oauth", credential="sk-ant-12345678",
+                                account_uuid="acct-1", forced_for_subagents=True)
+    bundle = _round_trip_bundle()
+    profile_repo.reset_all_profiles()
+    ei.apply_import(ei.import_bundle(bundle, passphrase="hunter22"), import_profiles=True, import_settings=False)
+    assert [p.forced_for_subagents for p in profile_repo.list_profiles()] == [True]
+
+
+def test_importing_a_second_forced_profile_keeps_the_holder_already_routing(env):
+    # Used to fail inside save_pool() with two holders, aborting the import.
+    profile_repo.create_profile(name="Old", kind="oauth", credential="sk-ant-12345678",
+                                account_uuid="acct-1", forced_for_subagents=True)
+    bundle = _round_trip_bundle()
+    profile_repo.reset_all_profiles()
+    profile_repo.create_profile(name="Current", kind="oauth", credential="sk-ant-87654321",
+                                account_uuid="acct-2", forced_for_subagents=True)
+
+    ei.apply_import(ei.import_bundle(bundle, passphrase="hunter22"), import_profiles=True, import_settings=False)
+    assert {p.name: p.forced_for_subagents for p in profile_repo.list_profiles()} == {"Current": True, "Old": False}
+
+
+
+def test_leave_on_fable_limit_survives_an_export_import_round_trip(env, monkeypatch):
+    profile_repo.create_profile(name="Leaver", kind="oauth", credential="sk-ant-12345678",
+                                account_uuid="acct-1", leave_on_fable_limit=True)
+    profile_repo.create_profile(name="Stayer", kind="oauth", credential="sk-ant-87654321",
+                                account_uuid="acct-2")
+    bundle = _round_trip_bundle()
+    profile_repo.reset_all_profiles()
+    ei.apply_import(ei.import_bundle(bundle, passphrase="hunter22"), import_profiles=True, import_settings=False)
+    assert {p.name: p.leave_on_fable_limit for p in profile_repo.list_profiles()} == {"Leaver": True, "Stayer": False}
+
+    # "Use imported version" applies the field to an existing profile too.
+    # The bundle carries no org_uuid (never set on these Profiles), so the
+    # match has to be proven by resolving both sides' own credential to the
+    # same organization (see resolve_legacy_oauth_match) — same pattern as
+    # test_apply_import_bundle_without_org_uuid_but_resolves_to_same_org_
+    # still_updates. Both Profiles here re-import under the SAME credential
+    # they were created with, so one mapping entry per credential is enough.
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", _fetch_by_token({
+        "sk-ant-12345678": _account(account_uuid="acct-1", org_uuid="org-1"),
+        "sk-ant-87654321": _account(account_uuid="acct-2", org_uuid="org-2"),
+    }))
+    profile_repo.update_profile(profile_repo.list_profiles()[0].id, leave_on_fable_limit=False)
+    ei.apply_import(ei.import_bundle(bundle, passphrase="hunter22"), import_profiles=True,
+                    import_settings=False, conflict_strategy="use_imported")
+    assert {p.name: p.leave_on_fable_limit for p in profile_repo.list_profiles()} == {"Leaver": True, "Stayer": False}
