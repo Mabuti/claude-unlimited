@@ -3,6 +3,11 @@ credential refresh, request translation, the HTTPS call to OpenAI's backend,
 and response translation back to Anthropic's shape. The single entry point
 gateway.py's codex branch calls into.
 
+run_passthrough() is the second, untranslated entry point: a request that
+arrives already OpenAI-shaped (the Codex CLI's own POST /v1/responses) is
+relayed to the same backend byte-for-byte, sharing the credential handling,
+URL resolution and socket read loop with run() but none of its translation.
+
 Talks to the same backend endpoints the `codex` CLI does —
 https://chatgpt.com/backend-api/codex/responses for a ChatGPT/Codex
 subscription, https://api.openai.com/v1/responses for a raw API key — with
@@ -377,6 +382,123 @@ def refresh_now(profile_id: str,
     return new_cred
 
 
+def _load_credential(profile: Profile, stored_credential: str
+                     ) -> tuple[openai_credential.StoredOpenAICredential, bool]:
+    """(decoded credential, is_subscription), refreshed first when it is a
+    ChatGPT subscription credential close to expiry. Shared by run() and
+    run_passthrough() so both decode, refresh and fail identically."""
+    try:
+        cred = openai_credential.decode(stored_credential)
+    except (json.JSONDecodeError, KeyError) as exc:
+        raise OpenAIBridgeError(f"Stored codex credential is malformed: {exc}") from exc
+
+    is_subscription = profile.auth_mode != "api_key"
+    if is_subscription:
+        cred = _refresh_if_needed(profile, cred)
+    return cred, is_subscription
+
+
+def _backend_parts(profile: Profile, is_subscription: bool, endpoint_path: str,
+                   suffix: str = ""):
+    """The split backend URL a request for this Profile goes to.
+
+    A subscription always talks to the ChatGPT Codex backend; an api_key
+    Profile talks to its Base URL (OpenAI's by default) plus the endpoint
+    path. `suffix` extends either one (e.g. "/compact")."""
+    if is_subscription:
+        url = CHATGPT_BACKEND_URL + suffix
+    else:
+        base = (profile.base_url or "https://api.openai.com/v1").rstrip("/")
+        url = f"{base}{endpoint_path}{suffix}"
+    parts = urlsplit(url)
+    if parts.scheme != "https":
+        # Codex profiles are https-only (plain http is an API-profile feature
+        # for local servers); profiles.py refuses this on save, and this
+        # catches a config edited by hand.
+        raise OpenAIBridgeError(f"Refusing to send a Codex request over {parts.scheme or 'no scheme'}: "
+                                "the Base URL must start with https://.")
+    return parts
+
+
+# A provider event after which nothing more belongs to the response.
+_TERMINAL_EVENT_TYPES = frozenset({
+    "response.completed",
+    "response.failed",
+    "response.incomplete",
+})
+
+
+def _stream_reads(resp, conn, *, parse_events: bool = True) -> Iterator[tuple[bytes, list]]:
+    """Owns the socket read of a successful response.
+
+    Yields (raw chunk exactly as read, provider events that chunk completed).
+    Events are parsed from a private copy of the bytes, CRLF-normalised and
+    split into SSE frames; no event after the provider's terminal one is
+    yielded. The raw chunk is never altered, so the translating path (run)
+    and the verbatim relay (run_passthrough) share this one read loop.
+
+    A chunked response closed without its zero-length terminator is accepted
+    only once the terminal event has arrived (and said so on stderr);
+    otherwise the http.client.IncompleteRead is raised to the caller, after
+    its surviving bytes were yielded. The connection is closed on every
+    exit."""
+    buffer = b""
+    terminal_event_seen = False
+    try:
+        while True:
+            incomplete = None
+            try:
+                chunk = resp.read(CHUNK_READ_SIZE)
+            except http.client.IncompleteRead as exc:
+                # ChatGPT's backend sometimes closes a chunked response
+                # after sending a complete SSE stream but before writing
+                # the zero-length HTTP terminator. http.client preserves
+                # those final bytes on the exception. Hand them on, and
+                # accept the close only when the provider's own terminal
+                # event proves the response was complete. A genuinely
+                # truncated SSE stream must still fail visibly.
+                incomplete = exc
+                chunk = exc.partial
+            if not chunk:
+                if incomplete is None:
+                    break
+            elif parse_events:
+                buffer += chunk
+            events: list = []
+            if parse_events:
+                # The SSE spec allows CRLF, and a proxy may rewrite line
+                # endings even when the origin does not use them. "\r\n\r\n"
+                # contains no "\n\n", so without this the frame boundary is
+                # never found and the entire stream sits in the buffer and is
+                # silently dropped. Safe on the payload: a raw CR cannot appear
+                # inside a JSON string, only as the escape \r.
+                if b"\r\n" in buffer:
+                    buffer = buffer.replace(b"\r\n", b"\n")
+                while b"\n\n" in buffer:
+                    frame, _, buffer = buffer.partition(b"\n\n")
+                    event = _parse_sse_frame(frame)
+                    if event is not None and not terminal_event_seen:
+                        if event.get("type") in _TERMINAL_EVENT_TYPES:
+                            terminal_event_seen = True
+                        events.append(event)
+            if chunk or events:
+                yield (chunk or b""), events
+            if incomplete is not None:
+                if terminal_event_seen:
+                    # Not silent: this is us deciding a protocol-level
+                    # anomaly was benign, and if the provider's behaviour
+                    # changes the daemon log is the only place that would
+                    # show it. Not an Activity entry — the turn SUCCEEDED,
+                    # and the only category that fits there is "error".
+                    print("[codex] accepted a truncated chunked close: the terminal "
+                          f"event arrived first ({len(incomplete.partial)} trailing bytes)",
+                          file=sys.stderr, flush=True)
+                    break
+                raise incomplete
+    finally:
+        conn.close()
+
+
 def run(profile: Profile, stored_credential: str, body: bytes,
         timeout: float = DEFAULT_TIMEOUT_SECONDS, parity: Optional[dict] = None,
         context: Optional[ConversationContext] = None,
@@ -391,14 +513,7 @@ def run(profile: Profile, stored_credential: str, body: bytes,
     only when there was no response to classify (DNS or connection failure);
     a non-2xx status is returned normally for the caller's own Observation
     classification, exactly as on the Anthropic path."""
-    try:
-        cred = openai_credential.decode(stored_credential)
-    except (json.JSONDecodeError, KeyError) as exc:
-        raise OpenAIBridgeError(f"Stored codex credential is malformed: {exc}") from exc
-
-    is_subscription = profile.auth_mode != "api_key"
-    if is_subscription:
-        cred = _refresh_if_needed(profile, cred)
+    cred, is_subscription = _load_credential(profile, stored_credential)
 
     try:
         anthropic_body = json.loads(body) if body else {}
@@ -412,18 +527,7 @@ def run(profile: Profile, stored_credential: str, body: bytes,
         parity=parity,
     )
     fmt = wire_formats.get(getattr(profile, "wire_format", None))
-    if is_subscription:
-        url = CHATGPT_BACKEND_URL
-    else:
-        base = (profile.base_url or "https://api.openai.com/v1").rstrip("/")
-        url = f"{base}{fmt.endpoint_path}"
-    parts = urlsplit(url)
-    if parts.scheme != "https":
-        # Codex profiles are https-only (plain http is an API-profile feature
-        # for local servers); profiles.py refuses this on save, and this
-        # catches a config edited by hand.
-        raise OpenAIBridgeError(f"Refusing to send a Codex request over {parts.scheme or 'no scheme'}: "
-                                "the Base URL must start with https://.")
+    parts = _backend_parts(profile, is_subscription, fmt.endpoint_path)
 
     # Start from whatever this backend last accepted in place of the mapped
     # model, then walk the ladder if that is rejected too. A Profile override
@@ -548,63 +652,19 @@ def run(profile: Profile, stored_credential: str, body: bytes,
 
     def _translated_chunks() -> Iterator[bytes]:
         translator = fmt.response_stream()
-        buffer = b""
         terminal_event_seen = False
+        reads = _stream_reads(resp, conn)
         try:
-            while True:
-                incomplete = None
-                try:
-                    chunk = resp.read(CHUNK_READ_SIZE)
-                except http.client.IncompleteRead as exc:
-                    # ChatGPT's backend sometimes closes a chunked response
-                    # after sending a complete SSE stream but before writing
-                    # the zero-length HTTP terminator. http.client preserves
-                    # those final bytes on the exception. Translate them, and
-                    # accept the close only when the provider's own terminal
-                    # event proves the response was complete. A genuinely
-                    # truncated SSE stream must still fail visibly.
-                    incomplete = exc
-                    chunk = exc.partial
-                if not chunk:
-                    if incomplete is None:
-                        break
-                else:
-                    buffer += chunk
-                # The SSE spec allows CRLF, and a proxy may rewrite line
-                # endings even when the origin does not use them. "\r\n\r\n"
-                # contains no "\n\n", so without this the frame boundary is
-                # never found and the entire stream sits in the buffer and is
-                # silently dropped. Safe on the payload: a raw CR cannot appear
-                # inside a JSON string, only as the escape \r.
-                if b"\r\n" in buffer:
-                    buffer = buffer.replace(b"\r\n", b"\n")
-                while b"\n\n" in buffer:
-                    frame, _, buffer = buffer.partition(b"\n\n")
-                    event = _parse_sse_frame(frame)
-                    # Nothing may follow the provider's terminal event: the
-                    # translator has already emitted message_stop, so a later
-                    # frame would append content AFTER the end of the message
-                    # and the client cannot read that.
-                    if event is not None and not terminal_event_seen:
-                        if event.get("type") in {
-                            "response.completed",
-                            "response.failed",
-                            "response.incomplete",
-                        }:
-                            terminal_event_seen = True
-                        yield from translator.feed(event)
-                if incomplete is not None:
-                    if terminal_event_seen:
-                        # Not silent: this is us deciding a protocol-level
-                        # anomaly was benign, and if the provider's behaviour
-                        # changes the daemon log is the only place that would
-                        # show it. Not an Activity entry — the turn SUCCEEDED,
-                        # and the only category that fits there is "error".
-                        print("[codex] accepted a truncated chunked close: the terminal "
-                              f"event arrived first ({len(incomplete.partial)} trailing bytes)",
-                              file=sys.stderr, flush=True)
-                        break
-                    raise incomplete
+            for _chunk, events in reads:
+                for event in events:
+                    # _stream_reads yields no event after the provider's
+                    # terminal one: the translator has already emitted
+                    # message_stop by then, so a later frame would append
+                    # content AFTER the end of the message and the client
+                    # cannot read that.
+                    if event.get("type") in _TERMINAL_EVENT_TYPES:
+                        terminal_event_seen = True
+                    yield from translator.feed(event)
         except Exception as exc:  # noqa: BLE001 - see abort() on why this cannot propagate
             # The status line and headers left long ago, so there is no way to
             # turn this into an HTTP error: the only thing the client can still
@@ -612,6 +672,7 @@ def run(profile: Profile, stored_credential: str, body: bytes,
             # `message_stop` that will never come.
             yield from translator.abort(f"upstream stream failed: {type(exc).__name__}: {exc}"[:500])
         finally:
+            reads.close()
             conn.close()
             # Only a finished response is replayed from: a partial turn's
             # reasoning would precede output Claude Code never kept.
@@ -620,6 +681,192 @@ def run(profile: Profile, stored_credential: str, body: bytes,
                                                translator.reasoning_items)
 
     return OpenAIBridgeResult(status=200, headers=response_headers, body_chunks=_translated_chunks())
+
+
+# ---- OpenAI-shaped ingress: the Codex CLI's own request, relayed verbatim ----
+
+# What may follow /v1/responses on an inbound path: "" or "/segment[/...]".
+# Anything else (a "..", a query, a fragment, an encoded character) is
+# refused locally rather than forwarded to a backend URL built from it.
+_RESPONSES_SUFFIX_PATTERN = re.compile(r"(?:/[A-Za-z0-9_-]+)*")
+
+# Client request headers never forwarded upstream: hop-by-hop framing, the
+# client's own credential (the placeholder token for this daemon), cookies,
+# anything the daemon itself sets, and accept-encoding — the response must
+# arrive identity-encoded or usage capture cannot read it.
+_PASSTHROUGH_DROPPED_REQUEST_HEADERS = frozenset({
+    "authorization",
+    "x-api-key",
+    "cookie",
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+    "accept-encoding",
+    "chatgpt-account-id",
+})
+
+# "The encrypted reasoning you replayed cannot be used here": what the
+# backend answers when a Codex session carries reasoning items another
+# account (or an expired key) produced — which is exactly what happens after
+# the pool rotates a live Codex session onto a different account.
+_ENCRYPTED_REASONING_REFUSAL = re.compile(
+    r"encrypt[a-z_ ]*[^.]{0,120}?(could not|couldn't|cannot|can't|unable|failed|invalid|not be)"
+    r"[^.]{0,60}?(decrypt|verif|pars|valid)"
+    r"|(invalid|malformed|corrupt)[^.]{0,20}?encrypted"
+    r"|invalid_encrypted_content|decrypt(ion)?[^.]{0,40}?fail",
+    re.IGNORECASE,
+)
+
+
+def valid_responses_suffix(suffix: str) -> bool:
+    """Whether `suffix` (the part of an inbound path after /v1/responses) is
+    safe to append to a backend URL."""
+    return bool(_RESPONSES_SUFFIX_PATTERN.fullmatch(suffix or ""))
+
+
+def _passthrough_headers(client_headers: dict, cred: openai_credential.StoredOpenAICredential,
+                         is_subscription: bool, content_length: int) -> dict:
+    headers = {}
+    for key, value in (client_headers or {}).items():
+        lowered = str(key).lower()
+        if lowered in _PASSTHROUGH_DROPPED_REQUEST_HEADERS or lowered.startswith("proxy-"):
+            continue
+        headers[key] = value
+    headers["Authorization"] = f"Bearer {cred.access_token}"
+    if is_subscription and cred.account_id:
+        headers["ChatGPT-Account-ID"] = cred.account_id
+    headers["Content-Length"] = str(content_length)
+    return headers
+
+
+def _without_encrypted_reasoning(body: bytes) -> Optional[bytes]:
+    """The request body minus every reasoning input item that carries
+    `encrypted_content`, or None when there is none to remove.
+
+    The whole item goes, not just the field: with `store: false` (what the
+    Codex CLI sends) a reasoning item left with only its `rs_…` id refers to
+    something the backend never stored, which is a second 400. Dropping it
+    costs the model its earlier private reasoning, never the conversation."""
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("input"), list):
+        return None
+    kept = [item for item in parsed["input"]
+            if not (isinstance(item, dict) and item.get("type") == "reasoning"
+                    and "encrypted_content" in item)]
+    if len(kept) == len(parsed["input"]):
+        return None
+    parsed["input"] = kept
+    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def run_passthrough(profile: Profile, stored_credential: str, method: str, path_suffix: str,
+                    body: bytes, client_headers: dict,
+                    timeout: float = DEFAULT_TIMEOUT_SECONDS) -> OpenAIBridgeResult:
+    """Relays one Codex CLI request (already OpenAI Responses-shaped) to this
+    codex-kind Profile's backend, with nothing translated either way.
+
+    The body goes out byte-identical and the client's own headers go with
+    it, minus its credential and hop-by-hop framing; the Profile's credential
+    replaces the credential. The response comes back with its raw status and
+    headers, and body_chunks yields the upstream bytes exactly as they
+    arrive. An error status is read whole and returned as-is.
+
+    One bounded exception to "byte-identical": a 400 refusing replayed
+    encrypted reasoning is retried ONCE without those reasoning items (see
+    _without_encrypted_reasoning). Raises OpenAIBridgeError when there was
+    no response at all, and ValueError for a suffix that must not be
+    forwarded (the gateway checks it first)."""
+    if not valid_responses_suffix(path_suffix):
+        raise ValueError(f"refusing to forward /v1/responses{path_suffix!r}")
+    cred, is_subscription = _load_credential(profile, stored_credential)
+    parts = _backend_parts(profile, is_subscription, "/responses", path_suffix)
+
+    payload = body
+    retried_without_reasoning = False
+    while True:
+        headers = _passthrough_headers(client_headers, cred, is_subscription, len(payload))
+        conn = None
+        try:
+            conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout)
+            conn.request(method, parts.path or "/", body=payload, headers=headers)
+            resp = conn.getresponse()
+        except (OSError, http.client.HTTPException) as exc:
+            if conn is not None:
+                conn.close()
+            raise OpenAIBridgeError(f"Could not reach {parts.hostname}: {exc}") from exc
+
+        response_headers = dict(resp.getheaders())
+        if resp.status < 400:
+            break
+
+        try:
+            raw = resp.read()
+        except (OSError, http.client.HTTPException) as exc:
+            raise OpenAIBridgeError(f"Connection to {parts.hostname} failed mid-response: {exc}") from exc
+        finally:
+            conn.close()
+        if (resp.status == 400 and not retried_without_reasoning
+                and _ENCRYPTED_REASONING_REFUSAL.search(raw.decode("utf-8", errors="replace"))):
+            stripped = _without_encrypted_reasoning(payload)
+            if stripped is not None:
+                retried_without_reasoning = True
+                print(f"[codex] {profile.name}: the backend refused replayed encrypted reasoning; "
+                      "retrying once without it", file=sys.stderr, flush=True)
+                payload = stripped
+                continue
+        return OpenAIBridgeResult(status=resp.status, headers=response_headers, body_chunks=iter([raw]))
+
+    content_type = {k.lower(): v for k, v in response_headers.items()}.get("content-type", "")
+    reads = _stream_reads(resp, conn, parse_events="text/event-stream" in content_type)
+
+    def _relayed_chunks() -> Iterator[bytes]:
+        try:
+            for chunk, _events in reads:
+                if chunk:
+                    yield chunk
+        except Exception as exc:  # noqa: BLE001 - the status line left long ago
+            # Nothing is injected: an Anthropic event has no meaning in an
+            # OpenAI stream. The stream simply ends before its terminal event,
+            # which the Codex CLI already treats as a dropped stream to retry.
+            print(f"[codex] {profile.name}: upstream stream ended early: "
+                  f"{type(exc).__name__}: {exc}"[:500], file=sys.stderr, flush=True)
+        finally:
+            reads.close()
+            conn.close()
+
+    return OpenAIBridgeResult(status=resp.status, headers=response_headers,
+                              body_chunks=_ClosingChunks(_relayed_chunks(), conn))
+
+
+class _ClosingChunks:
+    """An iterator over a relayed body whose close() releases the upstream
+    connection even when nothing was ever read: closing a generator that
+    never started does not run its `finally`, and a caller that discards a
+    result unread (a client that left first) must not leak the socket."""
+
+    def __init__(self, chunks: Iterator[bytes], conn) -> None:
+        self._chunks = chunks
+        self._conn = conn
+
+    def __iter__(self) -> "_ClosingChunks":
+        return self
+
+    def __next__(self) -> bytes:
+        return next(self._chunks)
+
+    def close(self) -> None:
+        try:
+            self._chunks.close()
+        finally:
+            self._conn.close()
 
 
 def _parse_sse_frame(frame: bytes) -> Optional[dict]:

@@ -28,7 +28,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterator, Optional
 
-from . import activity, eco, gpt_windows, speech, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_credential, openai_models, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_probe, usage_tracking
+from . import activity, eco, gpt_windows, speech, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_credential, openai_models, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_probe, usage_tracking, wire_formats
 from . import profiles as profile_repo
 from .config import Pool, Profile, load_pool
 from .observation import AuthInvalid, ModelWindow, ProviderUnavailable, QuotaExhausted, ShortRateLimit, Unknown, UsageSnapshot, classify
@@ -144,6 +144,69 @@ def _filter_openai_headers(headers: dict[str, str]) -> dict[str, str]:
     Anthropic side."""
     lower = {k.lower(): v for k, v in headers.items()}
     return {k: lower[k] for k in openai_observation.ALLOWED_HEADERS if k in lower}
+
+
+# ---- OpenAI-shaped ingress (the Codex CLI) ---------------------------------
+# A request is OpenAI-shaped by PATH alone, never by sniffing the body: the
+# Codex CLI only ever sends POST {base_url}/responses (plus suffixes such as
+# /responses/compact). It is served by codex-kind Profiles only and relayed
+# untranslated — see Gateway._handle_openai_ingress.
+
+# Same cap build_upstream_request applies to an Anthropic-shaped body.
+_OPENAI_INGRESS_MAX_BODY_BYTES = 20_000_000
+# How many x-codex-turn-state values to remember the issuing Profile of.
+_TURN_STATE_MEMORY = 2048
+
+# GatewayResult.error markers for this ingress. Distinct from the Anthropic
+# ones so daemon.py can never dress one of these in the other shape.
+OPENAI_ERROR_BAD_REQUEST = "openai_bad_request"
+OPENAI_ERROR_NO_CODEX_PROFILE = "openai_no_codex_profile"
+OPENAI_ERROR_CODEX_EXHAUSTED = "openai_codex_exhausted"
+OPENAI_ERROR_PINNED_UNUSABLE = "openai_pinned_profile_unusable"
+OPENAI_ERROR_UPSTREAM_UNREACHABLE = "openai_upstream_unreachable"
+
+_MESSAGE_NO_CODEX_PROFILE = (
+    "No enabled Codex/ChatGPT account is available in Claude Unlimited. "
+    "Enable one in the dashboard or add one with `cu add-codex-account`.")
+
+# Upstream response headers never relayed to the Codex CLI: hop-by-hop
+# framing the daemon sets itself, cookies, and the provider's edge
+# infrastructure. x-codex-* stays — the CLI displays those rate limits.
+_OPENAI_DROPPED_RESPONSE_HEADERS = frozenset({
+    "connection", "keep-alive", "proxy-connection", "transfer-encoding", "te",
+    "trailer", "upgrade", "content-length", "set-cookie", "server", "alt-svc",
+})
+
+
+def is_openai_ingress(method: str, path: str) -> bool:
+    """Whether this request is the Codex CLI's OpenAI Responses call."""
+    if method != "POST":
+        return False
+    route = path.split("?", 1)[0]
+    base = wire_formats.OPENAI_RESPONSES_INGRESS_PATH
+    return route == base or route.startswith(base + "/")
+
+
+def _openai_client_headers(headers: dict) -> dict:
+    return {k: v for k, v in (headers or {}).items()
+            if k.lower() not in _OPENAI_DROPPED_RESPONSE_HEADERS and not k.lower().startswith("cf-")}
+
+
+def _header_value(headers: dict, name: str) -> Optional[str]:
+    for key, value in (headers or {}).items():
+        if key.lower() == name:
+            return value
+    return None
+
+
+def _close_quietly(chunks) -> None:
+    """Release a response body nobody will read (its connection with it)."""
+    close = getattr(chunks, "close", None)
+    if close is not None:
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - cleanup must not raise
+            pass
 
 # A Profile is warned about an approaching threshold once per crossing, not
 # once per request — this in-memory set is cleared for a Profile the moment
@@ -913,6 +976,18 @@ class Gateway:
         # a network call would stall every request anyway.
         self._refresh_lock = threading.Lock()
         self._refresh_in_progress: set = set()
+        # The Codex CLI's own sticky pointer (OpenAI-shaped ingress). Kept
+        # apart from _current_profile_id on purpose: if Codex traffic moved
+        # the shared pointer, the next Claude Code request would stick to a
+        # GPT account. In memory only — a restart simply re-chooses.
+        self._openai_ingress_profile_id: Optional[str] = None
+        # x-codex-turn-state value -> the Profile whose response issued it,
+        # oldest first, capped at _TURN_STATE_MEMORY. A turn-state is only
+        # meaningful to the account that issued it.
+        self._turn_state_issuers: dict[str, str] = {}
+        # The last refusal this ingress logged to Activity, so a client that
+        # keeps retrying writes one line per outage rather than one per try.
+        self._openai_ingress_refusal_noted: Optional[str] = None
         persisted = runtime_state.load()
         self._persisted_profiles: dict = persisted["profiles"]
         self._current_profile_id = persisted["current_profile_id"]
@@ -1150,6 +1225,10 @@ class Gateway:
         instead of silently trying a different Profile — silently
         substituting a different account is exactly what pinning is for
         avoiding."""
+        if is_openai_ingress(method, path):
+            # The Codex CLI. Its own rotation loop over codex-kind Profiles
+            # only; nothing below this line runs for it.
+            return self._handle_openai_ingress(method, path, headers, body, forced_profile_id)
         now = datetime.now(timezone.utc)
         attempted: set[str] = set()
         previous_profile_id = self._current_profile_id
@@ -1937,6 +2016,300 @@ class Gateway:
 
         return GatewayResult(status=result.status, headers=client_headers, body_chunks=body_chunks,
                               profile_id=profile.id)
+
+    # ---- OpenAI-shaped ingress (the Codex CLI) ------------------------------
+
+    def _handle_openai_ingress(self, method: str, path: str, headers: dict, body: bytes,
+                               forced_profile_id: Optional[str]) -> GatewayResult:
+        """POST /v1/responses[/<suffix>]: the Codex CLI's own request, served
+        by codex-kind Profiles only and relayed with nothing translated.
+
+        Its own rotation loop, deliberately narrower than handle()'s: no ECO,
+        speech level, capacity guard, branch pins or project attribution
+        (all of those read or rewrite an Anthropic-shaped body; this body goes
+        out byte-identical). Observation, cooldown, quota and credential
+        handling are the codex path's, unchanged. It never moves the shared
+        rotation pointer — see self._openai_ingress_profile_id."""
+        now = datetime.now(timezone.utc)
+        route = path.split("?", 1)[0]
+        suffix = route[len(wire_formats.OPENAI_RESPONSES_INGRESS_PATH):].rstrip("/")
+        if not openai_bridge.valid_responses_suffix(suffix):
+            return GatewayResult(status=400, headers={}, body_chunks=None, profile_id=None,
+                                  error=OPENAI_ERROR_BAD_REQUEST,
+                                  error_detail=f"Claude Unlimited does not relay {route[:200]}.")
+        if len(body) > _OPENAI_INGRESS_MAX_BODY_BYTES:
+            return GatewayResult(status=400, headers={}, body_chunks=None, profile_id=None,
+                                  error=OPENAI_ERROR_BAD_REQUEST,
+                                  error_detail="The request body is too large for Claude Unlimited to forward.")
+
+        attempted: set[str] = set()
+        # Why the previous attempt got nowhere, when it never reached a
+        # response to classify: "network" or "credential".
+        last_failure: Optional[str] = None
+        for _ in range(MAX_ROTATION_ATTEMPTS):
+            with self._lock:
+                pool = load_pool()
+                snapshot = self._sync_snapshot(pool)
+                pre_recovery_states = {rt.profile_id: rt.state for rt in snapshot.profiles}
+                snapshot = recover_expired_cooldowns(snapshot, now)
+                self._runtime = {rt.profile_id: rt for rt in snapshot.profiles}
+                codex_ids = {p.id for p in pool.profiles if p.kind == "codex"}
+                not_codex = {rt.profile_id for rt in snapshot.profiles if rt.profile_id not in codex_ids}
+                if self._openai_ingress_profile_id not in codex_ids:
+                    self._openai_ingress_profile_id = None
+                if forced_profile_id is not None:
+                    pinned = pool.get(forced_profile_id)
+                    if pinned is not None and pinned.kind != "codex":
+                        # Refused below (400) before any attempt; a Claude
+                        # account can never serve an OpenAI-shaped request.
+                        chosen_id, reason = None, "pinned to a non-codex Profile"
+                    else:
+                        decision = self._forced_decision(pool, forced_profile_id, now)
+                        chosen_id, reason = decision.profile_id, decision.reason
+                else:
+                    # router.choose() on a view whose sticky pointer is THIS
+                    # ingress's own, with every non-codex Profile excluded.
+                    view = replace(snapshot, current_profile_id=self._openai_ingress_profile_id)
+                    decision = choose(view, now, exclude=not_codex | attempted)
+                    chosen_id, reason = decision.profile_id, decision.reason
+
+            # recover_expired_cooldowns() just folded any reset into the live
+            # runtime, so the Anthropic path will never see this transition:
+            # announce it here, exactly as handle() does.
+            for rt in snapshot.profiles:
+                if pre_recovery_states.get(rt.profile_id) in _QUOTA_RESET_SOURCE_STATES and rt.state == ProfileState.ELIGIBLE:
+                    self._warned_approaching.discard(rt.profile_id)
+                    name = self._profile_name(pool, rt.profile_id)
+                    activity.record("rotation", f"{name} quota reset — eligible again")
+                    notifications.notify_if_enabled("quota_reset", "Claude Unlimited",
+                                                      f"{name} is available again.", pool.settings)
+
+            if chosen_id is None or chosen_id in attempted:
+                return self._openai_ingress_refusal(pool, snapshot, now, forced_profile_id,
+                                                    reason, last_failure, headers)
+
+            profile = pool.get(chosen_id)
+            attempted.add(profile.id)
+            try:
+                credential = secret_store.get_token(profile.id)
+            except Exception:
+                # Transient (a locked keychain), not quota — same as handle().
+                with self._lock:
+                    self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
+                last_failure = "credential"
+                continue
+
+            # A turn-state is only meaningful to the account that issued it:
+            # replaying one issued by a different account is dropped.
+            forward_headers = headers
+            turn_state = _header_value(headers, "x-codex-turn-state")
+            if turn_state is not None:
+                with self._lock:
+                    issuer = self._turn_state_issuers.get(turn_state)
+                if issuer is not None and issuer != profile.id:
+                    forward_headers = {k: v for k, v in headers.items() if k.lower() != "x-codex-turn-state"}
+
+            with self._lock:
+                self._in_flight.add(profile.id)
+                self._in_flight_since.setdefault(profile.id, time.monotonic())
+
+            try:
+                result = openai_bridge.run_passthrough(profile, credential, method, suffix, body,
+                                                       forward_headers)
+            except openai_bridge.OpenAIBridgeError as exc:
+                with self._lock:  # same atomicity reasoning as the Anthropic path
+                    self._mark_profile_idle(profile.id)
+                    self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
+                last_failure = "network"
+                if forced_profile_id is not None:
+                    activity.record("error", f"{profile.name} — could not reach OpenAI",
+                                     meta=f"Codex CLI, pinned profile, not rotating ({exc})")
+                    return GatewayResult(status=502, headers={}, body_chunks=None, profile_id=None,
+                                          error=OPENAI_ERROR_UPSTREAM_UNREACHABLE,
+                                          error_detail=f"Claude Unlimited could not reach OpenAI for "
+                                                       f"{profile.name}, the account this session is pinned to.")
+                activity.record("error", f"{profile.name} — could not reach OpenAI",
+                                 meta=f"Codex CLI, network error, rotating to next codex profile ({exc})")
+                continue
+            except BaseException:
+                with self._lock:
+                    self._mark_profile_idle(profile.id)
+                raise
+            last_failure = None
+
+            try:
+                codex_headers = _filter_openai_headers(result.headers)
+                observation = openai_observation.classify(result.status, codex_headers, now)
+                credits = openai_observation.parse_credits(codex_headers)
+                if credits is not None:
+                    with self._lock:
+                        self._record_credits(profile.id, credits)
+
+                old_rt = self._runtime.get(profile.id)
+                old_state = old_rt.state if old_rt is not None else None
+                with self._lock:
+                    self._observe(profile.id, observation, now)
+                self._maybe_request_usage_recheck(profile.id, observation)
+                new_rt = self._runtime.get(profile.id)
+                self._persist()
+
+                if isinstance(observation, AuthInvalid) and old_state != ProfileState.AUTH_INVALID:
+                    activity.record("error", f"{profile.name} needs re-authentication", meta="credential rejected")
+                    notifications.notify_if_enabled("needs_attention", "Claude Unlimited",
+                                                      f"{profile.name} needs re-authentication.", pool.settings)
+
+                if isinstance(observation, UsageSnapshot) and new_rt is not None and new_rt.state == ProfileState.ELIGIBLE:
+                    near_threshold = observation.percent >= new_rt.switch_threshold - APPROACHING_THRESHOLD_BAND
+                    if near_threshold and profile.id not in self._warned_approaching:
+                        self._warned_approaching.add(profile.id)
+                        notifications.notify_if_enabled(
+                            "approaching_threshold", "Claude Unlimited",
+                            f"{profile.name} is approaching its switch threshold "
+                            f"({observation.percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
+                    elif not near_threshold:
+                        self._warned_approaching.discard(profile.id)
+
+                # Only status and headers have arrived: no body byte has
+                # reached the client, so moving this request is still safe.
+                rotate = False
+                if isinstance(observation, QuotaExhausted):
+                    if forced_profile_id is not None:
+                        activity.record("rotation", f"{profile.name} hit its quota",
+                                         meta="Codex CLI, pinned profile — returning the real response, not rotating")
+                    else:
+                        activity.record("rotation", f"{profile.name} hit its quota",
+                                         meta="Codex CLI, rotating to next codex profile")
+                        rotate = True
+                elif isinstance(observation, AuthInvalid) and forced_profile_id is None:
+                    with self._lock:
+                        alternative = choose(
+                            PoolSnapshot(profiles=list(self._runtime.values()),
+                                         current_profile_id=self._openai_ingress_profile_id),
+                            now, exclude=not_codex | attempted)
+                    # With nothing else to serve it, relay the real 401.
+                    if alternative.profile_id is not None:
+                        activity.record("rotation", f"{profile.name} rejected its credential",
+                                         meta="Codex CLI, rotating to next codex profile")
+                        rotate = True
+                if rotate:
+                    with self._lock:
+                        self._mark_profile_idle(profile.id)
+                    _close_quietly(result.body_chunks)
+                    continue
+
+                if forced_profile_id is None and result.status < 400:
+                    self._set_openai_ingress_profile(profile)
+                issued = _header_value(result.headers, "x-codex-turn-state")
+                if issued:
+                    self._remember_turn_state_issuer(issued, profile.id)
+                self._openai_ingress_refusal_noted = None
+
+                body_chunks = self._wrap_with_usage_capture(result.body_chunks, result.headers, profile.id, None,
+                                                             sent_bytes=len(body),
+                                                             quota_5h_percent=_codex_5h_percent(result.headers))
+                body_chunks = self._wrap_with_in_flight_clear(body_chunks, profile.id)
+            except BaseException:
+                # A bug must surface, but not while leaking the in-flight
+                # slot or the upstream connection.
+                with self._lock:
+                    self._mark_profile_idle(profile.id)
+                _close_quietly(result.body_chunks)
+                raise
+            return GatewayResult(status=result.status, headers=_openai_client_headers(result.headers),
+                                  body_chunks=body_chunks, profile_id=profile.id)
+
+        with self._lock:
+            pool = load_pool()
+            snapshot = self._sync_snapshot(pool)
+        return self._openai_ingress_refusal(pool, snapshot, now, forced_profile_id,
+                                            "rotation_attempts_exhausted", last_failure, headers)
+
+    def _openai_ingress_refusal(self, pool: Pool, snapshot: PoolSnapshot, now: datetime,
+                                forced_profile_id: Optional[str], reason: str,
+                                last_failure: Optional[str], headers: dict) -> GatewayResult:
+        """No codex Profile can take this Codex CLI request. The status is
+        chosen for how the Codex CLI reacts to it (measured against 0.144):
+        400 is shown once, verbatim — right for "nothing here can ever serve
+        you"; 429 is shown once — right for "come back later"; 5xx is
+        retried, which is right only for a network failure. A 503 for an
+        empty pool would cost the user ~30 retries over ~25 s."""
+        status, code, message, error_headers = 400, OPENAI_ERROR_NO_CODEX_PROFILE, _MESSAGE_NO_CODEX_PROFILE, {}
+        if forced_profile_id is not None:
+            pinned = pool.get(forced_profile_id)
+            name = pinned.name if pinned is not None else forced_profile_id
+            rt = self._runtime.get(forced_profile_id)
+            code = OPENAI_ERROR_PINNED_UNUSABLE
+            if last_failure == "network":
+                status, code = 502, OPENAI_ERROR_UPSTREAM_UNREACHABLE
+                message = f"Claude Unlimited could not reach OpenAI for {name}, the account this session is pinned to."
+            elif last_failure == "credential":
+                status, code = 502, OPENAI_ERROR_UPSTREAM_UNREACHABLE
+                message = f"Claude Unlimited could not read the stored credential for {name}, the account this session is pinned to."
+            elif pinned is None:
+                message = "The Claude Unlimited account this session is pinned to no longer exists."
+            elif pinned.kind != "codex":
+                message = (f"This session is pinned to {name}, a Claude account. The Codex CLI can only be "
+                           "served by a Codex/ChatGPT account.")
+            elif rt is not None and _out_of_capacity(rt):
+                status = 429
+                deadline = rt.resets_at or rt.cooldown_until
+                retry_after = _pool_retry_after_seconds(PoolSnapshot(profiles=[rt]), now)
+                if retry_after is not None:
+                    error_headers["retry-after"] = str(retry_after)
+                message = f"{name}, the account this session is pinned to, is out of capacity."
+                if deadline is not None:
+                    message += f" It resets at {deadline.astimezone():%H:%M}."
+            else:
+                why = {"forced_profile_disabled": "it is disabled",
+                       "forced_profile_needs_reauth": "it needs re-authentication"}.get(reason, "it cannot serve right now")
+                message = f"{name}, the account this session is pinned to, cannot serve the Codex CLI: {why}."
+        elif last_failure == "network":
+            status, code = 502, OPENAI_ERROR_UPSTREAM_UNREACHABLE
+            message = "Claude Unlimited could not reach OpenAI for any Codex/ChatGPT account."
+        else:
+            enabled = {p.id for p in pool.profiles if p.kind == "codex" and p.enabled}
+            runtimes = [rt for rt in snapshot.profiles if rt.profile_id in enabled]
+            waiting = [rt for rt in runtimes
+                       if rt.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING, ProfileState.COOLDOWN)]
+            if enabled and waiting:
+                status, code = 429, OPENAI_ERROR_CODEX_EXHAUSTED
+                retry_after = _pool_retry_after_seconds(PoolSnapshot(profiles=runtimes), now)
+                if retry_after is not None:
+                    error_headers["retry-after"] = str(retry_after)
+                deadlines = [d for rt in waiting for d in (rt.resets_at, rt.cooldown_until) if d is not None]
+                if all(_out_of_capacity(rt) for rt in waiting):
+                    message = "Every Codex/ChatGPT account in Claude Unlimited is out of capacity."
+                else:
+                    message = "Every Codex/ChatGPT account in Claude Unlimited is busy or cooling down."
+                if deadlines:
+                    message += f" The first one is available again at {min(deadlines).astimezone():%H:%M}."
+            elif enabled:
+                message = ("No Codex/ChatGPT account in Claude Unlimited can serve right now: every enabled one "
+                           "needs re-authentication or is set to manual. Fix it in the dashboard.")
+
+        if self._openai_ingress_refusal_noted != code:
+            self._openai_ingress_refusal_noted = code
+            activity.record("error", "Codex CLI request rejected",
+                             meta=f"{message} client={_client_label(headers)}")
+        return GatewayResult(status=status, headers=error_headers, body_chunks=None, profile_id=None,
+                              error=code, error_detail=message)
+
+    def _set_openai_ingress_profile(self, profile: Profile) -> None:
+        """Moves the Codex CLI's own sticky pointer — never the shared one,
+        and never with a "Rotated" notification (that speaks for Claude
+        Code's traffic). One Activity line when it actually changes."""
+        with self._lock:
+            changed = self._openai_ingress_profile_id != profile.id
+            self._openai_ingress_profile_id = profile.id
+        if changed:
+            activity.record("rotation", f"Codex CLI now served by {profile.name}")
+
+    def _remember_turn_state_issuer(self, turn_state: str, profile_id: str) -> None:
+        with self._lock:
+            self._turn_state_issuers.pop(turn_state, None)
+            self._turn_state_issuers[turn_state] = profile_id
+            while len(self._turn_state_issuers) > _TURN_STATE_MEMORY:
+                del self._turn_state_issuers[next(iter(self._turn_state_issuers))]
 
     @staticmethod
     def _models_listing_response(profile: Profile, path: str, listing: list) -> "GatewayResult":

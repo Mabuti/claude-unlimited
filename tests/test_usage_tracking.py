@@ -117,3 +117,60 @@ def test_content_type_missing_defaults_to_non_streaming_path_without_raising():
     capture = usage_tracking.UsageCapture()
     forwarded = b"".join(capture.wrap(iter([b"whatever"]), None))
     assert forwarded == b"whatever"
+
+
+# ---- OpenAI Responses (the Codex CLI, relayed untranslated) ----
+
+OPENAI_USAGE = {"input_tokens": 1000, "input_tokens_details": {"cached_tokens": 600},
+                "output_tokens": 42, "output_tokens_details": {"reasoning_tokens": 30}, "total_tokens": 1042}
+MAPPED_USAGE = {"input_tokens": 400, "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 600, "output_tokens": 42}
+
+
+def _responses_sse(terminal: str) -> bytes:
+    return (b'event: response.created\ndata: {"type":"response.created","response":{"model":"gpt-5.6-sol"}}\n\n'
+            b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"pong"}\n\n'
+            + f"event: {terminal}\ndata: ".encode()
+            + json.dumps({"type": terminal, "response": {"model": "gpt-5.6-sol", "usage": OPENAI_USAGE}}).encode()
+            + b"\n\n")
+
+
+@pytest.mark.parametrize("terminal", ["response.completed", "response.incomplete"])
+def test_responses_stream_usage_is_mapped_to_the_internal_shape(terminal):
+    stream = _responses_sse(terminal)
+    capture = usage_tracking.UsageCapture()
+    forwarded = b"".join(capture.wrap(iter([stream[:37], stream[37:]]), "text/event-stream"))
+
+    assert forwarded == stream
+    assert capture.model == "gpt-5.6-sol"
+    assert capture.usage == MAPPED_USAGE
+
+
+def test_responses_cached_tokens_never_drive_input_below_zero():
+    usage = {"input_tokens": 5, "input_tokens_details": {"cached_tokens": 9}, "output_tokens": 1}
+    stream = (b'event: response.completed\ndata: '
+              + json.dumps({"type": "response.completed", "response": {"model": "m", "usage": usage}}).encode()
+              + b"\n\n")
+    capture = usage_tracking.UsageCapture()
+    b"".join(capture.wrap(iter([stream]), "text/event-stream"))
+
+    assert capture.usage["input_tokens"] == 0
+    assert capture.usage["cache_read_input_tokens"] == 9
+
+
+def test_non_streaming_responses_body_usage_is_mapped():
+    body = json.dumps({"object": "response", "model": "gpt-5.6-sol", "output": [], "usage": OPENAI_USAGE}).encode()
+    capture = usage_tracking.UsageCapture()
+    b"".join(capture.wrap(iter([body]), "application/json"))
+
+    assert capture.model == "gpt-5.6-sol"
+    assert capture.usage == MAPPED_USAGE
+
+
+def test_non_streaming_anthropic_body_is_still_taken_verbatim():
+    usage = {"input_tokens": 3, "cache_creation_input_tokens": 1, "cache_read_input_tokens": 2, "output_tokens": 4}
+    body = json.dumps({"model": "claude-haiku-4-5", "usage": usage}).encode()
+    capture = usage_tracking.UsageCapture()
+    b"".join(capture.wrap(iter([body]), "application/json"))
+
+    assert capture.usage == usage

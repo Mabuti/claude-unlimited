@@ -862,3 +862,116 @@ def test_effort_replacement_picks_the_nearest(effort, supported, expected):
 def test_other_errors_are_not_effort_refusals():
     assert bridge_module._effort_replacement(400, "model gpt-x not found", "high") is None
     assert bridge_module._effort_replacement(429, _ASTRA_MINIMAL + " reasoning.effort", "minimal") is None
+
+
+# ---- run_passthrough: the Codex CLI's own request, relayed untranslated ----
+
+_PASSTHROUGH_BODY = b'{"model":"gpt-5.6-sol","input":[],"stream":true}'
+_PASSTHROUGH_SSE = (b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n"
+                    b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n")
+
+
+def test_passthrough_relays_the_stream_bytes_unmodified(monkeypatch):
+    raw = _PASSTHROUGH_SSE.replace(b"\n", b"\r\n") + b": trailing comment\r\n\r\n"
+    _install_fake_connection(monkeypatch, FakeHTTPResponse(200, {"content-type": "text/event-stream"}, raw))
+
+    result = bridge_module.run_passthrough(_subscription_profile(), _cred(), "POST", "", _PASSTHROUGH_BODY,
+                                           {"originator": "codex_exec", "Authorization": "Bearer placeholder"})
+
+    assert result.status == 200
+    assert b"".join(result.body_chunks) == raw
+    conn = FakeHTTPSConnection.last_instance
+    assert conn.closed
+    sent = conn.requests[0]
+    assert sent["path"] == "/backend-api/codex/responses"
+    assert sent["body"] == _PASSTHROUGH_BODY
+    assert sent["headers"]["Authorization"] == "Bearer tok-a"
+    assert sent["headers"]["ChatGPT-Account-ID"] == "acct-1"
+    assert sent["headers"]["originator"] == "codex_exec"
+
+
+def test_passthrough_accepts_a_truncated_close_after_the_terminal_event(monkeypatch, capsys):
+    _install_fake_connection(monkeypatch, IncompleteChunkedHTTPResponse(
+        200, {"content-type": "text/event-stream"}, _PASSTHROUGH_SSE))
+
+    result = bridge_module.run_passthrough(_subscription_profile(), _cred(), "POST", "", _PASSTHROUGH_BODY, {})
+
+    assert b"".join(result.body_chunks) == _PASSTHROUGH_SSE
+    assert "truncated" in capsys.readouterr().err.lower()
+    assert FakeHTTPSConnection.last_instance.closed
+
+
+def test_passthrough_truncated_stream_just_ends_without_an_injected_event(monkeypatch, capsys):
+    partial = b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n"
+    _install_fake_connection(monkeypatch, IncompleteChunkedHTTPResponse(
+        200, {"content-type": "text/event-stream"}, partial))
+
+    result = bridge_module.run_passthrough(_subscription_profile(), _cred(), "POST", "", _PASSTHROUGH_BODY, {})
+
+    assert b"".join(result.body_chunks) == partial   # nothing appended, nothing Anthropic-shaped
+    assert "ended early" in capsys.readouterr().err
+    assert FakeHTTPSConnection.last_instance.closed
+
+
+def test_passthrough_error_status_is_returned_whole_and_as_is(monkeypatch):
+    body = b'{"error":{"message":"nope","type":"invalid_request_error"}}'
+    _install_fake_connection(monkeypatch, FakeHTTPResponse(400, {"x-request-id": "r1"}, body))
+
+    result = bridge_module.run_passthrough(_subscription_profile(), _cred(), "POST", "/compact",
+                                           _PASSTHROUGH_BODY, {})
+
+    assert result.status == 400
+    assert result.headers == {"x-request-id": "r1"}
+    assert b"".join(result.body_chunks) == body
+    assert FakeHTTPSConnection.last_instance.requests[0]["path"] == "/backend-api/codex/responses/compact"
+    assert FakeHTTPSConnection.last_instance.closed
+
+
+def test_passthrough_close_before_reading_releases_the_connection(monkeypatch):
+    _install_fake_connection(monkeypatch, FakeHTTPResponse(200, {"content-type": "text/event-stream"},
+                                                           _PASSTHROUGH_SSE))
+
+    result = bridge_module.run_passthrough(_subscription_profile(), _cred(), "POST", "", _PASSTHROUGH_BODY, {})
+    result.body_chunks.close()
+
+    assert FakeHTTPSConnection.last_instance.closed
+
+
+@pytest.mark.parametrize("suffix", ["/..", "/a/../b", "?x=1", "#f", "/a.b", "compact", "/%2e"])
+def test_passthrough_refuses_an_unsafe_suffix_before_connecting(monkeypatch, suffix):
+    FakeHTTPSConnection.last_instance = None
+    _install_fake_connection(monkeypatch, FakeHTTPResponse(200, {}, b""))
+
+    with pytest.raises(ValueError):
+        bridge_module.run_passthrough(_subscription_profile(), _cred(), "POST", suffix, _PASSTHROUGH_BODY, {})
+    assert FakeHTTPSConnection.last_instance is None
+
+
+def test_passthrough_refuses_a_plain_http_base_url(monkeypatch):
+    _install_fake_connection(monkeypatch, FakeHTTPResponse(200, {}, b""))
+    profile = _subscription_profile(auth_mode="api_key", base_url="http://example.com/v1")
+
+    with pytest.raises(OpenAIBridgeError):
+        bridge_module.run_passthrough(profile, _cred(), "POST", "", _PASSTHROUGH_BODY, {})
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("The encrypted content for item rs_1 could not be verified.", True),
+    ("Encrypted content could not be decrypted or parsed.", True),
+    ("Invalid encrypted content.", True),
+    ('{"code": "invalid_encrypted_content"}', True),
+    ("The 'foo' model is not supported", False),
+    ("reasoning.effort 'minimal' is not supported", False),
+    ("prompt is too long", False),
+])
+def test_encrypted_reasoning_refusal_wording(text, expected):
+    assert bool(bridge_module._ENCRYPTED_REASONING_REFUSAL.search(text)) is expected
+
+
+def test_passthrough_network_failure_is_a_bridge_error(monkeypatch):
+    def factory(host, port, timeout=None):
+        raise OSError("unreachable")
+
+    monkeypatch.setattr(bridge_module.http.client, "HTTPSConnection", factory)
+    with pytest.raises(OpenAIBridgeError):
+        bridge_module.run_passthrough(_subscription_profile(), _cred(), "POST", "", _PASSTHROUGH_BODY, {})

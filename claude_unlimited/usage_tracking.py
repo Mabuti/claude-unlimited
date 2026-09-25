@@ -1,4 +1,6 @@
-"""Per-request token/model usage capture from Anthropic response bodies.
+"""Per-request token/model usage capture from Anthropic response bodies (and
+from OpenAI Responses bodies relayed untranslated for the Codex CLI — see
+the end of this docstring).
 
 An Anthropic SSE stream has this structure (content elided):
 
@@ -28,6 +30,13 @@ exactly as received, in order and unmodified, and only inspects a separate
 copy of the bytes. Every parsing step is guarded so a failure here can never
 raise past this module or alter what the client receives; the worst case is
 that one request's usage isn't captured.
+
+OpenAI Responses: the stream's terminal `response.completed` (or
+`response.incomplete`) event carries `response.model` and `response.usage`;
+a non-streaming body (e.g. /v1/responses/compact) carries `usage` at the top
+level. That usage is mapped to the Anthropic shape above: input_tokens minus
+input_tokens_details.cached_tokens, cache_read_input_tokens = cached_tokens,
+output_tokens as-is, cache_creation_input_tokens = 0.
 """
 
 from __future__ import annotations
@@ -88,6 +97,10 @@ class UsageCapture:
             usage = payload.get("usage")
             if isinstance(usage, dict):
                 self.usage = usage  # authoritative, self-contained (not a diff)
+        elif event_type in ("response.completed", "response.incomplete"):
+            # An OpenAI Responses stream (the Codex CLI, relayed untranslated):
+            # the terminal event carries the model and the final usage.
+            self._take_openai_response(payload.get("response"))
 
     # ---- plain JSON (non-streaming) ----
 
@@ -103,8 +116,48 @@ class UsageCapture:
         if self._json_buffer_capped or not self._json_buffer:
             return
         payload = json.loads(self._json_buffer.decode("utf-8"))
+        if _is_openai_usage(payload.get("usage")):
+            self._take_openai_response(payload)
+            return
         if payload.get("model"):
             self.model = payload["model"]
         usage = payload.get("usage")
         if isinstance(usage, dict):
             self.usage = usage
+
+    # ---- OpenAI Responses ----
+
+    def _take_openai_response(self, response) -> None:
+        if not isinstance(response, dict):
+            return
+        if isinstance(response.get("model"), str) and response["model"]:
+            self.model = response["model"]
+        usage = _openai_usage(response.get("usage"))
+        if usage is not None:
+            self.usage = usage
+
+
+def _is_openai_usage(usage) -> bool:
+    """An OpenAI Responses usage object, as opposed to Anthropic's: it reports
+    cached input inside input_tokens_details and has no cache_* fields."""
+    return (isinstance(usage, dict)
+            and "cache_read_input_tokens" not in usage
+            and "cache_creation_input_tokens" not in usage
+            and ("input_tokens_details" in usage or "output_tokens_details" in usage
+                 or "total_tokens" in usage))
+
+
+def _openai_usage(usage) -> Optional[dict]:
+    """OpenAI Responses usage in this module's (Anthropic) shape. OpenAI's
+    input_tokens INCLUDES the cached part; Anthropic's excludes it, so the
+    cached tokens move from one field to the other."""
+    if not isinstance(usage, dict):
+        return None
+    details = usage.get("input_tokens_details")
+    cached = int((details or {}).get("cached_tokens") or 0) if isinstance(details, dict) else 0
+    return {
+        "input_tokens": max(0, int(usage.get("input_tokens") or 0) - cached),
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": cached,
+        "output_tokens": int(usage.get("output_tokens") or 0),
+    }

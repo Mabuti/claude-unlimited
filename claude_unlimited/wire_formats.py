@@ -31,6 +31,11 @@ ANTHROPIC_MESSAGES = "anthropic_messages"
 OPENAI_RESPONSES = "openai_responses"
 OPENAI_CHAT_COMPLETIONS = "openai_chat_completions"
 
+# The inbound path that marks a request as OpenAI Responses-shaped (the Codex
+# CLI's `POST {base_url}/responses`). Such a request is relayed untranslated
+# to a codex-kind Profile; see gateway.is_openai_ingress.
+OPENAI_RESPONSES_INGRESS_PATH = "/v1/responses"
+
 
 class ResponseStream(Protocol):
     """Consumes provider SSE events and yields Anthropic-shaped SSE bytes."""
