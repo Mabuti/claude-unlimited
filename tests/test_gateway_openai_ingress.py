@@ -75,6 +75,8 @@ class Upstream:
                 original_request(method, path, body, headers)
                 token = headers["Authorization"].split(" ", 1)[1]
                 conn._response = self.script[token].pop(0)
+                if isinstance(conn._response, BaseException):
+                    raise conn._response  # a network failure on this account
 
             conn.request = request
             self.conns.append(conn)
@@ -235,8 +237,9 @@ def test_request_is_relayed_verbatim_both_ways(pool_env, monkeypatch):
                  "x-openai-internal-codex-responses-lite", "x-client-request-id", "session-id",
                  "thread-id", "originator", "user-agent", "accept", "content-type"):
         assert sent_headers[kept] == CODEX_HEADERS[kept], kept
-    for dropped in ("host", "accept-encoding", "connection", "cookie", "proxy-authorization"):
+    for dropped in ("host", "connection", "cookie", "proxy-authorization"):
         assert dropped not in sent_headers, dropped
+    assert sent_headers["accept-encoding"] == "identity"   # set by the daemon, never the client's
     assert len([k for k in sent["headers"] if k.lower() == "authorization"]) == 1
     assert conn.closed
 
@@ -275,7 +278,9 @@ def test_api_key_codex_profile_uses_its_base_url(pool_env, monkeypatch):
     assert "chatgpt-account-id" not in {k.lower() for k in up.requests[0]["headers"]}
 
 
-@pytest.mark.parametrize("path", ["/v1/responses/../admin", "/v1/responses/a.b", "/v1/responses/%2e%2e"])
+@pytest.mark.parametrize("path", ["/v1/responses/../admin", "/v1/responses/a.b", "/v1/responses/%2e%2e",
+                                  "/v1/responses/input_items", "/v1/responses/resp_123", "/v1/responses//",
+                                  "/v1/responses/compact/extra", "/v1/responses/compact//"])
 def test_unsafe_suffix_is_refused_locally(pool_env, monkeypatch, path):
     save_pool(Pool(profiles=[_codex()]))
     up = Upstream(monkeypatch, {"tok-c1": [_ok()]})
@@ -458,23 +463,28 @@ def test_auth_invalid_with_nothing_else_relays_the_real_401(pool_env, monkeypatc
     assert _drain(result) == b'{"error":{"message":"bad token"}}'
 
 
-def test_every_codex_profile_exhausted_is_a_429_with_retry_after(pool_env, monkeypatch):
+def test_every_codex_profile_exhausted_relays_the_last_real_429_then_answers_locally(pool_env, monkeypatch):
     save_pool(Pool(profiles=[_oauth(priority=0), _codex("c1"), _codex("c2", priority=2)]))
     up = Upstream(monkeypatch, {"tok-c1": [_quota_429()], "tok-c2": [_quota_429()]})
     gw = Gateway(transport=_no_transport)
 
     result = gw.handle("POST", "/v1/responses", dict(CODEX_HEADERS), BODY)
 
+    # An upstream answered: its own 429 is the truth, not a local refusal.
     assert result.status == 429
-    assert result.error == gateway_module.OPENAI_ERROR_CODEX_EXHAUSTED
-    assert 0 < int(result.headers["retry-after"]) <= 600
-    assert "available again at" in result.error_detail
+    assert result.error is None
+    assert result.profile_id == "c2"
+    assert b"usage_limit_reached" in _drain(result)
     assert len(up.requests) == 2
+    assert all(c.closed for c in up.conns)
     assert gw.serving_now_ids() == set()
 
-    # And the next request makes no upstream attempt at all.
+    # The next request makes no upstream attempt at all: a local 429.
     again = gw.handle("POST", "/v1/responses", dict(CODEX_HEADERS), BODY)
     assert again.status == 429
+    assert again.error == gateway_module.OPENAI_ERROR_CODEX_EXHAUSTED
+    assert 0 < int(again.headers["retry-after"]) <= 600
+    assert "available again at" in again.error_detail
     assert len(up.requests) == 2
 
 
@@ -707,3 +717,425 @@ def test_messages_on_claude_profiles_is_unchanged(pool_env, monkeypatch, profile
     assert _drain(result) == b'{"ok":true}'
     assert sent[0].url.endswith("/v1/messages")
     assert gw._current_profile_id == profile.id
+
+
+# ==== review fixes ===================================================================
+
+def _session(sid, **extra):
+    headers = dict(CODEX_HEADERS)
+    headers["session-id"] = sid
+    headers["thread-id"] = sid
+    headers.update(extra)
+    return headers
+
+
+def _set_state(gw, pid, state, **changes):
+    gw.runtime_snapshot()
+    assert gw.wait_for_credential_checks()
+    gw._runtime[pid] = gateway_module._replace_runtime(gw._runtime[pid], state=state, **changes)
+
+
+def _tokens(up):
+    return [r["headers"]["Authorization"].split(" ", 1)[1] for r in up.requests]
+
+
+def _in(minutes):
+    return datetime.now(timezone.utc) + timedelta(minutes=minutes)
+
+
+# A successful stream whose headers carry no usage: classify() says Unknown,
+# so a state a test set by hand survives the request.
+def _ok_no_usage():
+    return _ok(headers={"Content-Type": "text/event-stream"})
+
+
+def _status(status, headers=None, body=b'{"error":{"message":"upstream said no"}}'):
+    return FakeHTTPResponse(status, dict(headers or {"content-type": "application/json"}), body)
+
+
+# ---- F1: session affinity ------------------------------------------------------------
+
+def test_a_session_stays_on_its_account_when_that_account_starts_draining(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex("c1"), _codex("c2", priority=2)]))
+    up = Upstream(monkeypatch, {"tok-c1": [_ok(), _ok_no_usage()], "tok-c2": [_ok_no_usage()]})
+    gw = Gateway(transport=_no_transport)
+
+    assert _drain(gw.handle("POST", "/v1/responses", _session("s1"), BODY)) == SSE
+    _set_state(gw, "c1", ProfileState.DRAINING, last_usage_percent=99.0)
+
+    kept = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
+    fresh = gw.handle("POST", "/v1/responses", _session("s2"), BODY)
+    _drain(kept)
+    _drain(fresh)
+
+    assert kept.profile_id == "c1"      # an existing session keeps its account
+    assert fresh.profile_id == "c2"     # a new one avoids the draining account
+    assert _tokens(up) == ["tok-c1", "tok-c1", "tok-c2"]
+    assert gw._openai_sessions == {"s1": "c1", "s2": "c2"}
+
+
+@pytest.mark.parametrize("state,changes", [
+    (ProfileState.EXHAUSTED, {"resets_at": _in(30)}),
+    (ProfileState.COOLDOWN, {"cooldown_until": _in(30)}),
+    (ProfileState.AUTH_INVALID, {}),
+])
+def test_a_session_moves_when_its_account_cannot_serve(pool_env, monkeypatch, state, changes):
+    save_pool(Pool(profiles=[_codex("c1"), _codex("c2", priority=2)]))
+    up = Upstream(monkeypatch, {"tok-c1": [_ok()], "tok-c2": [_ok()]})
+    gw = Gateway(transport=_no_transport)
+    _drain(gw.handle("POST", "/v1/responses", _session("s1"), BODY))
+    _set_state(gw, "c1", state, **changes)
+
+    moved = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
+
+    assert moved.profile_id == "c2"
+    _drain(moved)
+    assert gw._openai_sessions["s1"] == "c2"
+    assert _tokens(up) == ["tok-c1", "tok-c2"]
+
+
+def test_a_session_moves_when_its_account_is_disabled_or_removed(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex("c1"), _codex("c2", priority=2)]))
+    Upstream(monkeypatch, {"tok-c1": [_ok()], "tok-c2": [_ok(), _ok()]})
+    gw = Gateway(transport=_no_transport)
+    _drain(gw.handle("POST", "/v1/responses", _session("s1"), BODY))
+
+    save_pool(Pool(profiles=[Profile(id="c1", name="C1", kind="codex", auth_mode="chatgpt_subscription",
+                                     priority=1, automatic=True, enabled=False), _codex("c2", priority=2)]))
+    assert gw.handle("POST", "/v1/responses", _session("s1"), BODY).profile_id == "c2"
+
+    gw._openai_sessions["s1"] = "gone"
+    assert gw.handle("POST", "/v1/responses", _session("s1"), BODY).profile_id == "c2"
+
+
+def test_a_session_keeps_its_account_even_when_another_is_preferred(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex("c1"), _codex("c2", priority=2)]))
+    up = Upstream(monkeypatch, {"tok-c2": [_ok()]})
+    gw = Gateway(transport=_no_transport)
+    gw._openai_sessions["s1"] = "c2"
+
+    assert gw.handle("POST", "/v1/responses", _session("s1"), BODY).profile_id == "c2"
+    assert _tokens(up) == ["tok-c2"]
+
+
+def test_a_pinned_request_neither_reads_nor_writes_the_session_map(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex("c1"), _codex("c2", priority=2)]))
+    up = Upstream(monkeypatch, {"tok-c1": [_ok()]})
+    gw = Gateway(transport=_no_transport)
+    gw._openai_sessions["s1"] = "c2"
+
+    result = gw.handle("POST", "/v1/responses", _session("s1"), BODY, forced_profile_id="c1")
+
+    assert result.profile_id == "c1"
+    assert _tokens(up) == ["tok-c1"]
+    assert gw._openai_sessions == {"s1": "c2"}
+
+
+def test_thread_id_keys_the_session_when_session_id_is_absent(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex("c1")]))
+    Upstream(monkeypatch, {"tok-c1": [_ok()]})
+    gw = Gateway(transport=_no_transport)
+    headers = {k: v for k, v in CODEX_HEADERS.items() if k != "session-id"}
+    headers["thread-id"] = "t-1"
+
+    _drain(gw.handle("POST", "/v1/responses", headers, BODY))
+
+    assert gw._openai_sessions == {"t-1": "c1"}
+
+
+def test_the_session_map_is_a_bounded_lru(pool_env, monkeypatch):
+    monkeypatch.setattr(gateway_module, "_OPENAI_SESSION_MEMORY", 3)
+    gw = Gateway(transport=_no_transport)
+    for key in ("s0", "s1", "s2"):
+        gw._remember_openai_session(key, "c1")
+    gw._remember_openai_session("s0", "c1")   # touched: now the newest
+    gw._remember_openai_session("s3", "c1")
+
+    assert list(gw._openai_sessions) == ["s2", "s0", "s3"]
+
+
+# ---- F2: account move hygiene ------------------------------------------------------
+
+MOVE_BODY = json.dumps({
+    "model": "gpt-5.6-sol",
+    "input": [
+        {"type": "message", "role": "user", "content": "hi"},
+        {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "gAAAA-c1-only"},
+        {"type": "reasoning", "id": "rs_2", "summary": [{"type": "summary_text", "text": "thought"}],
+         "encrypted_content": "gAAAA-c1-summary"},
+        {"type": "compaction", "encrypted_content": "gAAAA-compacted"},
+        {"type": "message", "role": "user", "content": "again"},
+    ],
+    "stream": True, "store": False,
+}).encode()
+
+
+def test_a_moved_session_leaves_turn_state_and_encrypted_reasoning_behind(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex("c1"), _codex("c2", priority=2)]))
+    issued = dict(OK_HEADERS, **{"x-codex-turn-state": "ts-c1"})
+    up = Upstream(monkeypatch, {"tok-c1": [_ok(headers=issued)], "tok-c2": [_ok()]})
+    gw = Gateway(transport=_no_transport)
+    _drain(gw.handle("POST", "/v1/responses", _session("s1"), BODY))
+    _set_state(gw, "c1", ProfileState.EXHAUSTED, resets_at=_in(30))
+
+    moved = gw.handle("POST", "/v1/responses", _session("s1", **{"x-codex-turn-state": "ts-c1"}), MOVE_BODY)
+
+    assert moved.profile_id == "c2"
+    _drain(moved)
+    assert len(up.requests) == 2                      # stripped BEFORE the first send, no 400 round trip
+    sent = up.requests[1]
+    assert "x-codex-turn-state" not in {k.lower() for k in sent["headers"]}
+    items = json.loads(sent["body"])["input"]
+    assert [item["type"] for item in items] == ["message", "reasoning", "compaction", "message"]
+    assert items[1] == {"type": "reasoning", "id": "rs_2", "summary": [{"type": "summary_text", "text": "thought"}]}
+    assert items[2] == {"type": "compaction", "encrypted_content": "gAAAA-compacted"}   # kept
+    assert sent["headers"]["Content-Length"] == str(len(sent["body"]))
+
+
+def test_a_session_on_its_own_account_goes_out_byte_identical(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex("c1"), _codex("c2", priority=2)]))
+    issued = dict(OK_HEADERS, **{"x-codex-turn-state": "ts-c1"})
+    up = Upstream(monkeypatch, {"tok-c1": [_ok(headers=issued), _ok()]})
+    gw = Gateway(transport=_no_transport)
+    _drain(gw.handle("POST", "/v1/responses", _session("s1"), BODY))
+
+    _drain(gw.handle("POST", "/v1/responses", _session("s1", **{"x-codex-turn-state": "ts-c1"}), MOVE_BODY))
+
+    sent = up.requests[1]
+    assert sent["body"] == MOVE_BODY
+    assert sent["headers"]["x-codex-turn-state"] == "ts-c1"
+
+
+def test_the_body_is_untouched_when_a_move_has_nothing_to_strip(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex("c1"), _codex("c2", priority=2)]))
+    up = Upstream(monkeypatch, {"tok-c2": [_ok()]})
+    gw = Gateway(transport=_no_transport)
+    gw._openai_sessions["s1"] = "c1"
+    _set_state(gw, "c1", ProfileState.AUTH_INVALID)
+
+    _drain(gw.handle("POST", "/v1/responses", _session("s1"), BODY))
+
+    assert up.requests[0]["body"] == BODY             # never re-serialised
+
+
+def test_the_single_retry_also_drops_compaction_and_turn_state(pool_env, monkeypatch, capsys):
+    save_pool(Pool(profiles=[_codex("c1")]))
+    refusal = _status(400, body=json.dumps({"error": {
+        "message": "The encrypted content for item cmp_1 could not be verified.",
+        "type": "invalid_request_error", "code": "invalid_encrypted_content"}}).encode())
+    up = Upstream(monkeypatch, {"tok-c1": [refusal, _ok()]})
+    gw = Gateway(transport=_no_transport)
+
+    result = gw.handle("POST", "/v1/responses", _session("s1", **{"x-codex-turn-state": "ts-unknown"}), MOVE_BODY)
+
+    assert result.status == 200
+    first, retry = up.requests
+    assert first["body"] == MOVE_BODY
+    assert first["headers"]["x-codex-turn-state"] == "ts-unknown"
+    assert [item["type"] for item in json.loads(retry["body"])["input"]] == ["message", "message"]
+    assert "x-codex-turn-state" not in {k.lower() for k in retry["headers"]}
+    assert "compacted history" in capsys.readouterr().err
+
+
+def test_without_foreign_reasoning_returns_none_when_there_is_nothing_to_strip():
+    assert bridge_module.without_foreign_reasoning(BODY) is None
+    assert bridge_module.without_foreign_reasoning(b"not json") is None
+
+
+# ---- F3: in-request failover ---------------------------------------------------------
+
+@pytest.mark.parametrize("first", [
+    lambda: _status(500), lambda: _status(502), lambda: _status(503), lambda: _status(504),
+    lambda: _status(529),
+    lambda: _status(429, {"content-type": "application/json", "retry-after": "5"}),   # not a quota 429
+    lambda: _status(429),
+    lambda: OSError("connection reset"),
+])
+def test_a_transient_failure_moves_the_request_to_the_next_codex_account(pool_env, monkeypatch, first):
+    save_pool(Pool(profiles=[_codex("c1"), _codex("c2", priority=2)]))
+    up = Upstream(monkeypatch, {"tok-c1": [first()], "tok-c2": [_ok()]})
+    gw = Gateway(transport=_no_transport)
+
+    result = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
+
+    assert result.status == 200
+    assert result.profile_id == "c2"
+    assert _drain(result) == SSE
+    assert _tokens(up) == ["tok-c1", "tok-c2"]
+    assert all(c.closed for c in up.conns)
+    assert gw.serving_now_ids() == set()
+
+
+def test_failover_is_bounded_and_returns_the_last_real_answer(pool_env, monkeypatch):
+    ids = [f"c{i}" for i in range(1, 7)]
+    monkeypatch.setattr(gateway_module, "secret_store", FakeSecretStore(
+        {pid: _codex_cred(f"tok-{pid}", f"acct-{pid}") for pid in ids}))
+    save_pool(Pool(profiles=[_codex(pid, priority=i) for i, pid in enumerate(ids, start=1)]))
+    up = Upstream(monkeypatch, {f"tok-{pid}": [_status(503, body=f"busy-{pid}".encode())] for pid in ids})
+    gw = Gateway(transport=_no_transport)
+
+    result = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
+
+    assert len(up.requests) == gateway_module.MAX_ROTATION_ATTEMPTS
+    last = f"c{gateway_module.MAX_ROTATION_ATTEMPTS}"
+    assert result.status == 503 and result.error is None
+    assert result.profile_id == last
+    assert _drain(result) == f"busy-{last}".encode()
+    assert all(c.closed for c in up.conns)
+    assert gw.serving_now_ids() == set()
+
+
+# ---- F4: truthful terminal answer ----------------------------------------------------
+
+def test_the_last_upstream_answer_wins_over_a_later_network_failure(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex("c1"), _codex("c2", priority=2)]))
+    quota = _quota_429()
+    quota._headers["set-cookie"] = "x=y"
+    up = Upstream(monkeypatch, {"tok-c1": [quota], "tok-c2": [OSError("no route to host")]})
+    gw = Gateway(transport=_no_transport)
+
+    result = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
+
+    assert result.status == 429
+    assert result.error is None
+    assert result.profile_id == "c1"
+    assert b"usage_limit_reached" in _drain(result)
+    assert "set-cookie" not in {k.lower() for k in result.headers}
+    assert result.headers["x-codex-primary-used-percent"] == "100"
+    assert all(c.closed for c in up.conns)
+    assert gw.serving_now_ids() == set()
+
+
+def test_a_single_account_5xx_is_relayed_and_the_next_try_gets_a_503_not_a_429(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex("c1")]))
+    up = Upstream(monkeypatch, {"tok-c1": [_status(503, body=b"overloaded")]})
+    gw = Gateway(transport=_no_transport)
+
+    first = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
+    assert first.status == 503 and first.error is None
+    assert _drain(first) == b"overloaded"
+
+    again = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
+    assert again.status == 503
+    assert again.error == gateway_module.OPENAI_ERROR_CODEX_UNAVAILABLE
+    assert int(again.headers["retry-after"]) >= 1
+    assert len(up.requests) == 1
+
+
+def test_an_account_that_is_only_cooling_down_is_a_503_with_retry_after(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex("c1"), _codex("c2", priority=2)]))
+    up = Upstream(monkeypatch, {})
+    gw = Gateway(transport=_no_transport)
+    _set_state(gw, "c1", ProfileState.COOLDOWN, cooldown_until=_in(0.5))
+    _set_state(gw, "c2", ProfileState.EXHAUSTED, resets_at=_in(60))
+
+    result = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
+
+    _assert_refused_without_attempt(result, up, status=503)
+    assert result.error == gateway_module.OPENAI_ERROR_CODEX_UNAVAILABLE
+    assert 1 <= int(result.headers["retry-after"]) <= 30
+
+
+def test_a_credential_read_failure_is_a_503_not_a_429(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex("c1")]))
+    up = Upstream(monkeypatch, {})
+
+    class LockedStore:
+        def get_token(self, profile_id):
+            raise RuntimeError("keychain locked")
+
+    monkeypatch.setattr(gateway_module, "secret_store", LockedStore())
+    gw = Gateway(transport=_no_transport)
+
+    result = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
+    pinned = gw.handle("POST", "/v1/responses", _session("s1"), BODY, forced_profile_id="c1")
+
+    for refused in (result, pinned):
+        _assert_refused_without_attempt(refused, up, status=503)
+        assert int(refused.headers["retry-after"]) >= 1
+    assert result.error == gateway_module.OPENAI_ERROR_CODEX_UNAVAILABLE
+
+
+# ---- F6/F7: in-flight accounting -----------------------------------------------------
+
+def test_a_result_discarded_unread_releases_its_slot_and_closes_the_upstream(pool_env, monkeypatch):
+    import claude_unlimited.daemon as daemon
+
+    save_pool(Pool(profiles=[_codex("c1")]))
+    up = Upstream(monkeypatch, {"tok-c1": [_ok()]})
+    gw = Gateway(transport=_no_transport)
+
+    result = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
+    assert gw.serving_now_ids() == {"c1"}
+    daemon._discard_result(result)                   # never read a byte of it
+
+    assert gw.serving_now_ids() == set()
+    assert up.conns[0].closed
+    daemon._discard_result(result)                   # idempotent
+    assert gw.serving_now_ids() == set()
+
+
+def test_two_open_responses_on_one_account_keep_it_in_flight_until_both_finish(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex("c1")]))
+    Upstream(monkeypatch, {"tok-c1": [_ok(), _ok()]})
+    gw = Gateway(transport=_no_transport)
+
+    first = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
+    second = gw.handle("POST", "/v1/responses", _session("s2"), BODY)
+    _drain(first)
+
+    assert gw.serving_now_ids() == {"c1"}             # the second is still streaming
+    assert gw.seconds_since_last_activity() == 0.0
+    assert not gw.is_idle(1)
+
+    _drain(second)
+    assert gw.serving_now_ids() == set()
+
+
+# ---- F8: allowlists ------------------------------------------------------------------
+
+def test_only_allowlisted_request_headers_go_upstream(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex("c1")]))
+    up = Upstream(monkeypatch, {"tok-c1": [_ok()]})
+    gw = Gateway(transport=_no_transport)
+    extra = {"x-openai-foo": "1", "forwarded": "for=1.2.3.4", "via": "1.1 proxy", "x-api-key": "sk-local",
+             "openai-organization": "org", "x-forwarded-for": "1.2.3.4", "chatgpt-account-id": "someone-else",
+             "openai-beta": "responses=v1", "version": "0.144.0", "x-openai-subagent": "review",
+             "session_id": "legacy", "x-codex-anything": "a", "x-openai-internal-codex-other": "b"}
+
+    _drain(gw.handle("POST", "/v1/responses", dict(CODEX_HEADERS, **extra), BODY))
+
+    sent = {k.lower(): v for k, v in up.requests[0]["headers"].items()}
+    for dropped in ("x-openai-foo", "forwarded", "via", "x-api-key", "openai-organization", "x-forwarded-for"):
+        assert dropped not in sent, dropped
+    assert sent["chatgpt-account-id"] == "acct-1"     # the account's own, never the client's
+    for kept in ("openai-beta", "version", "x-openai-subagent", "session_id", "x-codex-anything",
+                 "x-openai-internal-codex-other"):
+        assert sent[kept] == extra[kept], kept
+
+
+def test_only_allowlisted_response_headers_reach_the_client(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex("c1")]))
+    upstream_headers = dict(OK_HEADERS, **{
+        "Via": "1.1 envoy", "X-Envoy-Upstream-Service-Time": "12", "Set-Cookie2": "a=b",
+        "Strict-Transport-Security": "max-age=1", "X-Request-Id": "req_1", "OpenAI-Model": "gpt-5.6-sol",
+        "OpenAI-Processing-Ms": "40", "x-ratelimit-remaining-requests": "99", "Retry-After": "3"})
+    Upstream(monkeypatch, {"tok-c1": [_ok(headers=upstream_headers)]})
+    gw = Gateway(transport=_no_transport)
+
+    result = gw.handle("POST", "/v1/responses", dict(CODEX_HEADERS), BODY)
+
+    assert {k.lower() for k in result.headers} == {
+        "content-type", "x-codex-primary-used-percent", "x-codex-primary-window-minutes", "x-codex-plan-type",
+        "x-request-id", "openai-model", "openai-processing-ms", "x-ratelimit-remaining-requests", "retry-after"}
+
+
+@pytest.mark.parametrize("path,backend", [("/v1/responses/", "/backend-api/codex/responses"),
+                                          ("/v1/responses/compact/", "/backend-api/codex/responses/compact")])
+def test_one_trailing_slash_is_ignored(pool_env, monkeypatch, path, backend):
+    save_pool(Pool(profiles=[_codex("c1")]))
+    up = Upstream(monkeypatch, {"tok-c1": [_ok()]})
+    gw = Gateway(transport=_no_transport)
+
+    assert gw.handle("POST", path, dict(CODEX_HEADERS), BODY).status == 200
+    assert up.requests[0]["path"] == backend

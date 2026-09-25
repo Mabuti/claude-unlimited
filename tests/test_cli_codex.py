@@ -206,17 +206,65 @@ def test_passthrough_of_flag_looking_args_via_main(monkeypatch, codex_env):
     assert argv[-4:] == ["exec", "--model", "gpt-5.6-luna", "hi"]
 
 
-def test_profile_flag_is_still_parsed_by_argparse_not_passed_through(monkeypatch, codex_env):
+def test_account_flag_is_parsed_by_argparse_not_passed_through(monkeypatch, codex_env):
     save_pool(Pool(profiles=[_codex_profile(pid="c", name="ChatGPT")]))
     monkeypatch.setattr(cli, "_fetch_session_token",
                          lambda host, port, profile_id, timeout=2.0: f"tok-{profile_id}")
 
-    assert cli.main(["codex", "--profile", "ChatGPT", "exec", "hi"]) == 0
+    assert cli.main(["codex", "--account", "ChatGPT", "exec", "hi"]) == 0
     (_exe, argv, env), = codex_env
-    assert "--profile" not in argv
+    assert "--account" not in argv
     assert "ChatGPT" not in argv
     assert argv[-2:] == ["exec", "hi"]
     assert env["CLAUDE_UNLIMITED_TOKEN"] == "tok-c"
+
+
+@pytest.mark.parametrize("args", [
+    ["--profile", "fast", "exec", "hi"],
+    ["-p", "fast", "exec", "hi"],
+    ["exec", "--profile", "fast", "hi"],
+    ["exec", "-p", "fast", "hi"],
+])
+def test_codex_own_profile_flag_passes_through_untouched(monkeypatch, codex_env, args):
+    # Codex's -p/--profile picks $CODEX_HOME/<name>.config.toml; it is not a
+    # pin, even when a pool account happens to share the name.
+    save_pool(Pool(profiles=[_codex_profile(pid="c", name="fast")]))
+    monkeypatch.setattr(cli, "_fetch_placeholder_token", lambda host, port, timeout=2.0: "placeholder-tok")
+
+    def boom(*a, **kw):
+        raise AssertionError("codex's own --profile must not pin the session")
+    monkeypatch.setattr(cli, "_fetch_session_token", boom)
+
+    assert cli.main(["codex", *args]) == 0
+    (_exe, argv, env), = codex_env
+    assert argv[-len(args):] == args
+    assert env["CLAUDE_UNLIMITED_TOKEN"] == "placeholder-tok"
+
+
+def test_everything_after_a_double_dash_goes_to_codex_verbatim(monkeypatch, codex_env):
+    save_pool(Pool(profiles=[_codex_profile(pid="c", name="ChatGPT")]))
+    monkeypatch.setattr(cli, "_fetch_session_token",
+                         lambda host, port, profile_id, timeout=2.0: f"tok-{profile_id}")
+
+    assert cli.main(["codex", "--account", "ChatGPT", "exec", "--",
+                     "--port", "9", "--account", "x", "--", "-p", "fast"]) == 0
+    (_exe, argv, env), = codex_env
+    overrides = cli._codex_provider_overrides(4317)
+    assert argv == ["codex", *overrides, "exec", "--port", "9", "--account", "x", "--", "-p", "fast"]
+    assert env["CLAUDE_UNLIMITED_TOKEN"] == "tok-c"
+
+
+def test_an_unknown_account_names_the_account_flag(monkeypatch, codex_env, capsys):
+    save_pool(Pool(profiles=[_codex_profile()]))
+
+    assert cli.main(["codex", "--account", "nope"]) == 1
+    assert "--account 'nope'" in capsys.readouterr().err
+
+
+def test_double_dash_split_leaves_other_commands_alone():
+    assert cli._split_codex_passthrough(["code", "--", "-p"]) == (["code", "--", "-p"], [])
+    assert cli._split_codex_passthrough([]) == ([], [])
+    assert cli._split_codex_passthrough(["codex", "exec"]) == (["codex", "exec"], [])
 
 
 # ---- nothing written under CODEX_HOME ----

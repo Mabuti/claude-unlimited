@@ -680,35 +680,40 @@ def run(profile: Profile, stored_credential: str, body: bytes,
                 codex_state.remember_reasoning(profile.id, served_model, translator.anchors(),
                                                translator.reasoning_items)
 
-    return OpenAIBridgeResult(status=200, headers=response_headers, body_chunks=_translated_chunks())
+    # _ClosingChunks, not the bare generator: a result discarded before the
+    # first read must still close the upstream socket (see _ClosingChunks).
+    return OpenAIBridgeResult(status=200, headers=response_headers,
+                              body_chunks=_ClosingChunks(_translated_chunks(), conn))
 
 
 # ---- OpenAI-shaped ingress: the Codex CLI's own request, relayed verbatim ----
 
-# What may follow /v1/responses on an inbound path: "" or "/segment[/...]".
-# Anything else (a "..", a query, a fragment, an encoded character) is
-# refused locally rather than forwarded to a backend URL built from it.
-_RESPONSES_SUFFIX_PATTERN = re.compile(r"(?:/[A-Za-z0-9_-]+)*")
+# The only suffixes the Codex CLI sends after /v1/responses (measured against
+# 0.144: "" and "/compact"). Anything else is refused locally: the pool's
+# subscription credential must never reach a backend path the CLI itself
+# never calls.
+_ALLOWED_RESPONSES_SUFFIXES = frozenset({"", "/compact"})
 
-# Client request headers never forwarded upstream: hop-by-hop framing, the
-# client's own credential (the placeholder token for this daemon), cookies,
-# anything the daemon itself sets, and accept-encoding — the response must
-# arrive identity-encoded or usage capture cannot read it.
-_PASSTHROUGH_DROPPED_REQUEST_HEADERS = frozenset({
-    "authorization",
-    "x-api-key",
-    "cookie",
-    "host",
-    "content-length",
-    "connection",
-    "keep-alive",
-    "transfer-encoding",
-    "te",
-    "trailer",
-    "upgrade",
-    "accept-encoding",
-    "chatgpt-account-id",
+# Client request headers forwarded upstream: an ALLOWLIST, the headers the
+# Codex CLI actually sends (plus the few it has sent in other versions), so a
+# local process cannot attach arbitrary headers to a request that goes out
+# under the pool's credential. The daemon sets the rest itself: Authorization,
+# ChatGPT-Account-ID, Content-Length and Accept-Encoding (see
+# _passthrough_headers).
+_PASSTHROUGH_REQUEST_HEADERS = frozenset({
+    "accept",
+    "content-type",
+    "originator",
+    "user-agent",
+    "session-id",
+    "session_id",
+    "thread-id",
+    "x-client-request-id",
+    "openai-beta",
+    "version",
+    "x-openai-subagent",
 })
+_PASSTHROUGH_REQUEST_HEADER_PREFIXES = ("x-codex-", "x-openai-internal-codex-")
 
 # "The encrypted reasoning you replayed cannot be used here": what the
 # backend answers when a Codex session carries reasoning items another
@@ -724,47 +729,115 @@ _ENCRYPTED_REASONING_REFUSAL = re.compile(
 
 
 def valid_responses_suffix(suffix: str) -> bool:
-    """Whether `suffix` (the part of an inbound path after /v1/responses) is
-    safe to append to a backend URL."""
-    return bool(_RESPONSES_SUFFIX_PATTERN.fullmatch(suffix or ""))
+    """Whether `suffix` (the part of an inbound path after /v1/responses, one
+    trailing slash already removed) is one this daemon relays: "" or
+    "/compact", nothing else."""
+    return (suffix or "") in _ALLOWED_RESPONSES_SUFFIXES
+
+
+def _forwardable_request_header(name: str) -> bool:
+    lowered = str(name).lower()
+    return (lowered in _PASSTHROUGH_REQUEST_HEADERS
+            or any(lowered.startswith(prefix) for prefix in _PASSTHROUGH_REQUEST_HEADER_PREFIXES))
 
 
 def _passthrough_headers(client_headers: dict, cred: openai_credential.StoredOpenAICredential,
                          is_subscription: bool, content_length: int) -> dict:
-    headers = {}
-    for key, value in (client_headers or {}).items():
-        lowered = str(key).lower()
-        if lowered in _PASSTHROUGH_DROPPED_REQUEST_HEADERS or lowered.startswith("proxy-"):
-            continue
-        headers[key] = value
+    headers = {key: value for key, value in (client_headers or {}).items()
+               if _forwardable_request_header(key)}
     headers["Authorization"] = f"Bearer {cred.access_token}"
     if is_subscription and cred.account_id:
         headers["ChatGPT-Account-ID"] = cred.account_id
     headers["Content-Length"] = str(content_length)
+    # Identity, always: usage capture reads the relayed bytes, and it cannot
+    # read a compressed stream.
+    headers["Accept-Encoding"] = "identity"
     return headers
 
 
-def _without_encrypted_reasoning(body: bytes) -> Optional[bytes]:
-    """The request body minus every reasoning input item that carries
-    `encrypted_content`, or None when there is none to remove.
+def without_header(headers: dict, name: str) -> dict:
+    """`headers` minus every spelling of `name` (lowercase)."""
+    return {k: v for k, v in (headers or {}).items() if str(k).lower() != name}
 
-    The whole item goes, not just the field: with `store: false` (what the
-    Codex CLI sends) a reasoning item left with only its `rs_…` id refers to
-    something the backend never stored, which is a second 400. Dropping it
-    costs the model its earlier private reasoning, never the conversation."""
+
+# Keys a reasoning input item carries that say nothing on their own: with the
+# encrypted content gone, an item holding only these has nothing left to say.
+_REASONING_IDENTITY_KEYS = frozenset({"type", "id", "status", "encrypted_content"})
+
+
+def _parsed_input(body: bytes) -> Optional[dict]:
     try:
         parsed = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (ValueError, RecursionError):  # ValueError covers UnicodeDecodeError
         return None
     if not isinstance(parsed, dict) or not isinstance(parsed.get("input"), list):
         return None
-    kept = [item for item in parsed["input"]
-            if not (isinstance(item, dict) and item.get("type") == "reasoning"
-                    and "encrypted_content" in item)]
-    if len(kept) == len(parsed["input"]):
+    return parsed
+
+
+def _encode_body(parsed: dict) -> bytes:
+    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def without_foreign_reasoning(body: bytes) -> Optional[bytes]:
+    """The request body with encrypted reasoning taken out, or None when there
+    is none (the caller then sends the body byte-identical). Used when a Codex
+    session MOVES to a different account, before the first upstream send:
+    that ciphertext only decrypts on the account that produced it.
+
+    A reasoning item whose only payload is its encrypted content is dropped
+    whole; one that still carries something else (a summary, content) keeps
+    that and loses only the `encrypted_content` field. Compaction items are
+    kept: they hold the compacted conversation. The reactive retry in
+    run_passthrough drops them only when the backend actually refuses them."""
+    parsed = _parsed_input(body)
+    if parsed is None:
+        return None
+    changed = False
+    kept = []
+    for item in parsed["input"]:
+        if (isinstance(item, dict) and item.get("type") == "reasoning"
+                and "encrypted_content" in item):
+            changed = True
+            rest = {k: v for k, v in item.items()
+                    if k not in _REASONING_IDENTITY_KEYS and v not in (None, "", [], {})}
+            if not rest:
+                continue
+            item = {k: v for k, v in item.items() if k != "encrypted_content"}
+        kept.append(item)
+    if not changed:
         return None
     parsed["input"] = kept
-    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return _encode_body(parsed)
+
+
+def _without_encrypted_items(body: bytes) -> tuple:
+    """(the request body minus every `reasoning` AND `compaction` input item
+    that carries `encrypted_content`, how many compaction items went), or
+    (None, 0) when there is none to remove.
+
+    The whole item goes, not just the field: with `store: false` (what the
+    Codex CLI sends) a reasoning item left with only its id refers to
+    something the backend never stored, which is a second 400. Dropping it
+    costs the model its earlier private reasoning, never the conversation.
+    A compaction item IS its encrypted content, so dropping one costs the
+    compacted history, and the caller says so on stderr."""
+    parsed = _parsed_input(body)
+    if parsed is None:
+        return None, 0
+    kept = []
+    compaction_dropped = 0
+    for item in parsed["input"]:
+        if (isinstance(item, dict) and item.get("type") in ("reasoning", "compaction")
+                and "encrypted_content" in item):
+            if item.get("type") == "compaction":
+                compaction_dropped += 1
+            continue
+        kept.append(item)
+    if len(kept) == len(parsed["input"]):
+        return None, 0
+    parsed["input"] = kept
+    return _encode_body(parsed), compaction_dropped
 
 
 def run_passthrough(profile: Profile, stored_credential: str, method: str, path_suffix: str,
@@ -773,26 +846,30 @@ def run_passthrough(profile: Profile, stored_credential: str, method: str, path_
     """Relays one Codex CLI request (already OpenAI Responses-shaped) to this
     codex-kind Profile's backend, with nothing translated either way.
 
-    The body goes out byte-identical and the client's own headers go with
-    it, minus its credential and hop-by-hop framing; the Profile's credential
-    replaces the credential. The response comes back with its raw status and
-    headers, and body_chunks yields the upstream bytes exactly as they
-    arrive. An error status is read whole and returned as-is.
+    The body goes out byte-identical (the gateway may already have taken
+    another account's encrypted reasoning out of it — see
+    without_foreign_reasoning) with the allowlisted client headers
+    (_passthrough_headers); the Profile's credential replaces the client's.
+    The response comes back with its raw status and headers, and body_chunks
+    yields the upstream bytes exactly as they arrive. An error status is read
+    whole (error bodies are small) and returned as-is.
 
     One bounded exception to "byte-identical": a 400 refusing replayed
-    encrypted reasoning is retried ONCE without those reasoning items (see
-    _without_encrypted_reasoning). Raises OpenAIBridgeError when there was
-    no response at all, and ValueError for a suffix that must not be
-    forwarded (the gateway checks it first)."""
+    encrypted state is retried ONCE without every encrypted reasoning AND
+    compaction item and without x-codex-turn-state (see
+    _without_encrypted_items). Raises OpenAIBridgeError when there was no
+    response at all, and ValueError for a suffix that must not be forwarded
+    (the gateway checks it first)."""
     if not valid_responses_suffix(path_suffix):
         raise ValueError(f"refusing to forward /v1/responses{path_suffix!r}")
     cred, is_subscription = _load_credential(profile, stored_credential)
     parts = _backend_parts(profile, is_subscription, "/responses", path_suffix)
 
     payload = body
+    send_headers = client_headers
     retried_without_reasoning = False
     while True:
-        headers = _passthrough_headers(client_headers, cred, is_subscription, len(payload))
+        headers = _passthrough_headers(send_headers, cred, is_subscription, len(payload))
         conn = None
         try:
             conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout)
@@ -815,12 +892,20 @@ def run_passthrough(profile: Profile, stored_credential: str, method: str, path_
             conn.close()
         if (resp.status == 400 and not retried_without_reasoning
                 and _ENCRYPTED_REASONING_REFUSAL.search(raw.decode("utf-8", errors="replace"))):
-            stripped = _without_encrypted_reasoning(payload)
-            if stripped is not None:
+            stripped, compaction_dropped = _without_encrypted_items(payload)
+            turn_state_sent = any(str(k).lower() == "x-codex-turn-state" for k in (send_headers or {}))
+            if stripped is not None or turn_state_sent:
                 retried_without_reasoning = True
-                print(f"[codex] {profile.name}: the backend refused replayed encrypted reasoning; "
-                      "retrying once without it", file=sys.stderr, flush=True)
-                payload = stripped
+                print(f"[codex] {profile.name}: the backend refused replayed encrypted state; "
+                      "retrying once without encrypted reasoning and x-codex-turn-state",
+                      file=sys.stderr, flush=True)
+                if compaction_dropped:
+                    print(f"[codex] {profile.name}: dropped {compaction_dropped} encrypted compaction "
+                          "item(s) -- the compacted history of this session is gone for this turn",
+                          file=sys.stderr, flush=True)
+                if stripped is not None:
+                    payload = stripped
+                send_headers = without_header(send_headers, "x-codex-turn-state")
                 continue
         return OpenAIBridgeResult(status=resp.status, headers=response_headers, body_chunks=iter([raw]))
 

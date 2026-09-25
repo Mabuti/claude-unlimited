@@ -1,8 +1,8 @@
 """The daemon's side of OpenAI-shaped ingress (the Codex CLI's POST
 /v1/responses): OpenAI-shaped errors, Anthropic-shaped ones untouched for
-/v1/messages, and a keep-alive whose late failure is a Responses
-`response.failed` event. A real loopback server on an ephemeral port; the
-provider side is always faked."""
+/v1/messages, and no keep-alive — a slow Codex request still gets the real
+upstream status and headers. A real loopback server on an ephemeral port;
+the provider side is always faked."""
 
 import json
 import threading
@@ -223,52 +223,66 @@ def _last_event(data):
     return event, json.loads(payload)
 
 
-@pytest.mark.parametrize("method,path,body,expected", [
-    ("POST", "/v1/responses", b'{"stream": true}', True),
-    ("POST", "/v1/responses/compact", b'{"stream": true}', True),
-    ("POST", "/v1/responses", b'{"stream": false}', False),
-    ("POST", "/v1/responses", b"not json", False),
-    ("GET", "/v1/responses", b'{"stream": true}', False),
+@pytest.mark.parametrize("method,path,body", [
+    ("POST", "/v1/responses", b'{"stream": true}'),
+    ("POST", "/v1/responses/compact", b'{"stream": true}'),
+    ("POST", "/v1/responses/", b'{"stream": true}'),
+    ("POST", "/v1/responses", b'{"stream": false}'),
+    ("POST", "/v1/responses", b"not json"),
+    ("GET", "/v1/responses", b'{"stream": true}'),
 ])
-def test_streaming_responses_calls_want_a_keepalive(method, path, body, expected):
-    assert daemon._wants_event_stream(method, path, body) is expected
+def test_responses_calls_never_use_the_keepalive(method, path, body):
+    assert daemon._wants_event_stream(method, path, body) is False
 
 
-def test_late_refusal_after_pings_is_a_response_failed_event(server_with, monkeypatch, fast_keepalive):
+def test_a_slow_upstream_error_keeps_its_real_status_headers_and_body(server_with, monkeypatch, fast_keepalive):
     base = server_with([_codex()])
     released = threading.Event()
+    upstream = json.dumps({"error": {"type": "usage_limit_reached",
+                                     "message": "The usage limit has been reached"}}).encode()
     monkeypatch.setattr(daemon._gateway, "handle", _slow_handle(GatewayResult(
-        status=429, headers={}, body_chunks=None, profile_id=None,
-        error="openai_codex_exhausted", error_detail="All Codex accounts are out of capacity."), released))
+        status=429, headers={"content-type": "application/json", "x-codex-primary-used-percent": "100",
+                             "retry-after": "60"},
+        body_chunks=iter([upstream]), profile_id="c"), released))
+    threading.Timer(0.3, released.set).start()   # six keep-alive intervals
+
+    status, headers, payload = _error(_post(base, "/v1/responses"))
+
+    assert status == 429
+    lowered = {k.lower(): v for k, v in headers.items()}
+    assert lowered["x-codex-primary-used-percent"] == "100"
+    assert lowered["retry-after"] == "60"
+    assert payload == json.loads(upstream)
+
+
+def test_a_slow_stream_keeps_its_upstream_headers_and_gets_no_pings(server_with, monkeypatch, fast_keepalive):
+    base = server_with([_codex()])
+    released = threading.Event()
+    sse = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+    monkeypatch.setattr(daemon._gateway, "handle", _slow_handle(GatewayResult(
+        status=200, headers={"content-type": "text/event-stream", "x-codex-turn-state": "ts-1"},
+        body_chunks=iter([sse]), profile_id="c"), released))
     threading.Timer(0.3, released.set).start()
 
     with urllib.request.urlopen(_post(base, "/v1/responses"), timeout=5) as resp:
-        assert resp.status == 200
+        assert resp.headers["x-codex-turn-state"] == "ts-1"
         data = resp.read()
 
-    assert data.startswith(daemon._SSE_PING)
-    assert b"event: error" not in data
-    event, payload = _last_event(data)
-    assert event == b"event: response.failed"
-    assert payload == {"type": "response.failed", "response": {"status": "failed", "error": {
-        "code": "openai_codex_exhausted", "message": "All Codex accounts are out of capacity."}}}
+    assert data == sse                     # no `event: ping` in front of it
 
 
-def test_late_upstream_error_after_pings_is_a_response_failed_event(server_with, monkeypatch, fast_keepalive):
+def test_a_local_cooldown_refusal_is_an_openai_shaped_503(server_with, monkeypatch):
     base = server_with([_codex()])
-    released = threading.Event()
-    upstream = json.dumps({"error": {"message": "model overloaded", "type": "server_error",
-                                     "code": "server_is_overloaded"}}).encode()
-    monkeypatch.setattr(daemon._gateway, "handle", _slow_handle(GatewayResult(
-        status=500, headers={}, body_chunks=iter([upstream]), profile_id="c"), released))
-    threading.Timer(0.3, released.set).start()
+    monkeypatch.setattr(daemon._gateway, "handle", lambda *a, **kw: GatewayResult(
+        status=503, headers={"retry-after": "12"}, body_chunks=None, profile_id=None,
+        error="openai_codex_temporarily_unavailable", error_detail="Every account is briefly cooling down."))
 
-    with urllib.request.urlopen(_post(base, "/v1/responses"), timeout=5) as resp:
-        data = resp.read()
+    status, headers, payload = _error(_post(base, "/v1/responses"))
 
-    event, payload = _last_event(data)
-    assert event == b"event: response.failed"
-    assert payload["response"]["error"] == {"code": "server_is_overloaded", "message": "model overloaded"}
+    assert status == 503
+    assert {k.lower(): v for k, v in headers.items()}["retry-after"] == "12"
+    assert payload == {"error": {"message": "Every account is briefly cooling down.", "type": "server_error",
+                                 "code": "openai_codex_temporarily_unavailable"}}
 
 
 def test_messages_late_refusal_is_still_the_anthropic_error_event(server_with, monkeypatch, fast_keepalive):

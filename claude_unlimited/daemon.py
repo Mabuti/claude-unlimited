@@ -463,13 +463,10 @@ def _wants_event_stream(method: str, path: str, body: bytes) -> bool:
     can be written into. Parsed, not pattern-matched: '"stream": true' can
     just as well be text inside a message.
 
-    The Codex CLI's POST /v1/responses qualifies the same way (measured: it
-    tolerates the `event: ping` frames)."""
-    if is_openai_ingress(method, path) and body:
-        try:
-            return json.loads(body).get("stream") is True
-        except (ValueError, AttributeError):
-            return False
+    Never the Codex CLI's POST /v1/responses: it talks to chatgpt.com with the
+    same latency and needs no pings, and a keep-alive commits to 200 before
+    the upstream has answered, which loses the real status and the upstream
+    headers (x-codex-turn-state, the rate limits)."""
     if method != "POST" or not path.split("?", 1)[0].rstrip("/").endswith("/v1/messages") or not body:
         return False
     try:
@@ -538,7 +535,9 @@ def _openai_error_payload(result) -> tuple:
 
     The type is chosen for how the Codex CLI reacts (measured against
     0.144): a 429 typed `usage_limit_reached` is shown once and not retried;
-    a 400 is shown once with `error.message` verbatim."""
+    a 400 is shown once with `error.message` verbatim; a 5xx is retried.
+    The gateway only refuses when no upstream answered — an upstream's own
+    error reaches the client as-is, never through this."""
     message = result.error_detail or "[claude-unlimited] No Codex/ChatGPT account can serve this request right now."
     if result.status == 429:
         error_type = "usage_limit_reached"
@@ -556,38 +555,11 @@ def _openai_error_payload(result) -> tuple:
     return result.status, {"error": error}
 
 
-def _openai_failed_event(code, message: str) -> dict:
-    """A Responses stream's own terminal failure event, for a failure that
-    arrives after the keep-alive already sent 200: the Codex CLI reads
-    `response.error.message` from it, where an Anthropic `error` event would
-    mean nothing to it."""
-    return {"type": "response.failed",
-            "response": {"status": "failed", "error": {"code": code, "message": message}}}
-
-
-def _openai_upstream_failed_event(result) -> dict:
-    """An upstream's own non-200 answer as a response.failed event, keeping
-    the provider's code and message when its body is an OpenAI error."""
-    raw = b""
-    try:
-        raw = b"".join(result.body_chunks or [])
-    except (OSError, ValueError):
-        pass
-    try:
-        parsed = json.loads(raw)
-        error = parsed.get("error") if isinstance(parsed, dict) else None
-        if isinstance(error, dict) and error.get("message"):
-            return _openai_failed_event(error.get("code") or error.get("type") or f"http_{result.status}",
-                                        str(error["message"]))
-    except ValueError:
-        pass
-    text = raw.decode("utf-8", "replace").strip()[:500] or f"HTTP {result.status}"
-    return _openai_failed_event(f"http_{result.status}", text)
-
-
 def _discard_result(result) -> None:
-    """Close a gateway result nobody will read. Its body generator's cleanup
-    is what releases the Profile's in-flight slot and upstream connection."""
+    """Close a gateway result nobody will (further) read. Its body's close()
+    is what releases the Profile's in-flight slot and upstream connection —
+    even when not a byte of it was read (see gateway._InFlightBody). Safe to
+    call on a body that was already drained or closed."""
     close = getattr(getattr(result, "body_chunks", None), "close", None)
     if close is not None:
         try:
@@ -1735,32 +1707,41 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                                    forced_profile_id=grant.forced_profile_id,
                                    distribute=grant.distribute)
 
-        if _wants_event_stream(method, path, body):
-            self._serve_with_keepalive(serve, openai=openai)
+        if not openai and _wants_event_stream(method, path, body):
+            self._serve_with_keepalive(serve)
             return
+        # The Codex CLI always gets the real upstream status and headers.
         self._write_proxy_result(serve(), openai=openai)
 
     def _write_proxy_result(self, result, openai: bool = False) -> None:
-        """The ordinary response: whatever the gateway decided, as-is."""
-        if result.error is not None:
-            status, payload = _openai_error_payload(result) if openai else _proxy_error_payload(result)
-            self._send_json(status, payload, extra_headers=result.headers)
-            return
+        """The ordinary response: whatever the gateway decided, as-is.
 
-        self.send_response(result.status)
-        for k, v in result.headers.items():
-            if k.lower() in ("connection", "transfer-encoding", "content-length"):
-                continue
-            self.send_header(k, v)
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
+        The body is closed on every exit, not only when it was read to the
+        end: a client that is gone before the headers are written would
+        otherwise leave a body nobody ever starts, and with it the Profile's
+        in-flight slot and the upstream connection."""
         try:
-            for chunk in result.body_chunks:
-                self.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # client disconnected mid-stream
+            if result.error is not None:
+                status, payload = _openai_error_payload(result) if openai else _proxy_error_payload(result)
+                self._send_json(status, payload, extra_headers=result.headers)
+                return
 
-    def _serve_with_keepalive(self, serve, openai: bool = False) -> None:
+            self.send_response(result.status)
+            for k, v in result.headers.items():
+                if k.lower() in ("connection", "transfer-encoding", "content-length"):
+                    continue
+                self.send_header(k, v)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                for chunk in result.body_chunks:
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # client disconnected mid-stream
+        finally:
+            _discard_result(result)
+
+    def _serve_with_keepalive(self, serve) -> None:
         """A streaming request whose upstream is slow to answer.
 
         Claude Code gives up on a request that has sent no response headers
@@ -1776,10 +1757,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         Anthropic API sends while a model thinks — until the real stream
         starts. A failure that arrives after that goes out as an SSE `error`
         event carrying the provider's own error, which the client handles
-        exactly like one received mid-stream.
-
-        For the Codex CLI (openai=True) that late failure is a Responses
-        `response.failed` event instead — the stream it is already reading."""
+        exactly like one received mid-stream."""
         box: dict = {}
         done = threading.Event()
 
@@ -1795,7 +1773,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         if done.wait(_KEEPALIVE_AFTER_SECONDS):
             if "error" in box:
                 raise box["error"]
-            self._write_proxy_result(box["result"], openai=openai)
+            self._write_proxy_result(box["result"])
             return
 
         try:
@@ -1817,30 +1795,15 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if "error" in box:
-            if openai:
-                try:
-                    self._write_sse(b"response.failed", _openai_failed_event(
-                        "proxy_error", "[claude-unlimited] The request failed inside the proxy."))
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-            else:
-                self._write_sse_error("api_error", "[claude-unlimited] The request failed inside the proxy.")
+            self._write_sse_error("api_error", "[claude-unlimited] The request failed inside the proxy.")
             raise box["error"]
         result = box["result"]
         try:
             if result.error is not None:
-                if openai:
-                    _status, payload = _openai_error_payload(result)
-                    self._write_sse(b"response.failed",
-                                    _openai_failed_event(result.error, payload["error"]["message"]))
-                    return
                 _status, payload = _proxy_error_payload(result)
                 self._write_sse(b"error", payload)
                 return
             if result.status != 200:
-                if openai:
-                    self._write_sse(b"response.failed", _openai_upstream_failed_event(result))
-                    return
                 self._write_sse(b"error", _upstream_error_payload(result))
                 return
             for chunk in result.body_chunks:

@@ -2024,13 +2024,13 @@
         <div class="cmd-row">
           <div class="code-row">
             <code id="cmd-codex">cu codex</code>
-            <span class="cmd-optional">[--profile &lt;name&gt;] [-- codex args]</span>
+            <span class="cmd-optional">[--account &lt;name&gt;] [-- codex args]</span>
             <div class="copy-btn" data-copy-target="cmd-codex">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.codex">Starts the daemon if it isn't already running, then launches the real Codex CLI with its model provider pointed at this pool, so its sessions are served by your enabled Codex/ChatGPT accounts — never by a Claude account, and never moving the Claude Code rotation. Needs at least one enabled codex-kind Profile (add one with add-codex-account); with more than one, prompts you to pick one for this session, or pass --profile &lt;name&gt; to skip the prompt. It routes with `-c` overrides on the command line only — it never edits ~/.codex/config.toml or anything under CODEX_HOME. Any other extra arguments pass straight through to codex. The executable it launches is whatever Settings → Launch commands has for Codex.</div>
+          <div class="field-sub" data-i18n="help.cmd.codex">Starts the daemon if it isn't already running, then launches the real Codex CLI with its model provider pointed at this pool, so its sessions are served by your enabled Codex/ChatGPT accounts — never by a Claude account, and never moving the Claude Code rotation. Needs at least one enabled codex-kind Profile (add one with add-codex-account); with more than one, prompts you to pick one for this session, or pass --account &lt;name&gt; to skip the prompt. It routes with `-c` overrides on the command line only — it never edits ~/.codex/config.toml or anything under CODEX_HOME. Any other extra arguments pass straight through to codex, including its own -p/--profile, and everything after -- goes to codex verbatim. The executable it launches is whatever Settings → Launch commands has for Codex.</div>
         </div>
         <div class="divider"></div>
         <div class="cmd-row">

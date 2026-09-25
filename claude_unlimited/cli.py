@@ -1688,6 +1688,10 @@ def codex(port: int, codex_args: list[str], profile_arg: Optional[str] = None) -
     daemon, so Codex sessions are served by the pool's codex-kind
     (ChatGPT/Codex) accounts.
 
+    `profile_arg` is the value of `cu codex --account` (a pool Profile's name
+    or id). Codex's own `-p/--profile` is never consumed here; it arrives in
+    `codex_args` like any other codex flag.
+
     Modelled on code() but deliberately narrower: only codex-kind Profiles
     are ever relevant here (an oauth/api Claude Profile cannot serve
     `POST /v1/responses`), there is no --distribute (a passthrough session
@@ -1732,7 +1736,7 @@ def codex(port: int, codex_args: list[str], profile_arg: Optional[str] = None) -
                 print(f"{non_codex_match.name!r} is not a Codex account — `cu codex` only "
                       "routes through codex-kind Profiles.", file=sys.stderr)
             else:
-                print(f"No enabled Codex account matches --profile {profile_arg!r}.", file=sys.stderr)
+                print(f"No enabled Codex account matches --account {profile_arg!r}.", file=sys.stderr)
                 if codex_profiles:
                     print("Available: " + ", ".join(p.name for p in codex_profiles), file=sys.stderr)
             return 1
@@ -2534,6 +2538,17 @@ def _resolve_port_or_exit(explicit) -> int:
         raise SystemExit(2)
 
 
+def _split_codex_passthrough(argv: list) -> tuple:
+    """(what argparse should see, what goes to codex verbatim) for
+    `cu codex ... -- ...`: everything after the first `--` that follows the
+    `codex` subcommand is codex's own, untouched and in order, and the `--`
+    itself is dropped. Any other command, or no `--`, is returned whole."""
+    if not argv or argv[0] != "codex" or "--" not in argv[1:]:
+        return argv, []
+    cut = argv.index("--", 1)
+    return argv[:cut], argv[cut + 1:]
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="claude-unlimited", add_help=True,
@@ -2581,11 +2596,16 @@ def main(argv=None) -> int:
     codex_p = sub.add_parser("codex", help="start the daemon if needed, then launch the Codex CLI "
                                             "routed through the pool's ChatGPT/Codex accounts")
     codex_p.add_argument("--port", type=int, default=None)
-    codex_p.add_argument("--profile", metavar="NAME_OR_ID", default=None,
-                          help="pin this session to one Codex Profile by name or id, skipping the "
-                               "interactive picker")
+    # --account, not --profile: `-p/--profile` is the Codex CLI's own flag
+    # (it selects $CODEX_HOME/<name>.config.toml), so it must reach codex
+    # untouched rather than be taken as a pin.
+    codex_p.add_argument("--account", metavar="NAME_OR_ID", default=None,
+                          help="pin this session to one Codex account (Profile) by name or id, skipping "
+                               "the interactive picker")
     # Same parse_known_args() passthrough as code_p above, for `codex`'s own
-    # flag-looking args (e.g. `cu codex exec --model gpt-5.6-luna "hi"`).
+    # flag-looking args (e.g. `cu codex exec --model gpt-5.6-luna "hi"`), plus
+    # a `--` separator: everything after it goes to codex verbatim (see
+    # _split_codex_passthrough).
 
     install_p = sub.add_parser("install", help="register the daemon to start automatically on login")
     install_p.add_argument("--port", type=int, default=None)
@@ -2603,6 +2623,7 @@ def main(argv=None) -> int:
                                help="skip the confirmation prompt")
     purge_parser.add_argument("--port", type=int, default=None)
 
+    argv, codex_verbatim = _split_codex_passthrough(list(sys.argv[1:] if argv is None else argv))
     args, unknown = parser.parse_known_args(argv)
     if args.cmd == "start":
         return start(_resolve_port_or_exit(args.port))
@@ -2620,7 +2641,7 @@ def main(argv=None) -> int:
         return code(_resolve_port_or_exit(args.port), unknown, profile_arg=args.profile,
                     distribute=args.distribute)
     if args.cmd == "codex":
-        return codex(_resolve_port_or_exit(args.port), unknown, profile_arg=args.profile)
+        return codex(_resolve_port_or_exit(args.port), unknown + codex_verbatim, profile_arg=args.account)
     if args.cmd == "desktop":
         return desktop_revert() if args.revert else desktop(_resolve_port_or_exit(args.port))
     if args.cmd == "install":

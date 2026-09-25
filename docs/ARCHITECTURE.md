@@ -112,19 +112,78 @@ anywhere under `CODEX_HOME`), so a second, differently-shaped request arrives al
 Anthropic-shaped one "How a request flows" describes above:
 
 - `POST /v1/responses` (and `/v1/responses/*`) is recognised **by path**, not by any header
-  or body sniffing.
+  or body sniffing. Only two suffixes are relayed: none, and `/compact` (one trailing slash
+  is ignored). Any other `/v1/responses/*` path is refused locally with a 400 and never
+  reaches an upstream — the Codex CLI sends nothing else.
 - It is served **only by codex-kind Profiles**, and as an **unmodified passthrough** — no
   translation, no model mapping. This is the opposite direction from the `codex` case in "How
   a request flows": there, a Claude-shaped request from Claude Code is *translated* onto a
   GPT model; here, an already-OpenAI-shaped request from the real Codex CLI is relayed as-is
-  to a codex-kind Profile's own credential.
-- When no codex-kind Profile can serve it — none configured, none enabled, or all exhausted —
-  the request is refused with a clear error rather than silently falling through to a Claude
-  account, which could not answer it at all.
+  to a codex-kind Profile's own credential. "Unmodified" has exactly two named exceptions,
+  both about account-bound state (below): the **move strip** and the **one bounded retry**.
+  Outside those the body goes out byte-identical — it is never re-serialised unless one of
+  the two strips actually removed something.
+- **Session affinity.** The Codex CLI sends a `session-id` header (`thread-id` is the
+  fallback). The gateway keeps a bounded LRU map (4096 entries, in memory only) of session →
+  the codex Profile that last served it, recorded on every successful (`< 400`) serve. A
+  mapped session **stays** on its Profile while that Profile is enabled, codex-kind, not
+  already tried for this request, and ELIGIBLE or DRAINING — DRAINING keeps a session that is
+  already there, while a new session goes through `router.choose()`, which avoids DRAINING
+  whenever something better exists. It **moves** only when its Profile is EXHAUSTED,
+  AUTH_INVALID, COOLDOWN, disabled, removed, or failed earlier in the same request. A request
+  with no session header follows the ingress's single sticky pointer (next bullet). A pinned
+  session (`cu codex --account`) ignores the map entirely: it neither reads nor records it.
+- **Move strip.** Encrypted reasoning (`reasoning` input items carrying `encrypted_content`)
+  and `x-codex-turn-state` only work on the account that issued them. When a session is served
+  by a different Profile than the one it is mapped to, both are removed **before the first
+  upstream send**: the `x-codex-turn-state` header is dropped, a reasoning item whose only
+  payload is its encrypted content is dropped whole, and any other reasoning item just loses
+  its `encrypted_content` field. `compaction` items are kept — they hold the compacted
+  conversation. Separately, a turn-state whose issuing Profile is known and differs from the
+  one serving the request is dropped even without a mapped move.
+- **One bounded retry.** If the backend still answers 400 about encrypted content or
+  reasoning, the request is retried **once** on the same Profile without every `reasoning`
+  AND `compaction` item carrying `encrypted_content`, and without `x-codex-turn-state`. The
+  daemon log (stderr) says so, and says when compacted history was dropped.
+- **In-request failover.** Only status and headers have arrived when the gateway decides, so
+  no body byte has reached the client yet. When the request is not pinned and another codex
+  Profile can take it, a quota 429, any other 429, a 401, a 5xx/529 or a network failure moves
+  **this** request to the next codex Profile — at most `MAX_ROTATION_ATTEMPTS` (4) upstream
+  attempts in total. Every discarded upstream response is read (error bodies are small) and
+  its connection closed before the next attempt.
+- **Truthful terminal answer.** When attempts fail and nothing else can serve the request, the
+  client gets the **last upstream response itself** — its status, its allowlisted headers and
+  its body. A local refusal (an OpenAI-shaped error envelope) is only for a request no
+  upstream answered, and its status is picked for how the Codex CLI 0.144 reacts (it retries a
+  503 about 30 times, and shows a 400 or a 429 once):
+
+  | Situation (no upstream answered) | Status |
+  |---|---|
+  | No codex Profile can ever serve it: none enabled, pinned to a non-codex or missing Profile, pinned Profile disabled or needing re-auth, or every enabled one needs re-auth or is manual | `400` |
+  | Every codex candidate is EXHAUSTED or DRAINING (out of quota) | `429` + `Retry-After` when known |
+  | A candidate is only cooling down (COOLDOWN), or a stored credential could not be read | `503` + `Retry-After` when known — never `429` |
+  | The last attempt could not reach OpenAI at all | `502` |
+
+  A refused Codex request never falls through to a Claude account, which could not answer it.
+- **No keep-alive.** Unlike a streaming `/v1/messages` call, `/v1/responses` never goes
+  through the daemon's SSE keep-alive (`_serve_with_keepalive`). The Codex CLI talks to
+  chatgpt.com directly with the same latency and needs no pings, and a keep-alive commits to
+  `200` before the upstream answers — losing the real status and the upstream headers
+  (`x-codex-turn-state`, the rate limits). The response is written with the real upstream
+  status and headers.
+- **Allowlists.** Request headers forwarded upstream are only `accept`, `content-type`,
+  `originator`, `user-agent`, `session-id`, `session_id`, `thread-id`,
+  `x-client-request-id`, `openai-beta`, `version`, `x-openai-subagent`, and any `x-codex-*` or
+  `x-openai-internal-codex-*` header; the daemon then sets `Authorization`,
+  `ChatGPT-Account-ID` (subscription), `Content-Length` and `Accept-Encoding: identity`.
+  Response headers relayed to the client are only `content-type`, `retry-after`,
+  `x-request-id`, `openai-model`, `openai-processing-ms`, and any `x-codex-*` or
+  `x-ratelimit-*` header.
 - This ingress keeps its **own sticky account pointer**, separate from the shared Claude Code
   rotation pointer (`current_profile_id`; see "Branches" above). Codex CLI traffic routing
   among codex-kind Profiles never moves that pointer, the same way branch-pinned traffic
-  already doesn't.
+  already doesn't. The ingress pointer is where a new session (or a request with no session
+  header) goes; a session kept on its own account by affinity does not move it.
 - Rotation and quota observation reuse `openai_observation.py` unchanged — the same
   usage-header parsing a translated `codex`-kind response already goes through.
 

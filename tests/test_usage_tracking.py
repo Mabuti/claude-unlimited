@@ -174,3 +174,27 @@ def test_non_streaming_anthropic_body_is_still_taken_verbatim():
     b"".join(capture.wrap(iter([body]), "application/json"))
 
     assert capture.usage == usage
+
+
+# ---- CRLF-framed streams (the SSE spec allows them; a proxy may rewrite to them) ----
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 7, 4096])
+def test_crlf_framed_anthropic_stream_still_records_usage(chunk_size):
+    crlf = REAL_SHAPED_SSE.replace(b"\n", b"\r\n")
+    capture = usage_tracking.UsageCapture()
+    forwarded = b"".join(capture.wrap(_chunks_of(crlf, chunk_size), "text/event-stream"))
+
+    assert forwarded == crlf                      # relayed bytes are untouched
+    assert capture.model == "claude-haiku-4-5-20251001"
+    assert capture.usage["output_tokens"] == 10
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 4096])
+def test_crlf_framed_responses_stream_still_records_usage(chunk_size):
+    crlf = _responses_sse("response.completed").replace(b"\n", b"\r\n")
+    capture = usage_tracking.UsageCapture()
+    forwarded = b"".join(capture.wrap(_chunks_of(crlf, chunk_size), "text/event-stream"))
+
+    assert forwarded == crlf
+    assert capture.model == "gpt-5.6-sol"
+    assert capture.usage == MAPPED_USAGE

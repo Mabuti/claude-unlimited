@@ -76,6 +76,14 @@ class UsageCapture:
 
     def _feed_sse(self, chunk: bytes) -> None:
         self._sse_buffer += chunk
+        # SSE allows CRLF line endings, and "\r\n\r\n" contains no "\n\n":
+        # without this a CRLF-framed stream never yields a single event and
+        # its usage is silently lost. Only this private copy is rewritten --
+        # the relayed bytes are the untouched `chunk`. A CR left dangling at
+        # the end of the buffer pairs with the next chunk's LF on the next
+        # call, because the whole buffer is normalised each time.
+        if b"\r\n" in self._sse_buffer:
+            self._sse_buffer = self._sse_buffer.replace(b"\r\n", b"\n")
         while b"\n\n" in self._sse_buffer:
             event_block, self._sse_buffer = self._sse_buffer.split(b"\n\n", 1)
             self._parse_sse_event(event_block)
