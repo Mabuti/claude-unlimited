@@ -198,3 +198,28 @@ def test_crlf_framed_responses_stream_still_records_usage(chunk_size):
     assert forwarded == crlf
     assert capture.model == "gpt-5.6-sol"
     assert capture.usage == MAPPED_USAGE
+
+
+# The ChatGPT Codex backend streams SSE with no Content-Type header at all
+# (measured live against chatgpt.com, 2026-09-25), so every real `cu codex`
+# turn used to be parsed as JSON and record nothing.
+@pytest.mark.parametrize("chunk_size", [1, 7, 4096])
+def test_responses_stream_without_a_content_type_still_records_usage(chunk_size):
+    body = _responses_sse("response.completed")
+    capture = usage_tracking.UsageCapture()
+    forwarded = b"".join(capture.wrap(_chunks_of(body, chunk_size), None))
+
+    assert forwarded == body
+    assert capture.model == "gpt-5.6-sol"
+    assert capture.usage == MAPPED_USAGE
+
+
+def test_json_body_without_a_content_type_is_still_parsed_as_json():
+    body = json.dumps({"model": "claude-haiku-4-5",
+                       "usage": {"input_tokens": 3, "output_tokens": 4}}).encode()
+    capture = usage_tracking.UsageCapture()
+    forwarded = b"".join(capture.wrap(iter([body]), None))
+
+    assert forwarded == body
+    assert capture.model == "claude-haiku-4-5"
+    assert capture.usage["output_tokens"] == 4

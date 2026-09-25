@@ -47,6 +47,15 @@ from typing import Iterator, Optional
 _JSON_BODY_CAP_BYTES = 5_000_000  # give up buffering non-streaming bodies larger than this
 
 
+_SNIFF_SKIP = b"\xef\xbb\xbf \t\r\n"
+_SNIFF_BYTES = 8  # enough to tell "event:"/"data:"/"retry:" from a JSON body
+
+
+def _looks_like_sse(head: bytes) -> bool:
+    head = head.lstrip(_SNIFF_SKIP)
+    return head.startswith((b"event:", b"data:", b"id:", b"retry:", b":"))
+
+
 class UsageCapture:
     def __init__(self) -> None:
         self.model: Optional[str] = None
@@ -56,16 +65,44 @@ class UsageCapture:
         self._json_buffer_capped = False
 
     def wrap(self, chunks: Iterator[bytes], content_type: Optional[str]) -> Iterator[bytes]:
-        is_sse = "text/event-stream" in (content_type or "")
+        # The ChatGPT Codex backend streams its SSE with NO Content-Type
+        # header at all (measured live, 2026-09-25), which used to send every
+        # real `cu codex` response down the JSON path and record no usage.
+        # With no declared type, decide from the first non-empty chunk: an SSE
+        # body opens with a field ("event:", "data:", "id:", "retry:") or a
+        # ":" comment line, a JSON body never does.
+        # Undecided bytes are only held for PARSING; every chunk is still
+        # forwarded the moment it arrives.
+        is_sse: Optional[bool] = ("text/event-stream" in content_type) if content_type else None
+        undecided = b""
         for chunk in chunks:
+            to_parse = chunk
+            if is_sse is None:
+                undecided += chunk
+                head = undecided.lstrip(_SNIFF_SKIP)
+                if len(head) < _SNIFF_BYTES and b"\n" not in head:
+                    yield chunk
+                    continue
+                is_sse = _looks_like_sse(undecided)
+                to_parse, undecided = undecided, b""
             try:
                 if is_sse:
-                    self._feed_sse(chunk)
+                    self._feed_sse(to_parse)
                 else:
-                    self._feed_json(chunk)
+                    self._feed_json(to_parse)
             except Exception:
                 pass  # capture must never affect forwarding
             yield chunk
+        if is_sse is None and undecided:
+            # A body shorter than the sniff window: decide on what there is.
+            is_sse = _looks_like_sse(undecided)
+            try:
+                if is_sse:
+                    self._feed_sse(undecided)
+                else:
+                    self._feed_json(undecided)
+            except Exception:
+                pass
         if not is_sse:
             try:
                 self._finalize_json()
