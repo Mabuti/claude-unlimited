@@ -202,7 +202,7 @@ def _drain(result):
     ("POST", "/v1/responses/compact", True),
     ("POST", "/v1/responses?x=1", True),
     ("POST", "/v1/responses/", True),
-    ("GET", "/v1/responses", False),
+    ("GET", "/v1/responses", True),       # claimed so it is answered 405 locally, never forwarded
     ("POST", "/v1/responsesx", False),
     ("POST", "/v1/messages", False),
     ("POST", "/backend-api/codex/responses", False),
@@ -1006,34 +1006,36 @@ def test_the_last_upstream_answer_wins_over_a_later_network_failure(pool_env, mo
     assert gw.serving_now_ids() == set()
 
 
-def test_a_single_account_5xx_is_relayed_and_the_next_try_gets_a_503_not_a_429(pool_env, monkeypatch):
+def test_a_single_account_5xx_is_relayed_and_the_next_try_is_a_last_resort_attempt_not_a_429(pool_env,
+                                                                                          monkeypatch):
     save_pool(Pool(profiles=[_codex("c1")]))
-    up = Upstream(monkeypatch, {"tok-c1": [_status(503, body=b"overloaded")]})
+    up = Upstream(monkeypatch, {"tok-c1": [_status(503, body=b"overloaded"), _status(503, body=b"still")]})
     gw = Gateway(transport=_no_transport)
 
     first = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
     assert first.status == 503 and first.error is None
     assert _drain(first) == b"overloaded"
 
+    # The account is cooling down and nothing else can serve: it gets one
+    # last-resort attempt, and its real answer is relayed (never a 429).
     again = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
-    assert again.status == 503
-    assert again.error == gateway_module.OPENAI_ERROR_CODEX_UNAVAILABLE
-    assert int(again.headers["retry-after"]) >= 1
-    assert len(up.requests) == 1
+    assert again.status == 503 and again.error is None
+    assert _drain(again) == b"still"
+    assert len(up.requests) == 2
 
 
-def test_an_account_that_is_only_cooling_down_is_a_503_with_retry_after(pool_env, monkeypatch):
+def test_an_account_that_is_only_cooling_down_gets_one_last_resort_attempt(pool_env, monkeypatch):
     save_pool(Pool(profiles=[_codex("c1"), _codex("c2", priority=2)]))
-    up = Upstream(monkeypatch, {})
+    up = Upstream(monkeypatch, {"tok-c1": [_ok_no_usage()], "tok-c2": []})
     gw = Gateway(transport=_no_transport)
     _set_state(gw, "c1", ProfileState.COOLDOWN, cooldown_until=_in(0.5))
     _set_state(gw, "c2", ProfileState.EXHAUSTED, resets_at=_in(60))
 
     result = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
 
-    _assert_refused_without_attempt(result, up, status=503)
-    assert result.error == gateway_module.OPENAI_ERROR_CODEX_UNAVAILABLE
-    assert 1 <= int(result.headers["retry-after"]) <= 30
+    assert result.status == 200 and result.error is None and result.profile_id == "c1"
+    _drain(result)
+    assert _tokens(up) == ["tok-c1"]            # never the EXHAUSTED one
 
 
 def test_a_credential_read_failure_is_a_503_not_a_429(pool_env, monkeypatch):

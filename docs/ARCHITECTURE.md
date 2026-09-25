@@ -111,13 +111,20 @@ Profile and an import is blocked; neither overwrites.
 anywhere under `CODEX_HOME`), so a second, differently-shaped request arrives alongside the
 Anthropic-shaped one "How a request flows" describes above:
 
-- `POST /v1/responses` (and `/v1/responses/*`) is recognised **by path**, not by any header
-  or body sniffing — the **percent-decoded** path, query stripped, so `/v1/responses%2Fcompact`
-  or a double-encoded variant can never fall through to the Anthropic gateway and a Claude
-  account. Only two suffixes are relayed, judged after one round of decoding: none, and
-  `/compact` (one trailing slash is ignored). Any other `/v1/responses/*` path, or one that
-  needs a second round of decoding, is refused locally with a 400 and never reaches an
-  upstream — the Codex CLI sends nothing else. Only the decoded suffix is ever forwarded.
+- `/v1/responses` (and `/v1/responses/*`) is recognised **by path**, not by any header or
+  body sniffing, and for **every method** — on a **normalised** path, so no spelling of it can
+  fall through to the Anthropic gateway and a Claude account: query and fragment stripped
+  (a percent-encoded `?` or `#` as well), percent-decoded repeatedly until it stops changing,
+  `//` collapsed, `.`/`..` segments resolved, and `/v1/responses` matched regardless of case.
+  A path containing a NUL or any other control character is claimed too. Anything claimed is
+  then judged strictly: only `POST` is served (any other method gets a local `405` with
+  `Allow: POST`), and only two suffixes are relayed, judged after one round of decoding: none,
+  and `/compact` (one trailing slash is ignored). Any other suffix, a path that needs a
+  second round of decoding, a control character, or a non-canonical spelling (`/v1//responses`,
+  `/v1/./responses`) is refused locally with a 400 and never reaches an upstream — the Codex
+  CLI sends nothing else. Only the decoded suffix is ever forwarded. The daemon classifies the
+  raw request target as well as its parsed path, because `urlparse()` reads a leading `//` as a
+  host (`//v1/responses` would otherwise arrive as `/responses`).
 - It is served **only by codex-kind Profiles**, and as an **unmodified passthrough** — no
   translation, no model mapping. This is the opposite direction from the `codex` case in "How
   a request flows": there, a Claude-shaped request from Claude Code is *translated* onto a
@@ -125,10 +132,14 @@ Anthropic-shaped one "How a request flows" describes above:
   to a codex-kind Profile's own credential. "Unmodified" has exactly two named exceptions,
   both about account-bound state (below): the **move strip** and the **one bounded retry**.
   Outside those the body goes out byte-identical — it is never re-serialised unless one of
-  the two strips actually removed something.
+  the two strips actually removed something. When one did, the **whole** JSON body is
+  re-serialised: semantically identical, but number and string-escape formatting may differ
+  from what the Codex CLI sent (`1e-7` becomes `1e-07`, `\u00e9` becomes a literal `é`).
 - **Session affinity.** The Codex CLI sends a `session-id` header (`thread-id` is the
   fallback). The gateway keeps a bounded LRU map (4096 entries, in memory only) of session →
-  the codex Profile that last served it, recorded on every successful (`< 400`) serve. A
+  the codex Profile that last served it — keyed by the id itself when it is at most 64
+  characters, otherwise by `sha256:` + the SHA-256 of the whole id, so an entry stays small and
+  two long ids that share a prefix never share an entry — recorded on every successful (`< 400`) serve. A
   mapped session **stays** on its Profile while that Profile is enabled, codex-kind, not
   already tried for this request, and ELIGIBLE or DRAINING — DRAINING keeps a session that is
   already there, while a new session goes through `router.choose()`, which avoids DRAINING
@@ -170,18 +181,35 @@ Anthropic-shaped one "How a request flows" describes above:
   the Codex CLI's own reconnect lands on another account instead of the same sticky one. A
   clean end, or a failure after the terminal event, cools nothing; nor does a pinned session,
   which could not land anywhere else.
+- **Last-resort attempt on a cooling account.** The Codex CLI retries a 503 about 30 times over
+  roughly 24 seconds and ignores `Retry-After`, while a first cooldown is 30 seconds and
+  doubles. So with one codex account, a single transient break (a mid-stream failure, an
+  unmapped 5xx, a network error) would otherwise turn every retry of the next turn into a local
+  503 until the CLI gave up. Instead, when nothing ELIGIBLE (or DRAINING, for a session already
+  there) can take the request but an enabled codex candidate is in COOLDOWN, the request makes
+  **one** last-resort attempt on the COOLDOWN candidate whose cooldown ends soonest (never one
+  already tried in this request) and relays that account's real answer — success or failure; a
+  failure is observed as usual and extends the cooldown. A pinned request whose account is only
+  cooling down is likewise tried. EXHAUSTED, AUTH_INVALID and disabled accounts are never
+  tried this way. The cooldown bookkeeping itself is unchanged: it still steers rotation away
+  from the account whenever another one can serve.
 - **Truthful terminal answer.** When attempts fail and nothing else can serve the request, the
   client gets the **last upstream response itself** — its status, its allowlisted headers and
   its body. A local refusal (an OpenAI-shaped error envelope) is only for a request no
   upstream answered, and its status is picked for how the Codex CLI 0.144 reacts (it retries a
-  503 about 30 times, and shows a 400 or a 429 once):
+  5xx — a 503 about 30 times — and shows a 400, 405 or 429 once):
 
   | Situation (no upstream answered) | Status |
   |---|---|
+  | Not a `POST` (e.g. `GET /v1/responses/{id}`) — no upstream attempt at all | `405` + `Allow: POST` |
+  | A path or suffix that is not relayed, or a body over the size cap | `400` |
   | No codex Profile can ever serve it: none enabled, pinned to a non-codex or missing Profile, pinned Profile disabled or needing re-auth, or every enabled one needs re-auth or is manual | `400` |
   | Every codex candidate is EXHAUSTED or DRAINING (out of quota) | `429` + `Retry-After` when known |
-  | A candidate is only cooling down (COOLDOWN), or a stored credential could not be read | `503` + `Retry-After` when known — never `429` |
-  | The last attempt could not reach OpenAI at all | `502` |
+  | A stored credential could not be read, or no attempt was possible at all (e.g. the only cooling candidate was already tried in this request) | `503` + `Retry-After` when known — never `429` |
+  | Every attempt made failed to connect (network error, TLS, timeout) — including a last-resort attempt on a cooling account | `502` — a 5xx, so the Codex CLI retries it |
+
+  A candidate that is only cooling down no longer earns a local `503` by itself: it gets the
+  last-resort attempt above, whose real answer is relayed.
 
   A refused Codex request never falls through to a Claude account, which could not answer it.
 - **No keep-alive.** Unlike a streaming `/v1/messages` call, `/v1/responses` never goes

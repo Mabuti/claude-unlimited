@@ -19,6 +19,7 @@ underneath it.
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import itertools
 import json
@@ -159,9 +160,12 @@ _OPENAI_INGRESS_MAX_BODY_BYTES = 20_000_000
 _TURN_STATE_MEMORY = 2048
 # How many Codex CLI sessions to remember the serving Profile of (LRU).
 _OPENAI_SESSION_MEMORY = 4096
-# A session key longer than this is truncated before it is remembered, so a
-# client cannot make one map entry arbitrarily large.
-_OPENAI_SESSION_KEY_MAX_CHARS = 200
+# A session id longer than this is remembered by its SHA-256 digest
+# ("sha256:<hex>", 71 characters) instead of verbatim, so a client cannot
+# make one map entry arbitrarily large and two long ids that share a prefix
+# still never share an entry. A verbatim key is at most this long, so it can
+# never equal a digest key.
+_OPENAI_SESSION_KEY_VERBATIM_MAX_CHARS = 64
 # Runtime states a Codex session may STAY on. DRAINING keeps a session that is
 # already there (moving it would cost its account-bound state); a new session
 # goes through router.choose(), which avoids DRAINING while anything better
@@ -176,6 +180,7 @@ OPENAI_ERROR_CODEX_EXHAUSTED = "openai_codex_exhausted"
 OPENAI_ERROR_CODEX_UNAVAILABLE = "openai_codex_temporarily_unavailable"
 OPENAI_ERROR_PINNED_UNUSABLE = "openai_pinned_profile_unusable"
 OPENAI_ERROR_UPSTREAM_UNREACHABLE = "openai_upstream_unreachable"
+OPENAI_ERROR_METHOD_NOT_ALLOWED = "openai_method_not_allowed"
 
 _MESSAGE_NO_CODEX_PROFILE = (
     "No enabled Codex/ChatGPT account is available in Claude Unlimited. "
@@ -196,27 +201,70 @@ _OPENAI_RELAYED_RESPONSE_HEADER_PREFIXES = ("x-codex-", "x-ratelimit-")
 _OPENAI_INGRESS_MAX_DECODE_ROUNDS = 8
 
 
-def _is_responses_route(route: str) -> bool:
+def _strip_query(route: str) -> str:
+    """The path part of a request target: everything before its first `?`
+    or `#` (a query or a fragment)."""
+    for marker in ("?", "#"):
+        route = route.split(marker, 1)[0]
+    return route
+
+
+def _has_control_character(route: str) -> bool:
+    return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in route)
+
+
+def _normalised_route(route: str) -> str:
+    """`route` read the way a lenient server might: empty segments (`//`)
+    and `.` collapsed, `..` resolved (never above the root), no trailing
+    slash."""
+    segments: list[str] = []
+    for segment in route.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if segments:
+                segments.pop()
+            continue
+        segments.append(segment)
+    return "/" + "/".join(segments)
+
+
+def _responses_suffix(route: str) -> Optional[str]:
+    """What follows /v1/responses in `route` ("" for the route itself), the
+    base matched case-insensitively; None when `route` is neither
+    /v1/responses nor below it."""
     base = wire_formats.OPENAI_RESPONSES_INGRESS_PATH
-    return route == base or route.startswith(base + "/")
+    if len(route) == len(base) and route.lower() == base:
+        return ""
+    if route[:len(base) + 1].lower() == base + "/":
+        return route[len(base):]
+    return None
+
+
+def _is_responses_route(route: str) -> bool:
+    return _responses_suffix(route) is not None or _responses_suffix(_normalised_route(route)) is not None
 
 
 def is_openai_ingress(method: str, path: str) -> bool:
-    """Whether this request is the Codex CLI's OpenAI Responses call.
+    """Whether this request belongs to the Codex CLI's OpenAI Responses
+    ingress — for ANY method: a non-POST is answered there with a local 405,
+    never forwarded to the Anthropic gateway.
 
-    Decided on the PERCENT-DECODED path (query stripped first), decoded
-    repeatedly until it stops changing: `/v1/responses%2Fcompact` or a
-    double-encoded variant must never fall through to the Anthropic gateway,
-    where a Claude account's credential would be sent with it. Whether the
-    suffix is one that may be relayed is decided afterwards, strictly, by
-    _handle_openai_ingress (which refuses anything else locally)."""
-    if method != "POST":
-        return False
-    route = path.split("?", 1)[0]
+    Decided on a NORMALISED path, so no spelling of /v1/responses can fall
+    through to the Anthropic gateway, where a Claude account's credential
+    would be sent with it: query and fragment stripped (a percent-encoded
+    `?` or `#` too), percent-decoded repeatedly until it stops changing,
+    `//` and `.`/`..` segments collapsed, and the base matched without
+    regard to case. Every stage is checked, raw and normalised. A path with
+    a NUL or any other control character in it is claimed as well, so it is
+    refused locally rather than relayed anywhere. Which suffixes are
+    actually served is decided afterwards, strictly, by
+    _handle_openai_ingress (which refuses everything else locally)."""
+    route = _strip_query(path)
     for _ in range(_OPENAI_INGRESS_MAX_DECODE_ROUNDS):
-        if _is_responses_route(route):
+        if _has_control_character(route) or _is_responses_route(route):
             return True
-        decoded = unquote(route)
+        decoded = _strip_query(unquote(route))
         if decoded == route:
             return False
         route = decoded
@@ -240,11 +288,16 @@ def _openai_client_headers(headers: dict) -> dict:
 def _openai_session_key(headers: dict) -> Optional[str]:
     """Which Codex CLI session a request belongs to: its session-id header
     (session_id, as older versions spelled it), else thread-id. None when it
-    sent neither: that request follows the ingress's single sticky pointer."""
+    sent neither: that request follows the ingress's single sticky pointer.
+    A long id is keyed by a digest of the WHOLE id, never a truncation of it
+    (see _OPENAI_SESSION_KEY_VERBATIM_MAX_CHARS)."""
     for name in ("session-id", "session_id", "thread-id"):
         value = _header_value(headers, name)
         if value is not None and str(value).strip():
-            return str(value).strip()[:_OPENAI_SESSION_KEY_MAX_CHARS]
+            key = str(value).strip()
+            if len(key) <= _OPENAI_SESSION_KEY_VERBATIM_MAX_CHARS:
+                return key
+            return "sha256:" + hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest()
     return None
 
 
@@ -1733,75 +1786,48 @@ class Gateway:
             # sessions each pinned to a different one).
             with self._lock:
                 self._mark_profile_busy(profile.id)
-
+            # From here the slot is released exactly once: at an exit that
+            # abandons the attempt, by the handler below for an unexpected
+            # exception (a failed _persist, activity write, notification, ...)
+            # or, once handed over, by the response body. Without the handler
+            # such an exception leaked the slot for good — the count never
+            # returned to 0, so "Used now" and the idle check stayed wedged.
+            slot_held = True
+            attempt_resp: Optional[UpstreamResponse] = None
             try:
-                resp: UpstreamResponse = self._transport(upstream_req)
-            except (OSError, http.client.HTTPException):
-                # http.client.HTTPException is NOT an OSError, so catching
-                # only OSError missed a whole real class of transport failure:
-                # BadStatusLine and IncompleteRead from a proxy or middlebox
-                # returning a malformed response. Those escaped handle()
-                # entirely — the client got a dropped connection with no HTTP
-                # status, and the Profile's in-flight slot leaked, which pins
-                # "Used now" on forever and wedges the idle check the updater
-                # waits for.
-                #
-                # Real network failure reaching this Profile's upstream
-                # (timeout, DNS, connection refused, TLS) — not a quota
-                # problem. Same handling as a 503/529 ProviderUnavailable
-                # response: brief cooldown, try the next eligible Profile.
-                # Previously unhandled here, this could crash the request
-                # thread with no HTTP response at all (daemon.py's proxy
-                # handler has no guard around Gateway.handle() either).
-                # One lock for both: _observe read-modify-writes self._runtime,
-                # so doing it unlocked let a concurrent request's completed
-                # observation be overwritten by this thread's stale snapshot —
-                # silently reviving a Profile another thread had just learned
-                # was out of quota.
-                with self._lock:
-                    self._mark_profile_idle(profile.id)
-                    self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
-                if forced_profile_id is not None:
-                    # No other Profile to fall back to when pinned — fail
-                    # the request clearly instead of a pointless immediate
-                    # retry of the same unreachable upstream.
-                    activity.record("error", f"{profile.name} — could not reach upstream",
-                                     meta="pinned profile, not rotating")
-                    return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
-                                          error="upstream_unreachable")
-                activity.record("error", f"{profile.name} — could not reach upstream",
-                                 meta="network error, rotating to next eligible profile")
-                continue
-            except BaseException:
-                # Anything else is a bug, and should surface as one — but not
-                # while silently leaking this Profile's in-flight slot, which
-                # nothing else would ever clear.
-                with self._lock:
-                    self._mark_profile_idle(profile.id)
-                raise
-
-            observation = classify(resp.status, filter_response_headers(resp.headers), now)
-
-            if (profile.kind == "api" and profile.default_model
-                    and isinstance(observation, Unknown) and observation.status_code in _MODEL_FALLBACK_STATUS_CODES):
-                # Read the (small) error body to tell "model not found" from
-                # everything else a 400 can mean. A "prompt is too long" 400
-                # used to be taken for a model refusal: it retried with the
-                # default model, logged "<model> unavailable", and remembered
-                # the model as refused — which, with a forced model, would move
-                # every later request off it for good after one large prompt.
                 try:
-                    error_body, resp = _peek_error_body(resp)
+                    resp: UpstreamResponse = self._transport(upstream_req)
+                    attempt_resp = resp
                 except (OSError, http.client.HTTPException):
-                    # The connection dropped while the error body was read —
-                    # the same failure as one before the headers: release
-                    # the slot, cool the Profile down, rotate (or fail, when
-                    # pinned) exactly as the network-error branch above does.
-                    resp.connection.close()
+                    # http.client.HTTPException is NOT an OSError, so catching
+                    # only OSError missed a whole real class of transport failure:
+                    # BadStatusLine and IncompleteRead from a proxy or middlebox
+                    # returning a malformed response. Those escaped handle()
+                    # entirely — the client got a dropped connection with no HTTP
+                    # status, and the Profile's in-flight slot leaked, which pins
+                    # "Used now" on forever and wedges the idle check the updater
+                    # waits for.
+                    #
+                    # Real network failure reaching this Profile's upstream
+                    # (timeout, DNS, connection refused, TLS) — not a quota
+                    # problem. Same handling as a 503/529 ProviderUnavailable
+                    # response: brief cooldown, try the next eligible Profile.
+                    # Previously unhandled here, this could crash the request
+                    # thread with no HTTP response at all (daemon.py's proxy
+                    # handler has no guard around Gateway.handle() either).
+                    # One lock for both: _observe read-modify-writes self._runtime,
+                    # so doing it unlocked let a concurrent request's completed
+                    # observation be overwritten by this thread's stale snapshot —
+                    # silently reviving a Profile another thread had just learned
+                    # was out of quota.
                     with self._lock:
                         self._mark_profile_idle(profile.id)
+                        slot_held = False
                         self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
                     if forced_profile_id is not None:
+                        # No other Profile to fall back to when pinned — fail
+                        # the request clearly instead of a pointless immediate
+                        # retry of the same unreachable upstream.
                         activity.record("error", f"{profile.name} — could not reach upstream",
                                          meta="pinned profile, not rotating")
                         return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
@@ -1809,129 +1835,181 @@ class Gateway:
                     activity.record("error", f"{profile.name} — could not reach upstream",
                                      meta="network error, rotating to next eligible profile")
                     continue
-                if _is_model_refusal(observation.status_code, error_body):
-                    self._remember_rejected_model(profile, request_model(eco_body))
-                    retried = self._maybe_retry_with_default_model(
-                        profile, credential, method, path, headers, eco_body, now,
-                        parity=pool.settings.model_parity)
-                    if retried is not None:
-                        resp.connection.close()  # the first attempt's response is being discarded
-                        resp, observation = retried
-
-            old_rt = self._runtime.get(profile.id)
-            old_state = old_rt.state if old_rt is not None else None
-            with self._lock:
-                self._observe(profile.id, observation, now)
-            self._maybe_request_usage_recheck(profile.id, observation)
-            new_rt = self._runtime.get(profile.id)
-            self._persist()
-
-            if isinstance(observation, AuthInvalid) and old_state != ProfileState.AUTH_INVALID:
-                activity.record("error", f"{profile.name} needs re-authentication", meta="credential rejected")
-                notifications.notify_if_enabled("needs_attention", "Claude Unlimited",
-                                                  f"{profile.name} needs re-authentication.", pool.settings)
-
-            if isinstance(observation, UsageSnapshot) and new_rt is not None and new_rt.state == ProfileState.ELIGIBLE:
-                near_threshold = observation.percent >= new_rt.switch_threshold - APPROACHING_THRESHOLD_BAND
-                if near_threshold and profile.id not in self._warned_approaching:
-                    self._warned_approaching.add(profile.id)
-                    notifications.notify_if_enabled(
-                        "approaching_threshold", "Claude Unlimited",
-                        f"{profile.name} is approaching its switch threshold "
-                        f"({observation.percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
-                elif not near_threshold:
-                    self._warned_approaching.discard(profile.id)
-
-            if isinstance(observation, QuotaExhausted):
-                if forced_profile_id is not None:
-                    # No other Profile to fall back to when pinned — relay
-                    # Anthropic's real quota-exhausted response as-is
-                    # instead of rotating away from the one Profile the
-                    # user explicitly chose for this terminal.
-                    activity.record("rotation", f"{profile.name} hit its quota",
-                                     meta="pinned profile — returning the real response, not rotating")
-                else:
-                    # Headers/status only have arrived so far — no body
-                    # byte has reached the caller yet. Safe to retry on the
-                    # next profile.
+                except BaseException:
+                    # Anything else is a bug, and should surface as one — but not
+                    # while silently leaking this Profile's in-flight slot, which
+                    # nothing else would ever clear.
                     with self._lock:
                         self._mark_profile_idle(profile.id)
+                        slot_held = False
+                    raise
+
+                observation = classify(resp.status, filter_response_headers(resp.headers), now)
+
+                if (profile.kind == "api" and profile.default_model
+                        and isinstance(observation, Unknown) and observation.status_code in _MODEL_FALLBACK_STATUS_CODES):
+                    # Read the (small) error body to tell "model not found" from
+                    # everything else a 400 can mean. A "prompt is too long" 400
+                    # used to be taken for a model refusal: it retried with the
+                    # default model, logged "<model> unavailable", and remembered
+                    # the model as refused — which, with a forced model, would move
+                    # every later request off it for good after one large prompt.
+                    try:
+                        error_body, resp = _peek_error_body(resp)
+                        attempt_resp = resp
+                    except (OSError, http.client.HTTPException):
+                        # The connection dropped while the error body was read —
+                        # the same failure as one before the headers: release
+                        # the slot, cool the Profile down, rotate (or fail, when
+                        # pinned) exactly as the network-error branch above does.
+                        resp.connection.close()
+                        with self._lock:
+                            self._mark_profile_idle(profile.id)
+                            slot_held = False
+                            self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
+                        if forced_profile_id is not None:
+                            activity.record("error", f"{profile.name} — could not reach upstream",
+                                             meta="pinned profile, not rotating")
+                            return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
+                                                  error="upstream_unreachable")
+                        activity.record("error", f"{profile.name} — could not reach upstream",
+                                         meta="network error, rotating to next eligible profile")
+                        continue
+                    if _is_model_refusal(observation.status_code, error_body):
+                        self._remember_rejected_model(profile, request_model(eco_body))
+                        retried = self._maybe_retry_with_default_model(
+                            profile, credential, method, path, headers, eco_body, now,
+                            parity=pool.settings.model_parity)
+                        if retried is not None:
+                            resp.connection.close()  # the first attempt's response is being discarded
+                            resp, observation = retried
+                            attempt_resp = resp
+
+                old_rt = self._runtime.get(profile.id)
+                old_state = old_rt.state if old_rt is not None else None
+                with self._lock:
+                    self._observe(profile.id, observation, now)
+                self._maybe_request_usage_recheck(profile.id, observation)
+                new_rt = self._runtime.get(profile.id)
+                self._persist()
+
+                if isinstance(observation, AuthInvalid) and old_state != ProfileState.AUTH_INVALID:
+                    activity.record("error", f"{profile.name} needs re-authentication", meta="credential rejected")
+                    notifications.notify_if_enabled("needs_attention", "Claude Unlimited",
+                                                      f"{profile.name} needs re-authentication.", pool.settings)
+
+                if isinstance(observation, UsageSnapshot) and new_rt is not None and new_rt.state == ProfileState.ELIGIBLE:
+                    near_threshold = observation.percent >= new_rt.switch_threshold - APPROACHING_THRESHOLD_BAND
+                    if near_threshold and profile.id not in self._warned_approaching:
+                        self._warned_approaching.add(profile.id)
+                        notifications.notify_if_enabled(
+                            "approaching_threshold", "Claude Unlimited",
+                            f"{profile.name} is approaching its switch threshold "
+                            f"({observation.percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
+                    elif not near_threshold:
+                        self._warned_approaching.discard(profile.id)
+
+                if isinstance(observation, QuotaExhausted):
+                    if forced_profile_id is not None:
+                        # No other Profile to fall back to when pinned — relay
+                        # Anthropic's real quota-exhausted response as-is
+                        # instead of rotating away from the one Profile the
+                        # user explicitly chose for this terminal.
+                        activity.record("rotation", f"{profile.name} hit its quota",
+                                         meta="pinned profile — returning the real response, not rotating")
+                    else:
+                        # Headers/status only have arrived so far — no body
+                        # byte has reached the caller yet. Safe to retry on the
+                        # next profile.
+                        with self._lock:
+                            self._mark_profile_idle(profile.id)
+                            slot_held = False
+                        resp.connection.close()
+                        activity.record("rotation", f"{profile.name} hit its quota", meta="rotating to next eligible profile")
+                        continue
+
+                if (isinstance(observation, Unknown) and observation.status_code == 429
+                        and forced_profile_id is None
+                        and transient_failovers < _MAX_TRANSIENT_FAILOVERS_PER_REQUEST
+                        and choose(snapshot, now, fit=fit, exclude=attempted).profile_id is not None):
+                    # A 429 that classify() judged NOT to be about this
+                    # account's quota (see observation.classify) deliberately
+                    # leaves Router state alone, so this Profile is never
+                    # benched for it. That fixes the 30-minute bench on a
+                    # healthy account -- but on its own it would mean a
+                    # persistently-degraded Profile swallows every one of the
+                    # client's retries and never fails over, which is strictly
+                    # worse than the behaviour it replaced. So: do not bench
+                    # it, but do move THIS request on to the next untried
+                    # Profile. Only headers/status have arrived, no body byte
+                    # has reached the caller, so retrying elsewhere is safe --
+                    # same reasoning as the QuotaExhausted rotation above.
+                    # When nothing else could serve it, fall through instead
+                    # and relay Anthropic's real response.
+                    retry_excluding_attempted = True
+                    transient_failovers += 1
+                    with self._lock:
+                        self._mark_profile_idle(profile.id)
+                        slot_held = False
                     resp.connection.close()
-                    activity.record("rotation", f"{profile.name} hit its quota", meta="rotating to next eligible profile")
+                    activity.record("rotation", f"{profile.name} returned a transient 429",
+                                     meta="not a quota signal — trying the next profile, not benching this one")
                     continue
 
-            if (isinstance(observation, Unknown) and observation.status_code == 429
-                    and forced_profile_id is None
-                    and transient_failovers < _MAX_TRANSIENT_FAILOVERS_PER_REQUEST
-                    and choose(snapshot, now, fit=fit, exclude=attempted).profile_id is not None):
-                # A 429 that classify() judged NOT to be about this
-                # account's quota (see observation.classify) deliberately
-                # leaves Router state alone, so this Profile is never
-                # benched for it. That fixes the 30-minute bench on a
-                # healthy account -- but on its own it would mean a
-                # persistently-degraded Profile swallows every one of the
-                # client's retries and never fails over, which is strictly
-                # worse than the behaviour it replaced. So: do not bench
-                # it, but do move THIS request on to the next untried
-                # Profile. Only headers/status have arrived, no body byte
-                # has reached the caller, so retrying elsewhere is safe --
-                # same reasoning as the QuotaExhausted rotation above.
-                # When nothing else could serve it, fall through instead
-                # and relay Anthropic's real response.
-                retry_excluding_attempted = True
-                transient_failovers += 1
-                with self._lock:
-                    self._mark_profile_idle(profile.id)
-                resp.connection.close()
-                activity.record("rotation", f"{profile.name} returned a transient 429",
-                                 meta="not a quota signal — trying the next profile, not benching this one")
-                continue
-
-            if forced_profile_id is None and not branch_routed:
-                # A pinned session's requests must never move the shared
-                # rotation pointer or fire a "Rotated" notification — other
-                # concurrent terminals may be relying on normal rotation at
-                # the exact same time (see handle()'s docstring). The same
-                # holds for a branch-routed request (a subagent on its own
-                # account): it speaks for ONE branch, not for the pool.
-                with self._lock:
-                    self._current_profile_id = profile.id
-                self._persist()
-                if previous_profile_id is not None and previous_profile_id != profile.id:
-                    self._announce_rotation(pool, previous_profile_id, profile, decision.reason)
-                    # A real rotation switch clears the PREVIOUS Profile's
-                    # "Used now" immediately rather than leaving it to
-                    # linger for the rest of _USED_NOW_GRACE_SECONDS — the
-                    # whole point of that grace window is to survive short
-                    # gaps BETWEEN requests on the same still-in-use
-                    # Profile, not to keep showing a Profile as active
-                    # after rotation has genuinely moved on from it. Safe
-                    # even if some other pinned session is concurrently
-                    # using previous_profile_id too: that session's own
-                    # in-flight marking (self._in_flight, not
-                    # self._last_active) is untouched by this, so
-                    # in_flight_ids() still reports it correctly.
+                if forced_profile_id is None and not branch_routed:
+                    # A pinned session's requests must never move the shared
+                    # rotation pointer or fire a "Rotated" notification — other
+                    # concurrent terminals may be relying on normal rotation at
+                    # the exact same time (see handle()'s docstring). The same
+                    # holds for a branch-routed request (a subagent on its own
+                    # account): it speaks for ONE branch, not for the pool.
                     with self._lock:
-                        self._last_active.pop(previous_profile_id, None)
+                        self._current_profile_id = profile.id
+                    self._persist()
+                    if previous_profile_id is not None and previous_profile_id != profile.id:
+                        self._announce_rotation(pool, previous_profile_id, profile, decision.reason)
+                        # A real rotation switch clears the PREVIOUS Profile's
+                        # "Used now" immediately rather than leaving it to
+                        # linger for the rest of _USED_NOW_GRACE_SECONDS — the
+                        # whole point of that grace window is to survive short
+                        # gaps BETWEEN requests on the same still-in-use
+                        # Profile, not to keep showing a Profile as active
+                        # after rotation has genuinely moved on from it. Safe
+                        # even if some other pinned session is concurrently
+                        # using previous_profile_id too: that session's own
+                        # in-flight marking (self._in_flight, not
+                        # self._last_active) is untouched by this, so
+                        # in_flight_ids() still reports it correctly.
+                        with self._lock:
+                            self._last_active.pop(previous_profile_id, None)
 
-            project_id = None
-            try:
-                session_id = project_attribution.session_id_from_headers(headers)
-                if session_id:
-                    project_id = project_attribution.resolve_project(session_id)
-                    if project_id:
-                        project_usage.record_request(project_id)
-            except Exception:
-                project_id = None  # best-effort attribution — must never affect a real request
+                project_id = None
+                try:
+                    session_id = project_attribution.session_id_from_headers(headers)
+                    if session_id:
+                        project_id = project_attribution.resolve_project(session_id)
+                        if project_id:
+                            project_usage.record_request(project_id)
+                except Exception:
+                    project_id = None  # best-effort attribution — must never affect a real request
 
-            body_chunks = self._wrap_with_usage_capture(resp.body_chunks, resp.headers, profile.id, project_id,
-                                                         eco_stats=eco_stats,
-                                                         sent_bytes=len(eco_body or body),
-                                                         quota_5h_percent=_anthropic_5h_percent(resp.headers))
-            body_chunks = self._wrap_with_in_flight_clear(body_chunks, profile.id,
-                                                          resp.body_chunks, resp.connection)
-            return GatewayResult(status=resp.status, headers=resp.headers, body_chunks=body_chunks,
-                                  profile_id=profile.id)
+                body_chunks = self._wrap_with_usage_capture(resp.body_chunks, resp.headers, profile.id, project_id,
+                                                             eco_stats=eco_stats,
+                                                             sent_bytes=len(eco_body or body),
+                                                             quota_5h_percent=_anthropic_5h_percent(resp.headers))
+                body_chunks = self._wrap_with_in_flight_clear(body_chunks, profile.id,
+                                                              resp.body_chunks, resp.connection)
+                # The body owns the slot and the upstream from here on.
+                slot_held, attempt_resp = False, None
+                return GatewayResult(status=resp.status, headers=resp.headers, body_chunks=body_chunks,
+                                      profile_id=profile.id)
+            except BaseException:
+                if slot_held:
+                    with self._lock:
+                        self._mark_profile_idle(profile.id)
+                if attempt_resp is not None:
+                    _close_all((attempt_resp.body_chunks, attempt_resp.connection))
+                raise
 
         activity.record("error", "Rotation attempts exhausted without a usable Profile")
         notifications.notify_if_enabled("needs_attention", "Claude Unlimited",
@@ -2097,128 +2175,145 @@ class Gateway:
 
         with self._lock:
             self._mark_profile_busy(profile.id)
-
+        # Released exactly once: at an exit that abandons the attempt, by the
+        # handler below for an unexpected exception, or — once handed over —
+        # by the response body (see the Anthropic path in handle()).
+        slot_held = True
+        result = None
         try:
-            branch = project_attribution.branch_key(headers, body)
-            result = openai_bridge.run(profile, credential, body,
-                                        parity=pool.settings.model_parity,
-                                        context=openai_bridge.ConversationContext(
-                                            claude_session_id=branch[0] if branch else None,
-                                            agent_id=(branch[1] if branch and branch[1] != project_attribution.MAIN_BRANCH
-                                                      else None),
-                                            parent_agent_id=project_attribution.parent_agent_id_from_headers(headers)))
-        except openai_bridge.OpenAIBridgeError as exc:
-            with self._lock:  # same atomicity reasoning as the Anthropic path
-                self._mark_profile_idle(profile.id)
-                self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
-            if forced_profile_id is not None:
+            try:
+                branch = project_attribution.branch_key(headers, body)
+                result = openai_bridge.run(profile, credential, body,
+                                            parity=pool.settings.model_parity,
+                                            context=openai_bridge.ConversationContext(
+                                                claude_session_id=branch[0] if branch else None,
+                                                agent_id=(branch[1] if branch and branch[1] != project_attribution.MAIN_BRANCH
+                                                          else None),
+                                                parent_agent_id=project_attribution.parent_agent_id_from_headers(headers)))
+            except openai_bridge.OpenAIBridgeError as exc:
+                with self._lock:  # same atomicity reasoning as the Anthropic path
+                    self._mark_profile_idle(profile.id)
+                    slot_held = False
+                    self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
+                if forced_profile_id is not None:
+                    activity.record("error", f"{profile.name} — could not reach OpenAI",
+                                     meta=f"pinned profile, not rotating ({exc})")
+                    return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
+                                          error="upstream_unreachable")
                 activity.record("error", f"{profile.name} — could not reach OpenAI",
-                                 meta=f"pinned profile, not rotating ({exc})")
-                return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
-                                      error="upstream_unreachable")
-            activity.record("error", f"{profile.name} — could not reach OpenAI",
-                             meta=f"network error, rotating to next eligible profile ({exc})")
-            return None
-        except BaseException:
-            # Same reasoning as the Anthropic path: an unexpected failure must
-            # still surface, but not while leaking this Profile's in-flight
-            # slot, which nothing else clears.
-            with self._lock:
-                self._mark_profile_idle(profile.id)
-            raise
-
-        codex_headers = _filter_openai_headers(result.headers)
-        observation = openai_observation.classify(result.status, codex_headers, now)
-        # Credits ride along on both 200s and 429s and never decide a state on
-        # their own, so they are recorded before the observation is folded in:
-        # the QuotaExhausted branch in router._apply reads credits_has to
-        # decide whether this account can still serve (issue #6).
-        credits = openai_observation.parse_credits(codex_headers)
-        if credits is not None:
-            with self._lock:
-                self._record_credits(profile.id, credits)
-
-        old_rt = self._runtime.get(profile.id)
-        old_state = old_rt.state if old_rt is not None else None
-        with self._lock:
-            self._observe(profile.id, observation, now)
-        self._maybe_request_usage_recheck(profile.id, observation)
-        new_rt = self._runtime.get(profile.id)
-        self._persist()
-
-        if isinstance(observation, AuthInvalid) and old_state != ProfileState.AUTH_INVALID:
-            activity.record("error", f"{profile.name} needs re-authentication", meta="credential rejected")
-            notifications.notify_if_enabled("needs_attention", "Claude Unlimited",
-                                              f"{profile.name} needs re-authentication.", pool.settings)
-
-        if isinstance(observation, UsageSnapshot) and new_rt is not None and new_rt.state == ProfileState.ELIGIBLE:
-            near_threshold = observation.percent >= new_rt.switch_threshold - APPROACHING_THRESHOLD_BAND
-            if near_threshold and profile.id not in self._warned_approaching:
-                self._warned_approaching.add(profile.id)
-                notifications.notify_if_enabled(
-                    "approaching_threshold", "Claude Unlimited",
-                    f"{profile.name} is approaching its switch threshold "
-                    f"({observation.percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
-            elif not near_threshold:
-                self._warned_approaching.discard(profile.id)
-
-        if isinstance(observation, QuotaExhausted):
-            if forced_profile_id is not None:
-                activity.record("rotation", f"{profile.name} hit its quota",
-                                 meta="pinned profile — returning the real response, not rotating")
-            else:
+                                 meta=f"network error, rotating to next eligible profile ({exc})")
+                return None
+            except BaseException:
+                # Same reasoning as the Anthropic path: an unexpected failure must
+                # still surface, but not while leaking this Profile's in-flight
+                # slot, which nothing else clears.
                 with self._lock:
                     self._mark_profile_idle(profile.id)
-                # Discarded unread: release its connection too (see _InFlightBody).
-                _close_quietly(result.body_chunks)
-                activity.record("rotation", f"{profile.name} hit its quota", meta="rotating to next eligible profile")
-                return None
+                    slot_held = False
+                raise
 
-        # Same rule as the oauth/api path: a pinned OR branch-routed request
-        # speaks for one terminal/branch, never for the shared pointer.
-        if forced_profile_id is None and not branch_routed:
-            with self._lock:
-                self._current_profile_id = profile.id
-            self._persist()
-            if previous_profile_id is not None and previous_profile_id != profile.id:
-                self._announce_rotation(pool, previous_profile_id, profile, reason)
+            codex_headers = _filter_openai_headers(result.headers)
+            observation = openai_observation.classify(result.status, codex_headers, now)
+            # Credits ride along on both 200s and 429s and never decide a state on
+            # their own, so they are recorded before the observation is folded in:
+            # the QuotaExhausted branch in router._apply reads credits_has to
+            # decide whether this account can still serve (issue #6).
+            credits = openai_observation.parse_credits(codex_headers)
+            if credits is not None:
                 with self._lock:
-                    self._last_active.pop(previous_profile_id, None)
+                    self._record_credits(profile.id, credits)
 
-        project_id = None
-        try:
-            session_id = project_attribution.session_id_from_headers(headers)
-            if session_id:
-                project_id = project_attribution.resolve_project(session_id)
-                if project_id:
-                    project_usage.record_request(project_id)
-        except Exception:
+            old_rt = self._runtime.get(profile.id)
+            old_state = old_rt.state if old_rt is not None else None
+            with self._lock:
+                self._observe(profile.id, observation, now)
+            self._maybe_request_usage_recheck(profile.id, observation)
+            new_rt = self._runtime.get(profile.id)
+            self._persist()
+
+            if isinstance(observation, AuthInvalid) and old_state != ProfileState.AUTH_INVALID:
+                activity.record("error", f"{profile.name} needs re-authentication", meta="credential rejected")
+                notifications.notify_if_enabled("needs_attention", "Claude Unlimited",
+                                                  f"{profile.name} needs re-authentication.", pool.settings)
+
+            if isinstance(observation, UsageSnapshot) and new_rt is not None and new_rt.state == ProfileState.ELIGIBLE:
+                near_threshold = observation.percent >= new_rt.switch_threshold - APPROACHING_THRESHOLD_BAND
+                if near_threshold and profile.id not in self._warned_approaching:
+                    self._warned_approaching.add(profile.id)
+                    notifications.notify_if_enabled(
+                        "approaching_threshold", "Claude Unlimited",
+                        f"{profile.name} is approaching its switch threshold "
+                        f"({observation.percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
+                elif not near_threshold:
+                    self._warned_approaching.discard(profile.id)
+
+            if isinstance(observation, QuotaExhausted):
+                if forced_profile_id is not None:
+                    activity.record("rotation", f"{profile.name} hit its quota",
+                                     meta="pinned profile — returning the real response, not rotating")
+                else:
+                    with self._lock:
+                        self._mark_profile_idle(profile.id)
+                        slot_held = False
+                    # Discarded unread: release its connection too (see _InFlightBody).
+                    _close_quietly(result.body_chunks)
+                    activity.record("rotation", f"{profile.name} hit its quota", meta="rotating to next eligible profile")
+                    return None
+
+            # Same rule as the oauth/api path: a pinned OR branch-routed request
+            # speaks for one terminal/branch, never for the shared pointer.
+            if forced_profile_id is None and not branch_routed:
+                with self._lock:
+                    self._current_profile_id = profile.id
+                self._persist()
+                if previous_profile_id is not None and previous_profile_id != profile.id:
+                    self._announce_rotation(pool, previous_profile_id, profile, reason)
+                    with self._lock:
+                        self._last_active.pop(previous_profile_id, None)
+
             project_id = None
+            try:
+                session_id = project_attribution.session_id_from_headers(headers)
+                if session_id:
+                    project_id = project_attribution.resolve_project(session_id)
+                    if project_id:
+                        project_usage.record_request(project_id)
+            except Exception:
+                project_id = None
 
-        # Deliberately NOT result.headers here — those are OpenAI's own raw
-        # response headers (Cloudflare ray/cookies, x-codex-* quota
-        # telemetry, etc.), already consumed above for rotation/observation
-        # purposes but never meant to reach the client: Claude Code expects
-        # an Anthropic-shaped response, and leaking a different provider's
-        # infrastructure headers through would be a real, visible tell,
-        # not just noise. Every codex-kind response is translated SSE
-        # (openai_translate.ResponseTranslator's whole job), so this is
-        # always the same clean content-type — nothing upstream-specific
-        # to preserve.
-        # A non-2xx result carries a single plain-JSON error object
-        # (openai_bridge.run()'s _error_chunks()), never SSE — only a real
-        # 200 is actually the translated event stream.
-        content_type = "text/event-stream; charset=utf-8" if result.status < 300 else "application/json"
-        client_headers = {"content-type": content_type}
-        # One parse of the inbound body, shared by both readers below: what the
-        # client asked for (recorded beside the OpenAI model that actually ran)
-        # and whether it wants SSE back.
-        parsed_body = _parsed_request(body)
-        body_chunks = self._wrap_with_usage_capture(result.body_chunks, client_headers, profile.id, project_id,
-                                                     requested_model=_requested_model(parsed_body),
-                                                     eco_stats=eco_stats, sent_bytes=len(body),
-                                                     quota_5h_percent=_codex_5h_percent(result.headers))
-        body_chunks = self._wrap_with_in_flight_clear(body_chunks, profile.id, result.body_chunks)
+            # Deliberately NOT result.headers here — those are OpenAI's own raw
+            # response headers (Cloudflare ray/cookies, x-codex-* quota
+            # telemetry, etc.), already consumed above for rotation/observation
+            # purposes but never meant to reach the client: Claude Code expects
+            # an Anthropic-shaped response, and leaking a different provider's
+            # infrastructure headers through would be a real, visible tell,
+            # not just noise. Every codex-kind response is translated SSE
+            # (openai_translate.ResponseTranslator's whole job), so this is
+            # always the same clean content-type — nothing upstream-specific
+            # to preserve.
+            # A non-2xx result carries a single plain-JSON error object
+            # (openai_bridge.run()'s _error_chunks()), never SSE — only a real
+            # 200 is actually the translated event stream.
+            content_type = "text/event-stream; charset=utf-8" if result.status < 300 else "application/json"
+            client_headers = {"content-type": content_type}
+            # One parse of the inbound body, shared by both readers below: what the
+            # client asked for (recorded beside the OpenAI model that actually ran)
+            # and whether it wants SSE back.
+            parsed_body = _parsed_request(body)
+            body_chunks = self._wrap_with_usage_capture(result.body_chunks, client_headers, profile.id, project_id,
+                                                         requested_model=_requested_model(parsed_body),
+                                                         eco_stats=eco_stats, sent_bytes=len(body),
+                                                         quota_5h_percent=_codex_5h_percent(result.headers))
+            body_chunks = self._wrap_with_in_flight_clear(body_chunks, profile.id, result.body_chunks)
+            # The body owns the slot and the upstream from here on.
+            slot_held = False
+        except BaseException:
+            if slot_held:
+                with self._lock:
+                    self._mark_profile_idle(profile.id)
+                if result is not None:
+                    _close_quietly(result.body_chunks)
+            raise
 
         # The upstream Responses call is always streamed, but the client
         # decides how it wants the answer back. A client that asked for
@@ -2271,21 +2366,30 @@ class Gateway:
         the last upstream answer itself; a local refusal is only for a request
         no upstream ever answered (see _openai_ingress_refusal)."""
         now = datetime.now(timezone.utc)
-        raw_route = path.split("?", 1)[0]
-        # Decoded ONCE: `/v1/responses%2Fcompact` is `/compact`, and only the
-        # decoded suffix is ever forwarded. Anything that needs a second
-        # round of decoding (is_openai_ingress still claims it) is refused
-        # below, as is every suffix other than "" and "/compact".
-        route = unquote(raw_route)
-        suffix = None
-        if _is_responses_route(route):
-            suffix = route[len(wire_formats.OPENAI_RESPONSES_INGRESS_PATH):]
-            if suffix.endswith("/"):
-                suffix = suffix[:-1]
+        raw_route = _strip_query(path)
+        shown_route = "".join("?" if _has_control_character(ch) else ch for ch in raw_route[:200])
+        if method != "POST":
+            # is_openai_ingress claims every method on this route, so that a
+            # GET /v1/responses/{id} can never reach a Claude account. The
+            # Codex CLI only ever POSTs; nothing else is relayed.
+            return GatewayResult(status=405, headers={"allow": "POST"}, body_chunks=None, profile_id=None,
+                                  error=OPENAI_ERROR_METHOD_NOT_ALLOWED,
+                                  error_detail=f"Claude Unlimited relays only POST to {shown_route}, not {method}.")
+        # Decoded ONCE (a decoded `?`/`#` ends the path, as a raw one does):
+        # `/v1/responses%2Fcompact` is `/compact`, and only the decoded suffix
+        # is ever forwarded. The suffix is judged strictly — no `//`, `.` or
+        # `..` collapsing, one trailing slash ignored — so anything else that
+        # is_openai_ingress claimed (a second round of decoding needed, a
+        # control character, a non-canonical spelling) is refused below, as
+        # is every suffix other than "" and "/compact".
+        route = _strip_query(unquote(raw_route))
+        suffix = None if _has_control_character(route) else _responses_suffix(route)
+        if suffix is not None and suffix.endswith("/"):
+            suffix = suffix[:-1]
         if suffix is None or not openai_bridge.valid_responses_suffix(suffix):
             return GatewayResult(status=400, headers={}, body_chunks=None, profile_id=None,
                                   error=OPENAI_ERROR_BAD_REQUEST,
-                                  error_detail=f"Claude Unlimited does not relay {raw_route[:200]}.")
+                                  error_detail=f"Claude Unlimited does not relay {shown_route}.")
         if len(body) > _OPENAI_INGRESS_MAX_BODY_BYTES:
             return GatewayResult(status=400, headers={}, body_chunks=None, profile_id=None,
                                   error=OPENAI_ERROR_BAD_REQUEST,
@@ -2312,6 +2416,9 @@ class Gateway:
         last_answer: Optional[_UpstreamAnswer] = None
         # Set when routing found nothing to try: why, for the refusal.
         stopped_because: Optional[str] = None
+        # Whether this request already spent its one last-resort attempt on an
+        # account that is only cooling down (see _openai_last_resort_target).
+        last_resort_used = False
         for attempt in range(MAX_ROTATION_ATTEMPTS):
             final_attempt = attempt == MAX_ROTATION_ATTEMPTS - 1
             by_session = False
@@ -2349,6 +2456,15 @@ class Gateway:
                             view = replace(snapshot, current_profile_id=self._openai_ingress_profile_id)
                             decision = choose(view, now, exclude=not_codex | attempted)
                             chosen_id, reason = decision.profile_id, decision.reason
+                    if chosen_id is None and not last_resort_used:
+                        # Nothing can serve it normally, but an account that is
+                        # only cooling down may well answer by now: one try,
+                        # rather than a local 503 for every one of the Codex
+                        # CLI's retries (~30 over ~24 s, Retry-After ignored)
+                        # while a single account's cooldown outlasts them all.
+                        last_resort = self._openai_last_resort_target(pool, attempted)
+                        if last_resort is not None:
+                            chosen_id, reason, last_resort_used = last_resort, "last_resort_cooldown", True
 
             # recover_expired_cooldowns() just folded any reset into the live
             # runtime, so the Anthropic path will never see this transition:
@@ -2415,42 +2531,42 @@ class Gateway:
                     if issuer is not None and issuer != profile.id:
                         send_headers = openai_bridge.without_header(headers, "x-codex-turn-state")
 
-            with self._lock:
-                self._mark_profile_busy(profile.id)
-
             # A pinned session cannot land anywhere else, so cooling its
             # account after a mid-stream failure would only turn the Codex
             # CLI's reconnect into a local 503.
             on_stream_failure = (None if pinned else
                                  (lambda exc, served=profile: self._openai_stream_failed(served, exc)))
-            try:
-                result = openai_bridge.run_passthrough(profile, credential, method, suffix, send_body,
-                                                       send_headers, on_stream_failure=on_stream_failure)
-            except openai_bridge.OpenAIBridgeError as exc:
-                with self._lock:  # same atomicity reasoning as the Anthropic path
-                    self._mark_profile_idle(profile.id)
-                    self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
-                last_failure = "network"
-                if pinned:
-                    activity.record("error", f"{profile.name} — could not reach OpenAI",
-                                     meta=f"Codex CLI, pinned profile, not rotating ({exc})")
-                    return GatewayResult(status=502, headers={}, body_chunks=None, profile_id=None,
-                                          error=OPENAI_ERROR_UPSTREAM_UNREACHABLE,
-                                          error_detail=f"Claude Unlimited could not reach OpenAI for "
-                                                       f"{profile.name}, the account this session is pinned to.")
-                activity.record("error", f"{profile.name} — could not reach OpenAI",
-                                 meta=f"Codex CLI, network error, trying the next codex profile ({exc})")
-                continue
-            except BaseException:
-                with self._lock:
-                    self._mark_profile_idle(profile.id)
-                raise
-            last_failure = None
-
-            # From here the slot is released exactly once: by the failover
-            # branch, by the except below, or — once `owned` — by the body.
+            with self._lock:
+                self._mark_profile_busy(profile.id)
+            # From here the slot is released exactly once: at an exit that
+            # abandons the attempt (network failure, failover), by the except
+            # below for an unexpected exception, or — once `owned` — by the
+            # body. `owned` is set the moment the slot is no longer this
+            # frame's to release.
             owned = False
+            result = None
             try:
+                try:
+                    result = openai_bridge.run_passthrough(profile, credential, method, suffix, send_body,
+                                                           send_headers, on_stream_failure=on_stream_failure)
+                except openai_bridge.OpenAIBridgeError as exc:
+                    with self._lock:  # same atomicity reasoning as the Anthropic path
+                        self._mark_profile_idle(profile.id)
+                        owned = True
+                        self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
+                    last_failure = "network"
+                    if pinned:
+                        activity.record("error", f"{profile.name} — could not reach OpenAI",
+                                         meta=f"Codex CLI, pinned profile, not rotating ({exc})")
+                        return GatewayResult(status=502, headers={}, body_chunks=None, profile_id=None,
+                                              error=OPENAI_ERROR_UPSTREAM_UNREACHABLE,
+                                              error_detail=f"Claude Unlimited could not reach OpenAI for "
+                                                           f"{profile.name}, the account this session is pinned to.")
+                    activity.record("error", f"{profile.name} — could not reach OpenAI",
+                                     meta=f"Codex CLI, network error, trying the next codex profile ({exc})")
+                    continue
+                last_failure = None
+
                 codex_headers = _filter_openai_headers(result.headers)
                 observation = openai_observation.classify(result.status, codex_headers, now)
                 if 500 <= result.status < 600 and isinstance(observation, Unknown):
@@ -2508,7 +2624,7 @@ class Gateway:
                                                       _read_and_close(result.body_chunks), profile.id)
                         with self._lock:
                             self._mark_profile_idle(profile.id)
-                        owned = True  # released: the except below must not release again
+                            owned = True  # released: the except below must not release again
                         continue
 
                 if not pinned and result.status < 400:
@@ -2535,7 +2651,8 @@ class Gateway:
                 if not owned:
                     with self._lock:
                         self._mark_profile_idle(profile.id)
-                _close_quietly(result.body_chunks)
+                    if result is not None:
+                        _close_quietly(result.body_chunks)
                 raise
             return GatewayResult(status=result.status, headers=client_headers,
                                   body_chunks=body_chunks, profile_id=profile.id)
@@ -2600,6 +2717,31 @@ class Gateway:
         if manual in attempted:
             return None
         return manual
+
+    def _openai_last_resort_target(self, pool: Pool, attempted: set) -> Optional[str]:
+        """The codex Profile to try once when nothing ELIGIBLE (or DRAINING,
+        for a session already there) can take a Codex CLI request: of the
+        enabled codex accounts rotation could hand it to that are only in
+        COOLDOWN and not yet tried for this request, the one whose cooldown
+        ends soonest. None when there is no such account. EXHAUSTED,
+        AUTH_INVALID and disabled accounts are never returned.
+
+        The cooldown bookkeeping itself is untouched: it still steers
+        rotation away from the account whenever anything else can serve.
+        Call with self._lock held, after self._runtime was refreshed."""
+        best: Optional[tuple] = None
+        for profile in pool.profiles:
+            if profile.kind != "codex" or not profile.enabled or profile.id in attempted:
+                continue
+            rt = self._runtime.get(profile.id)
+            if rt is None or rt.state != ProfileState.COOLDOWN:
+                continue
+            if not (rt.automatic or profile.id in (self._openai_ingress_profile_id, self._manual_profile_id)):
+                continue
+            ends = rt.cooldown_until or datetime.min.replace(tzinfo=timezone.utc)
+            if best is None or ends < best[0]:
+                best = (ends, profile.id)
+        return best[1] if best is not None else None
 
     def _openai_stream_failed(self, profile: Profile, exc: BaseException) -> None:
         """A Codex CLI response that began < 400 failed to read before its

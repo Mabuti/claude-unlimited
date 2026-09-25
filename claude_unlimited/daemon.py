@@ -541,7 +541,7 @@ def _openai_error_payload(result) -> tuple:
     message = result.error_detail or "[claude-unlimited] No Codex/ChatGPT account can serve this request right now."
     if result.status == 429:
         error_type = "usage_limit_reached"
-    elif result.status == 400:
+    elif result.status in (400, 405):
         error_type = "invalid_request_error"
     else:
         error_type = "server_error"
@@ -1693,6 +1693,12 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         # The Codex CLI's POST /v1/responses: every error it can receive from
         # here on is OpenAI-shaped instead of Anthropic-shaped.
         openai = is_openai_ingress(method, path)
+        if not openai and is_openai_ingress(method, self.path):
+            # urlparse() reads a target that starts with `//` as a
+            # network-path reference: `//v1/responses` arrives here as
+            # `/responses`, which would otherwise reach a Claude account. The
+            # raw target is what gets classified, and handed on, instead.
+            openai, path = True, self.path
         auth_result = self._check_placeholder_token(openai=openai)
         if auth_result is None:
             return
