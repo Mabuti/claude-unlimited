@@ -104,6 +104,34 @@ Profile and an import is blocked; neither overwrites.
    request and one answer.
 7. The body streams back untouched while a tee counts tokens for the usage history.
 
+## OpenAI-shaped ingress
+
+`cu codex` launches the real Codex CLI with its own model provider pointed at this daemon
+(`-c` overrides only, on the command line — never a write to `~/.codex/config.toml` or
+anywhere under `CODEX_HOME`), so a second, differently-shaped request arrives alongside the
+Anthropic-shaped one "How a request flows" describes above:
+
+- `POST /v1/responses` (and `/v1/responses/*`) is recognised **by path**, not by any header
+  or body sniffing.
+- It is served **only by codex-kind Profiles**, and as an **unmodified passthrough** — no
+  translation, no model mapping. This is the opposite direction from the `codex` case in "How
+  a request flows": there, a Claude-shaped request from Claude Code is *translated* onto a
+  GPT model; here, an already-OpenAI-shaped request from the real Codex CLI is relayed as-is
+  to a codex-kind Profile's own credential.
+- When no codex-kind Profile can serve it — none configured, none enabled, or all exhausted —
+  the request is refused with a clear error rather than silently falling through to a Claude
+  account, which could not answer it at all.
+- This ingress keeps its **own sticky account pointer**, separate from the shared Claude Code
+  rotation pointer (`current_profile_id`; see "Branches" above). Codex CLI traffic routing
+  among codex-kind Profiles never moves that pointer, the same way branch-pinned traffic
+  already doesn't.
+- Rotation and quota observation reuse `openai_observation.py` unchanged — the same
+  usage-header parsing a translated `codex`-kind response already goes through.
+
+**Phase 2 — Codex CLI traffic served by Claude accounts — is not implemented.** Every
+`POST /v1/responses` request is answered by a codex-kind Profile only; there is no reverse
+translation path yet.
+
 ## Rotation rules
 
 - Requests go to the enabled Profile with the **lowest priority number**.

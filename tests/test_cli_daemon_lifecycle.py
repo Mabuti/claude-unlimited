@@ -702,7 +702,7 @@ def test_every_port_taking_subcommand_uses_the_guarded_resolver():
 
     source = inspect.getsource(cli.main)
     assert "resolve_port(args.port)" not in source
-    assert source.count("_resolve_port_or_exit(args.port)") == 7
+    assert source.count("_resolve_port_or_exit(args.port)") == 8
 
 
 def test_a_good_port_flag_still_resolves():

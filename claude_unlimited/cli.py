@@ -1653,6 +1653,137 @@ def desktop_revert() -> int:
     return 0
 
 
+# The model_provider id `codex()` registers itself under via `-c` overrides
+# (see _codex_provider_overrides). Shared with tests so the id can't drift
+# between the argv the function builds and what a test asserts on.
+CODEX_PROVIDER_ID = "claude_unlimited"
+
+
+def _codex_provider_overrides(port: int) -> list[str]:
+    """The `-c model_providers.claude_unlimited.*` flags that route Codex CLI
+    at this daemon's OpenAI-shaped ingress (docs/ARCHITECTURE.md, "OpenAI-
+    shaped ingress"), entirely on the command line. `requires_openai_auth`
+    and `supports_websockets` are pinned false so the session authenticates
+    with the daemon's own token (env_key) and never tries a websocket
+    transport the daemon does not serve; Codex 0.144 accepts both keys.
+
+    Never written to ~/.codex/config.toml or anywhere under CODEX_HOME: this
+    list is passed as literal `-c` argv tokens on every launch, so nothing
+    persists once the process exits. Shared by codex() and its tests so the
+    two cannot drift apart."""
+    return [
+        "-c", f'model_provider="{CODEX_PROVIDER_ID}"',
+        "-c", f'model_providers.{CODEX_PROVIDER_ID}.name="Claude Unlimited"',
+        "-c", f'model_providers.{CODEX_PROVIDER_ID}.base_url="http://{LOOPBACK_HOST}:{port}/v1"',
+        "-c", f'model_providers.{CODEX_PROVIDER_ID}.wire_api="responses"',
+        "-c", f'model_providers.{CODEX_PROVIDER_ID}.env_key="CLAUDE_UNLIMITED_TOKEN"',
+        "-c", f'model_providers.{CODEX_PROVIDER_ID}.requires_openai_auth=false',
+        "-c", f'model_providers.{CODEX_PROVIDER_ID}.supports_websockets=false',
+    ]
+
+
+def codex(port: int, codex_args: list[str], profile_arg: Optional[str] = None) -> int:
+    """`claude-unlimited codex` / `cu codex`: starts the daemon if needed,
+    then launches the real Codex CLI with its model provider pointed at this
+    daemon, so Codex sessions are served by the pool's codex-kind
+    (ChatGPT/Codex) accounts.
+
+    Modelled on code() but deliberately narrower: only codex-kind Profiles
+    are ever relevant here (an oauth/api Claude Profile cannot serve
+    `POST /v1/responses`), there is no --distribute (a passthrough session
+    has no subagents to spread), and none of code()'s /model-picker-relabeling
+    machinery applies (_routing_env, _apply_model_labels,
+    _apply_one_million_context, gateway model discovery, _status_line_args) --
+    Codex CLI has no such picker and none of that is wire_api="responses"
+    shaped. This never touches the shared Claude Code rotation pointer or
+    writes anything under CODEX_HOME (see docs/ARCHITECTURE.md, "OpenAI-shaped
+    ingress")."""
+    _banner()
+    # The which-check must look for the CONFIGURED executable, not a
+    # hardcoded "codex" (mirrors code()'s own check), and must run before the
+    # daemon starts so a missing binary never leaves one running for nothing.
+    base = launch_argv("codex")
+    exe, extra = base[0], base[1:]
+    if not shutil.which(exe):
+        print("Codex CLI (`codex`) not found on PATH. Install it first: "
+              "https://github.com/openai/codex", file=sys.stderr)
+        return 1
+
+    if not _ensure_daemon(port):
+        return 1
+
+    try:
+        pool = load_pool()
+        enabled_profiles = pool.enabled_profiles()
+    except Exception:
+        # Same defensive shape as code(): a config that can't be read reads as
+        # "no profiles", which the checks below already treat as "nothing to
+        # route through" rather than crashing.
+        enabled_profiles = []
+
+    codex_profiles = [p for p in enabled_profiles if p.kind == "codex"]
+
+    forced_profile = None
+    if profile_arg:
+        forced_profile = _match_profile(codex_profiles, profile_arg)
+        if forced_profile is None:
+            non_codex_match = _match_profile(enabled_profiles, profile_arg)
+            if non_codex_match is not None and non_codex_match.kind != "codex":
+                print(f"{non_codex_match.name!r} is not a Codex account — `cu codex` only "
+                      "routes through codex-kind Profiles.", file=sys.stderr)
+            else:
+                print(f"No enabled Codex account matches --profile {profile_arg!r}.", file=sys.stderr)
+                if codex_profiles:
+                    print("Available: " + ", ".join(p.name for p in codex_profiles), file=sys.stderr)
+            return 1
+    elif not codex_profiles:
+        print("No enabled Codex/ChatGPT account in the pool. Add one with "
+              "`cu add-codex-account`, or enable one in the dashboard.", file=sys.stderr)
+        return 1
+    elif len(codex_profiles) > 1 and sys.stdin.isatty():
+        # Short timeout deliberately, same reasoning as code(): the picker
+        # must never stall on an unreachable daemon.
+        live_profiles = _fetch_live_profiles(LOOPBACK_HOST, port, timeout=1.0)
+        try:
+            forced_profile = _prompt_profile_choice(codex_profiles, live_profiles)
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.", file=sys.stderr)
+            return 1
+
+    try:
+        if forced_profile is not None:
+            token = _fetch_session_token(LOOPBACK_HOST, port, forced_profile.id)
+        else:
+            token = _fetch_placeholder_token(LOOPBACK_HOST, port)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError) as exc:
+        print(f"Could not fetch the local credential from the daemon: {exc}", file=sys.stderr)
+        return 1
+
+    if forced_profile is not None:
+        print(f"Routing Codex through Claude Unlimited at {LOOPBACK_HOST}:{port}, pinned to "
+              f"{forced_profile.name} — launching codex…\n")
+    else:
+        print(f"Routing Codex through Claude Unlimited at {LOOPBACK_HOST}:{port} — launching codex…\n")
+
+    # Child env only: a copy of the current environment plus the one token
+    # Codex needs to authenticate to this daemon (env_key="CLAUDE_UNLIMITED_TOKEN"
+    # above). Nothing here is written to disk -- CODEX_HOME is never set or
+    # read, so this never touches another Profile's isolated Codex login.
+    env = {**os.environ, "CLAUDE_UNLIMITED_TOKEN": token}
+    argv = [exe, *_codex_provider_overrides(port), *extra, *codex_args]
+
+    # execvpe replaces this process image outright (see code()'s identical
+    # note on execvp): it never returns and never flushes Python's own
+    # buffers, so anything still sitting in stdout's buffer would vanish.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if os.name == "nt":
+        # Windows has no real exec -- see code()'s identical branch.
+        return _run_tool(argv, env=env).returncode
+    os.execvpe(_resolve_launcher(exe), argv, env)
+    return 0  # unreachable: execvpe replaces this process on success
+
+
 def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None,
          distribute: bool = False) -> int:
     _banner()
@@ -2446,6 +2577,16 @@ def main(argv=None) -> int:
     # `claude-unlimited code --model opus`, where argparse matches --model
     # against code_p's options first). parse_known_args() below is what
     # lets unrecognized arguments fall through to `claude` untouched.
+
+    codex_p = sub.add_parser("codex", help="start the daemon if needed, then launch the Codex CLI "
+                                            "routed through the pool's ChatGPT/Codex accounts")
+    codex_p.add_argument("--port", type=int, default=None)
+    codex_p.add_argument("--profile", metavar="NAME_OR_ID", default=None,
+                          help="pin this session to one Codex Profile by name or id, skipping the "
+                               "interactive picker")
+    # Same parse_known_args() passthrough as code_p above, for `codex`'s own
+    # flag-looking args (e.g. `cu codex exec --model gpt-5.6-luna "hi"`).
+
     install_p = sub.add_parser("install", help="register the daemon to start automatically on login")
     install_p.add_argument("--port", type=int, default=None)
     sub.add_parser("uninstall", help="stop the daemon from starting automatically on login")
@@ -2478,6 +2619,8 @@ def main(argv=None) -> int:
     if args.cmd == "code":
         return code(_resolve_port_or_exit(args.port), unknown, profile_arg=args.profile,
                     distribute=args.distribute)
+    if args.cmd == "codex":
+        return codex(_resolve_port_or_exit(args.port), unknown, profile_arg=args.profile)
     if args.cmd == "desktop":
         return desktop_revert() if args.revert else desktop(_resolve_port_or_exit(args.port))
     if args.cmd == "install":
