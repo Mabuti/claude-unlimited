@@ -246,11 +246,40 @@ def test_everything_after_a_double_dash_goes_to_codex_verbatim(monkeypatch, code
     monkeypatch.setattr(cli, "_fetch_session_token",
                          lambda host, port, profile_id, timeout=2.0: f"tok-{profile_id}")
 
-    assert cli.main(["codex", "--account", "ChatGPT", "exec", "--",
+    # A `--` right after cu's own options is dropped; a later one is codex's.
+    assert cli.main(["codex", "--account", "ChatGPT", "--", "exec",
                      "--port", "9", "--account", "x", "--", "-p", "fast"]) == 0
     (_exe, argv, env), = codex_env
     overrides = cli._codex_provider_overrides(4317)
     assert argv == ["codex", *overrides, "exec", "--port", "9", "--account", "x", "--", "-p", "fast"]
+    assert env["CLAUDE_UNLIMITED_TOKEN"] == "tok-c"
+
+
+def test_cu_options_after_a_codex_argument_belong_to_codex(monkeypatch, codex_env):
+    # G8: `cu codex exec --port 9 --account x` must not let argparse steal
+    # --port/--account from codex.
+    save_pool(Pool(profiles=[_codex_profile(pid="c", name="ChatGPT")]))
+    monkeypatch.setattr(cli, "_fetch_placeholder_token", lambda host, port, timeout=2.0: "placeholder-tok")
+
+    def boom(*a, **kw):
+        raise AssertionError("a --account meant for codex must not pin the session")
+    monkeypatch.setattr(cli, "_fetch_session_token", boom)
+
+    assert cli.main(["codex", "exec", "--port", "9", "--account", "x", "--", "-p", "fast"]) == 0
+    (_exe, argv, env), = codex_env
+    overrides = cli._codex_provider_overrides(4317)   # the default port, not 9
+    assert argv == ["codex", *overrides, "exec", "--port", "9", "--account", "x", "--", "-p", "fast"]
+    assert env["CLAUDE_UNLIMITED_TOKEN"] == "placeholder-tok"
+
+
+def test_cu_options_in_the_leading_run_are_read_in_every_spelling(monkeypatch, codex_env):
+    save_pool(Pool(profiles=[_codex_profile(pid="c", name="ChatGPT")]))
+    monkeypatch.setattr(cli, "_fetch_session_token",
+                         lambda host, port, profile_id, timeout=2.0: f"tok-{profile_id}")
+
+    assert cli.main(["codex", "--port=4318", "--account=ChatGPT", "exec", "--port", "1"]) == 0
+    (_exe, argv, env), = codex_env
+    assert argv == ["codex", *cli._codex_provider_overrides(4318), "exec", "--port", "1"]
     assert env["CLAUDE_UNLIMITED_TOKEN"] == "tok-c"
 
 
@@ -263,8 +292,35 @@ def test_an_unknown_account_names_the_account_flag(monkeypatch, codex_env, capsy
 
 def test_double_dash_split_leaves_other_commands_alone():
     assert cli._split_codex_passthrough(["code", "--", "-p"]) == (["code", "--", "-p"], [])
+    assert cli._split_codex_passthrough(["code", "--port", "9", "--model", "x"]) == (
+        ["code", "--port", "9", "--model", "x"], [])
     assert cli._split_codex_passthrough([]) == ([], [])
-    assert cli._split_codex_passthrough(["codex", "exec"]) == (["codex", "exec"], [])
+
+
+@pytest.mark.parametrize("argv,own,verbatim", [
+    (["codex"], ["codex"], []),
+    (["codex", "exec"], ["codex"], ["exec"]),
+    (["codex", "--port", "9", "exec", "--port", "8"], ["codex", "--port", "9"], ["exec", "--port", "8"]),
+    (["codex", "--port=9", "--account=a", "x"], ["codex", "--port=9", "--account=a"], ["x"]),
+    (["codex", "--account", "a", "--", "--account", "b"], ["codex", "--account", "a"], ["--account", "b"]),
+    (["codex", "--", "--", "x"], ["codex"], ["--", "x"]),
+    (["codex", "-p", "fast", "--port", "9"], ["codex"], ["-p", "fast", "--port", "9"]),
+    (["codex", "--help"], ["codex", "--help"], []),
+    (["codex", "exec", "--help"], ["codex"], ["exec", "--help"]),
+    (["codex", "--port"], ["codex", "--port"], []),     # argparse reports the missing value
+])
+def test_codex_split_reads_only_the_leading_run(argv, own, verbatim):
+    assert cli._split_codex_passthrough(argv) == (own, verbatim)
+
+
+def test_cu_code_parsing_is_unchanged(monkeypatch):
+    seen = []
+    monkeypatch.setattr(cli, "code", lambda port, args, profile_arg=None, distribute=False:
+                        seen.append((port, args, profile_arg, distribute)) or 0)
+    monkeypatch.setattr(cli, "_resolve_port_or_exit", lambda port: port)
+
+    assert cli.main(["code", "--model", "opus", "--port", "9", "--profile", "p", "--", "-x"]) == 0
+    assert seen == [(9, ["--model", "opus", "--", "-x"], "p", False)]
 
 
 # ---- nothing written under CODEX_HOME ----

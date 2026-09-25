@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterator, Optional
+from urllib.parse import unquote
 
 from . import activity, eco, gpt_windows, speech, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_credential, openai_models, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_probe, usage_tracking, wire_formats
 from . import profiles as profile_repo
@@ -190,13 +191,38 @@ _OPENAI_RELAYED_RESPONSE_HEADERS = frozenset({
 _OPENAI_RELAYED_RESPONSE_HEADER_PREFIXES = ("x-codex-", "x-ratelimit-")
 
 
+# How many rounds of percent-decoding is_openai_ingress applies before it
+# gives up looking for a fixed point. Real clients encode at most once.
+_OPENAI_INGRESS_MAX_DECODE_ROUNDS = 8
+
+
+def _is_responses_route(route: str) -> bool:
+    base = wire_formats.OPENAI_RESPONSES_INGRESS_PATH
+    return route == base or route.startswith(base + "/")
+
+
 def is_openai_ingress(method: str, path: str) -> bool:
-    """Whether this request is the Codex CLI's OpenAI Responses call."""
+    """Whether this request is the Codex CLI's OpenAI Responses call.
+
+    Decided on the PERCENT-DECODED path (query stripped first), decoded
+    repeatedly until it stops changing: `/v1/responses%2Fcompact` or a
+    double-encoded variant must never fall through to the Anthropic gateway,
+    where a Claude account's credential would be sent with it. Whether the
+    suffix is one that may be relayed is decided afterwards, strictly, by
+    _handle_openai_ingress (which refuses anything else locally)."""
     if method != "POST":
         return False
     route = path.split("?", 1)[0]
-    base = wire_formats.OPENAI_RESPONSES_INGRESS_PATH
-    return route == base or route.startswith(base + "/")
+    for _ in range(_OPENAI_INGRESS_MAX_DECODE_ROUNDS):
+        if _is_responses_route(route):
+            return True
+        decoded = unquote(route)
+        if decoded == route:
+            return False
+        route = decoded
+    # Still changing after that many rounds: nothing legitimate looks like
+    # this, and claiming it means it is refused locally rather than relayed.
+    return True
 
 
 def _openai_client_headers(headers: dict) -> dict:
@@ -220,6 +246,18 @@ def _openai_session_key(headers: dict) -> Optional[str]:
         if value is not None and str(value).strip():
             return str(value).strip()[:_OPENAI_SESSION_KEY_MAX_CHARS]
     return None
+
+
+def _retry_after_seconds(value) -> Optional[float]:
+    """A Retry-After header given in seconds, or None when absent or not a
+    finite, non-negative number."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds != seconds or seconds < 0 or seconds == float("inf"):
+        return None
+    return seconds
 
 
 def _openai_failover_reason(status: int, observation) -> Optional[str]:
@@ -308,12 +346,28 @@ class _InFlightBody:
     close() is idempotent: the slot is released exactly once, however many of
     those paths run. `closers` are the upstream objects behind `chunks` (the
     raw body, its connection), closed after `chunks` itself so a wrapper in
-    between that was never started cannot hide them."""
+    between that was never started cannot hide them.
 
-    def __init__(self, chunks, release: Callable[[], None], closers=()) -> None:
+    The finalizer never blocks on the gateway's lock. `release` takes that
+    lock, and it is a plain (non-reentrant) threading.Lock: a finalizer runs
+    wherever the last reference happens to drop or cyclic GC happens to fire
+    — including on a thread that is inside `with gateway._lock:` right now —
+    and blocking there would deadlock the whole daemon. So the finalizer uses
+    `try_release` (a non-blocking attempt that says whether it released) and,
+    when the lock is busy, hands `release` to a short-lived daemon thread,
+    which simply waits for the holder to finish. A thread rather than a queue
+    drained at the next lock acquisition: that lock is taken in dozens of
+    places, and a queue drained only on some of them would leave the slot
+    held — the Profile shown as "Used now", the pool never idle — until
+    unrelated traffic happened to come along. Explicit close() and normal
+    exhaustion keep the plain blocking release."""
+
+    def __init__(self, chunks, release: Callable[[], None], closers=(),
+                 try_release: Optional[Callable[[], bool]] = None) -> None:
         self._chunks = iter(chunks)
         self._inner = chunks
         self._release = release
+        self._try_release = try_release
         self._closers = tuple(c for c in closers if c is not None)
         self._closed = False
         self._close_lock = threading.Lock()
@@ -332,6 +386,9 @@ class _InFlightBody:
             raise
 
     def close(self) -> None:
+        self._close(finalizing=False)
+
+    def _close(self, finalizing: bool) -> None:
         with self._close_lock:
             if self._closed:
                 return
@@ -340,13 +397,25 @@ class _InFlightBody:
             _close_quietly(self._inner)
             _close_all(self._closers)
         finally:
-            self._release()
+            if finalizing:
+                self._release_without_blocking()
+            else:
+                self._release()
+
+    def _release_without_blocking(self) -> None:
+        # With no non-blocking variant supplied, nothing is known about what
+        # `release` waits on, so it is never run on the finalizing thread.
+        if self._try_release is not None and self._try_release():
+            return
+        # The lock is held — possibly by this very thread. The helper thread
+        # holds no reference to this object, only to the release callable.
+        threading.Thread(target=self._release, name="cu-in-flight-release", daemon=True).start()
 
     def __del__(self) -> None:
         # The same safety net the generator wrapper had through CPython's
         # generator finalizer: a body dropped half-read still frees its slot.
         try:
-            self.close()
+            self._close(finalizing=True)
         except Exception:  # noqa: BLE001 - never raise from a finalizer
             pass
 
@@ -2202,14 +2271,21 @@ class Gateway:
         the last upstream answer itself; a local refusal is only for a request
         no upstream ever answered (see _openai_ingress_refusal)."""
         now = datetime.now(timezone.utc)
-        route = path.split("?", 1)[0]
-        suffix = route[len(wire_formats.OPENAI_RESPONSES_INGRESS_PATH):]
-        if suffix.endswith("/"):
-            suffix = suffix[:-1]
-        if not openai_bridge.valid_responses_suffix(suffix):
+        raw_route = path.split("?", 1)[0]
+        # Decoded ONCE: `/v1/responses%2Fcompact` is `/compact`, and only the
+        # decoded suffix is ever forwarded. Anything that needs a second
+        # round of decoding (is_openai_ingress still claims it) is refused
+        # below, as is every suffix other than "" and "/compact".
+        route = unquote(raw_route)
+        suffix = None
+        if _is_responses_route(route):
+            suffix = route[len(wire_formats.OPENAI_RESPONSES_INGRESS_PATH):]
+            if suffix.endswith("/"):
+                suffix = suffix[:-1]
+        if suffix is None or not openai_bridge.valid_responses_suffix(suffix):
             return GatewayResult(status=400, headers={}, body_chunks=None, profile_id=None,
                                   error=OPENAI_ERROR_BAD_REQUEST,
-                                  error_detail=f"Claude Unlimited does not relay {route[:200]}.")
+                                  error_detail=f"Claude Unlimited does not relay {raw_route[:200]}.")
         if len(body) > _OPENAI_INGRESS_MAX_BODY_BYTES:
             return GatewayResult(status=400, headers={}, body_chunks=None, profile_id=None,
                                   error=OPENAI_ERROR_BAD_REQUEST,
@@ -2226,6 +2302,9 @@ class Gateway:
         moved_body_ready = False
 
         attempted: set[str] = set()
+        # The first account this request was routed to. Any later attempt is
+        # a move (see the strip below).
+        first_profile_id: Optional[str] = None
         # Why the previous attempt got nowhere, when it never reached a
         # response to classify: "network" or "credential".
         last_failure: Optional[str] = None
@@ -2260,12 +2339,16 @@ class Gateway:
                     if chosen_id is not None:
                         by_session, reason = True, "session_affinity"
                     else:
-                        # router.choose() on a view whose sticky pointer is
-                        # THIS ingress's own, with every non-codex Profile
-                        # excluded.
-                        view = replace(snapshot, current_profile_id=self._openai_ingress_profile_id)
-                        decision = choose(view, now, exclude=not_codex | attempted)
-                        chosen_id, reason = decision.profile_id, decision.reason
+                        chosen_id = self._openai_manual_target(pool, attempted)
+                        if chosen_id is not None:
+                            reason = "manual_override"
+                        else:
+                            # router.choose() on a view whose sticky pointer
+                            # is THIS ingress's own, with every non-codex
+                            # Profile excluded.
+                            view = replace(snapshot, current_profile_id=self._openai_ingress_profile_id)
+                            decision = choose(view, now, exclude=not_codex | attempted)
+                            chosen_id, reason = decision.profile_id, decision.reason
 
             # recover_expired_cooldowns() just folded any reset into the live
             # runtime, so the Anthropic path will never see this transition:
@@ -2284,6 +2367,10 @@ class Gateway:
 
             profile = pool.get(chosen_id)
             attempted.add(profile.id)
+            if first_profile_id is None:
+                # Set even if its credential cannot be read below: routing
+                # picked it as the account this request belongs on.
+                first_profile_id = profile.id
             try:
                 credential = secret_store.get_token(profile.id)
             except Exception:
@@ -2294,7 +2381,14 @@ class Gateway:
                 continue
 
             send_body, send_headers = body, headers
-            if session_home is not None and profile.id != session_home:
+            session_moved = session_home is not None and profile.id != session_home
+            # In-request failover is a move too: the account the first attempt
+            # went to is the one the request's turn state and encrypted
+            # reasoning were most plausibly issued by — and with no session map
+            # entry (a daemon restart, a request with no session header) it is
+            # the only evidence there is.
+            failed_over = profile.id != first_profile_id
+            if session_moved or failed_over:
                 # The session is MOVING to another account. Its turn state and
                 # encrypted reasoning only decrypt on the account that issued
                 # them, so they stay behind — before the first send, rather
@@ -2307,9 +2401,10 @@ class Gateway:
                     moved_body_ready = True
                 if moved_body is not None:
                     send_body = moved_body
-                activity.record("rotation", f"Codex CLI session moved to {profile.name}",
-                                 meta=f"from {self._profile_name(pool, session_home)}; its encrypted reasoning "
-                                      "and turn state were left behind")
+                if session_moved:
+                    activity.record("rotation", f"Codex CLI session moved to {profile.name}",
+                                     meta=f"from {self._profile_name(pool, session_home)}; its encrypted "
+                                          "reasoning and turn state were left behind")
             else:
                 # A turn-state is only meaningful to the account that issued
                 # it: replaying one issued by a different account is dropped.
@@ -2323,9 +2418,14 @@ class Gateway:
             with self._lock:
                 self._mark_profile_busy(profile.id)
 
+            # A pinned session cannot land anywhere else, so cooling its
+            # account after a mid-stream failure would only turn the Codex
+            # CLI's reconnect into a local 503.
+            on_stream_failure = (None if pinned else
+                                 (lambda exc, served=profile: self._openai_stream_failed(served, exc)))
             try:
                 result = openai_bridge.run_passthrough(profile, credential, method, suffix, send_body,
-                                                       send_headers)
+                                                       send_headers, on_stream_failure=on_stream_failure)
             except openai_bridge.OpenAIBridgeError as exc:
                 with self._lock:  # same atomicity reasoning as the Anthropic path
                     self._mark_profile_idle(profile.id)
@@ -2353,6 +2453,12 @@ class Gateway:
             try:
                 codex_headers = _filter_openai_headers(result.headers)
                 observation = openai_observation.classify(result.status, codex_headers, now)
+                if 500 <= result.status < 600 and isinstance(observation, Unknown):
+                    # A 5xx classify() has no mapping for (504, 520-524, ...):
+                    # the account failed transiently all the same, so it is
+                    # cooled exactly like the 5xx classify() does map.
+                    observation = ProviderUnavailable(
+                        retry_after_seconds=_retry_after_seconds(codex_headers.get("retry-after")))
                 credits = openai_observation.parse_credits(codex_headers)
                 if credits is not None:
                     with self._lock:
@@ -2470,6 +2576,46 @@ class Gateway:
         self._openai_sessions[session_key] = profile_id
         return profile_id
 
+    def _openai_manual_target(self, pool: Pool, attempted: set) -> Optional[str]:
+        """The Dashboard's standing "Take over" (self._manual_profile_id), when
+        it names a codex Profile this request can use: enabled, codex-kind,
+        ELIGIBLE and not already tried for this request. A manual-only
+        (automatic=False) Profile qualifies — taking it over is what makes it
+        servable. A takeover naming a Claude account says nothing about Codex
+        traffic and is ignored here. Call with self._lock held, after
+        self._runtime was refreshed.
+
+        Like _manual_choice on the Claude side, a takeover whose codex Profile
+        is no longer ELIGIBLE is cleared, so it can never strand the pool."""
+        manual = self._manual_profile_id
+        if manual is None:
+            return None
+        profile = pool.get(manual)
+        if profile is None or profile.kind != "codex":
+            return None
+        rt = self._runtime.get(manual)
+        if not profile.enabled or rt is None or rt.state != ProfileState.ELIGIBLE:
+            self._manual_profile_id = None
+            return None
+        if manual in attempted:
+            return None
+        return manual
+
+    def _openai_stream_failed(self, profile: Profile, exc: BaseException) -> None:
+        """A Codex CLI response that began < 400 failed to read before its
+        terminal event: that account is observed as ProviderUnavailable (the
+        same bounded cooldown a network failure earns), so the Codex CLI's own
+        reconnect is routed to another account instead of the same sticky
+        one. Called by openai_bridge's relay while the body is being read —
+        never with self._lock held."""
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
+        self._persist()
+        activity.record("error", f"{profile.name} — Codex stream failed mid-response",
+                         meta=(f"cooling it down so the Codex CLI's retry goes to another account "
+                               f"({type(exc).__name__}: {exc})")[:300])
+
     def _remember_openai_session(self, session_key: str, profile_id: str) -> None:
         with self._lock:
             self._openai_sessions.pop(session_key, None)
@@ -2529,7 +2675,8 @@ class Gateway:
             # Accounts rotation could hand this request to at all.
             candidates = [rt for rt in runtimes
                           if rt.state not in (ProfileState.AUTH_INVALID, ProfileState.DISABLED)
-                          and (rt.automatic or rt.profile_id == self._openai_ingress_profile_id)]
+                          and (rt.automatic or rt.profile_id in (self._openai_ingress_profile_id,
+                                                                  self._manual_profile_id))]
             cooling = [rt for rt in candidates if rt.state == ProfileState.COOLDOWN]
             spent = [rt for rt in candidates if rt.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING)]
             if not enabled:
@@ -3578,6 +3725,18 @@ class Gateway:
         with self._lock:
             self._mark_profile_idle(profile_id)
 
+    def _try_release_in_flight(self, profile_id: str) -> bool:
+        """_release_in_flight without waiting: True when the slot was
+        released, False (nothing done) when self._lock is held right now —
+        possibly by the calling thread itself. For _InFlightBody's finalizer."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            self._mark_profile_idle(profile_id)
+        finally:
+            self._lock.release()
+        return True
+
     def _wrap_with_in_flight_clear(self, chunks, profile_id: str, *closers):
         """Hands the in-flight slot taken for this response to the body
         itself: it is released once the body is fully drained, fails, or is
@@ -3590,7 +3749,8 @@ class Gateway:
                 self._mark_profile_idle(profile_id)
             _close_all(closers)
             return chunks
-        return _InFlightBody(chunks, lambda: self._release_in_flight(profile_id), closers)
+        return _InFlightBody(chunks, lambda: self._release_in_flight(profile_id), closers,
+                             try_release=lambda: self._try_release_in_flight(profile_id))
 
     def seconds_since_last_activity(self) -> Optional[float]:
         """How long since any Profile last served a request, or None if this

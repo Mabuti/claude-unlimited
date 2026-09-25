@@ -112,9 +112,12 @@ anywhere under `CODEX_HOME`), so a second, differently-shaped request arrives al
 Anthropic-shaped one "How a request flows" describes above:
 
 - `POST /v1/responses` (and `/v1/responses/*`) is recognised **by path**, not by any header
-  or body sniffing. Only two suffixes are relayed: none, and `/compact` (one trailing slash
-  is ignored). Any other `/v1/responses/*` path is refused locally with a 400 and never
-  reaches an upstream — the Codex CLI sends nothing else.
+  or body sniffing — the **percent-decoded** path, query stripped, so `/v1/responses%2Fcompact`
+  or a double-encoded variant can never fall through to the Anthropic gateway and a Claude
+  account. Only two suffixes are relayed, judged after one round of decoding: none, and
+  `/compact` (one trailing slash is ignored). Any other `/v1/responses/*` path, or one that
+  needs a second round of decoding, is refused locally with a 400 and never reaches an
+  upstream — the Codex CLI sends nothing else. Only the decoded suffix is ever forwarded.
 - It is served **only by codex-kind Profiles**, and as an **unmodified passthrough** — no
   translation, no model mapping. This is the opposite direction from the `codex` case in "How
   a request flows": there, a Claude-shaped request from Claude Code is *translated* onto a
@@ -139,18 +142,34 @@ Anthropic-shaped one "How a request flows" describes above:
   upstream send**: the `x-codex-turn-state` header is dropped, a reasoning item whose only
   payload is its encrypted content is dropped whole, and any other reasoning item just loses
   its `encrypted_content` field. `compaction` items are kept — they hold the compacted
-  conversation. Separately, a turn-state whose issuing Profile is known and differs from the
-  one serving the request is dropped even without a mapped move.
-- **One bounded retry.** If the backend still answers 400 about encrypted content or
-  reasoning, the request is retried **once** on the same Profile without every `reasoning`
-  AND `compaction` item carrying `encrypted_content`, and without `x-codex-turn-state`. The
-  daemon log (stderr) says so, and says when compacted history was dropped.
+  conversation. **In-request failover is a move too**: every attempt after the request's first
+  one gets the same strip before it is sent, whether or not the session map has an entry
+  (after a daemon restart it has none). The first attempt still goes out byte-identical.
+  Separately, a turn-state whose issuing Profile is known and differs from the one serving
+  the request is dropped even without a mapped move.
+- **One bounded retry.** If the backend still answers a 400 whose error text mentions
+  encryption or decryption at all (case-insensitive: "encrypted content is invalid", "could
+  not decrypt", `invalid_encrypted_content`, ...), and the request carried encrypted input
+  items or `x-codex-turn-state`, it is retried **once** on the same Profile without every
+  `reasoning` AND `compaction` item carrying `encrypted_content`, and without
+  `x-codex-turn-state`. Any other 400 is relayed as-is. The daemon log (stderr) says so, and
+  says when compacted history was dropped.
 - **In-request failover.** Only status and headers have arrived when the gateway decides, so
   no body byte has reached the client yet. When the request is not pinned and another codex
   Profile can take it, a quota 429, any other 429, a 401, a 5xx/529 or a network failure moves
   **this** request to the next codex Profile — at most `MAX_ROTATION_ATTEMPTS` (4) upstream
   attempts in total. Every discarded upstream response is read (error bodies are small) and
-  its connection closed before the next attempt.
+  its connection closed before the next attempt. A 5xx that `openai_observation.classify()`
+  has no mapping for (504, 520-524, ...) is observed as `ProviderUnavailable` by the gateway,
+  so it cools the account exactly like a 500/502/503/529.
+- **Mid-stream failure.** Once a `200` has started streaming, the request can no longer move.
+  If the upstream read then fails before the stream's terminal event (`response.completed`,
+  `response.failed`, `response.incomplete`), the relay just ends (nothing is injected into the
+  OpenAI stream) and the bridge calls back into the gateway, which observes the serving
+  Profile as `ProviderUnavailable` — the same bounded cooldown a network failure earns — so
+  the Codex CLI's own reconnect lands on another account instead of the same sticky one. A
+  clean end, or a failure after the terminal event, cools nothing; nor does a pinned session,
+  which could not land anywhere else.
 - **Truthful terminal answer.** When attempts fail and nothing else can serve the request, the
   client gets the **last upstream response itself** — its status, its allowlisted headers and
   its body. A local refusal (an OpenAI-shaped error envelope) is only for a request no
@@ -184,6 +203,12 @@ Anthropic-shaped one "How a request flows" describes above:
   among codex-kind Profiles never moves that pointer, the same way branch-pinned traffic
   already doesn't. The ingress pointer is where a new session (or a request with no session
   header) goes; a session kept on its own account by affinity does not move it.
+- **Take over.** When the Dashboard's standing "Take over" names an enabled, ELIGIBLE
+  codex-kind Profile, a new session (or a request with no session header) goes there before
+  the ingress pointer is consulted — including a manual-only (`automatic=False`) Profile,
+  which the takeover is what makes servable. A session already mapped to a working account
+  stays there. A takeover naming a Claude account has no effect on this ingress, and one whose
+  codex Profile stops being ELIGIBLE is cleared, as on the Claude side.
 - Rotation and quota observation reuse `openai_observation.py` unchanged — the same
   usage-header parsing a translated `codex`-kind response already goes through.
 

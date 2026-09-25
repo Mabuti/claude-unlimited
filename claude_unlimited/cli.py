@@ -2538,15 +2538,42 @@ def _resolve_port_or_exit(explicit) -> int:
         raise SystemExit(2)
 
 
+# cu's own options for `cu codex`. They are read ONLY in the leading run of
+# tokens right after `codex` (see _split_codex_passthrough).
+_CODEX_OWN_VALUE_OPTIONS = ("--port", "--account")
+_CODEX_OWN_FLAGS = ("-h", "--help")
+
+
 def _split_codex_passthrough(argv: list) -> tuple:
     """(what argparse should see, what goes to codex verbatim) for
-    `cu codex ... -- ...`: everything after the first `--` that follows the
-    `codex` subcommand is codex's own, untouched and in order, and the `--`
-    itself is dropped. Any other command, or no `--`, is returned whole."""
-    if not argv or argv[0] != "codex" or "--" not in argv[1:]:
+    `cu codex ...`.
+
+    cu's own options (`--port N`, `--port=N`, `--account X`, `--account=X`,
+    `-h`/`--help`) are recognised only in the leading run of tokens right
+    after `codex`. The first token that is not one of them ends that run; a
+    `--` at that point is dropped, and everything from there on goes to codex
+    verbatim and in order — so `cu codex exec --port 9 --account x` hands
+    `--port 9 --account x` to codex instead of letting argparse take them.
+    Any other command is returned whole, for argparse as before."""
+    if not argv or argv[0] != "codex":
         return argv, []
-    cut = argv.index("--", 1)
-    return argv[:cut], argv[cut + 1:]
+    own = [argv[0]]
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token in _CODEX_OWN_VALUE_OPTIONS:
+            # The value is taken whatever it looks like; argparse reports a
+            # missing one.
+            own.extend(argv[index:index + 2])
+            index += 2
+        elif token.startswith(tuple(f"{name}=" for name in _CODEX_OWN_VALUE_OPTIONS)) or token in _CODEX_OWN_FLAGS:
+            own.append(token)
+            index += 1
+        else:
+            break
+    if index < len(argv) and argv[index] == "--":
+        index += 1
+    return own, argv[index:]
 
 
 def main(argv=None) -> int:
@@ -2594,7 +2621,12 @@ def main(argv=None) -> int:
     # lets unrecognized arguments fall through to `claude` untouched.
 
     codex_p = sub.add_parser("codex", help="start the daemon if needed, then launch the Codex CLI "
-                                            "routed through the pool's ChatGPT/Codex accounts")
+                                            "routed through the pool's ChatGPT/Codex accounts",
+                              usage="%(prog)s [--port N] [--account NAME_OR_ID] [--] [codex args ...]",
+                              description="cu's own options are read only right after `codex`, before "
+                                          "any other argument. From the first other argument on, "
+                                          "everything goes to codex verbatim and in order; a `--` "
+                                          "right after cu's options is dropped.")
     codex_p.add_argument("--port", type=int, default=None)
     # --account, not --profile: `-p/--profile` is the Codex CLI's own flag
     # (it selects $CODEX_HOME/<name>.config.toml), so it must reach codex
@@ -2602,10 +2634,9 @@ def main(argv=None) -> int:
     codex_p.add_argument("--account", metavar="NAME_OR_ID", default=None,
                           help="pin this session to one Codex account (Profile) by name or id, skipping "
                                "the interactive picker")
-    # Same parse_known_args() passthrough as code_p above, for `codex`'s own
-    # flag-looking args (e.g. `cu codex exec --model gpt-5.6-luna "hi"`), plus
-    # a `--` separator: everything after it goes to codex verbatim (see
-    # _split_codex_passthrough).
+    # Unlike code_p above, argparse never sees codex's own arguments: main()
+    # splits them off first (_split_codex_passthrough), so a codex flag that
+    # shares a name with one of ours (`cu codex exec --port 9`) is codex's.
 
     install_p = sub.add_parser("install", help="register the daemon to start automatically on login")
     install_p.add_argument("--port", type=int, default=None)
@@ -2641,6 +2672,7 @@ def main(argv=None) -> int:
         return code(_resolve_port_or_exit(args.port), unknown, profile_arg=args.profile,
                     distribute=args.distribute)
     if args.cmd == "codex":
+        # `unknown` is always empty here: argparse only saw cu's own options.
         return codex(_resolve_port_or_exit(args.port), unknown + codex_verbatim, profile_arg=args.account)
     if args.cmd == "desktop":
         return desktop_revert() if args.revert else desktop(_resolve_port_or_exit(args.port))

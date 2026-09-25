@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, replace
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 from urllib.parse import urlsplit
 
 from . import codex_state, openai_credential, openai_login
@@ -719,13 +719,14 @@ _PASSTHROUGH_REQUEST_HEADER_PREFIXES = ("x-codex-", "x-openai-internal-codex-")
 # backend answers when a Codex session carries reasoning items another
 # account (or an expired key) produced — which is exactly what happens after
 # the pool rotates a live Codex session onto a different account.
-_ENCRYPTED_REASONING_REFUSAL = re.compile(
-    r"encrypt[a-z_ ]*[^.]{0,120}?(could not|couldn't|cannot|can't|unable|failed|invalid|not be)"
-    r"[^.]{0,60}?(decrypt|verif|pars|valid)"
-    r"|(invalid|malformed|corrupt)[^.]{0,20}?encrypted"
-    r"|invalid_encrypted_content|decrypt(ion)?[^.]{0,40}?fail",
-    re.IGNORECASE,
-)
+#
+# Deliberately broad: ANY 400 that mentions encryption or decryption
+# ("encrypted content is invalid", "could not decrypt",
+# "invalid_encrypted_content", ...) counts, because the backend's wording
+# drifts and a missed refusal costs the whole turn, while a false match costs
+# only the one bounded retry — and only when the request actually carried
+# encrypted state to strip (see run_passthrough).
+_ENCRYPTED_REASONING_REFUSAL = re.compile(r"(?:en|de)crypt", re.IGNORECASE)
 
 
 def valid_responses_suffix(suffix: str) -> bool:
@@ -842,7 +843,9 @@ def _without_encrypted_items(body: bytes) -> tuple:
 
 def run_passthrough(profile: Profile, stored_credential: str, method: str, path_suffix: str,
                     body: bytes, client_headers: dict,
-                    timeout: float = DEFAULT_TIMEOUT_SECONDS) -> OpenAIBridgeResult:
+                    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+                    on_stream_failure: Optional[Callable[[BaseException], None]] = None
+                    ) -> OpenAIBridgeResult:
     """Relays one Codex CLI request (already OpenAI Responses-shaped) to this
     codex-kind Profile's backend, with nothing translated either way.
 
@@ -854,12 +857,21 @@ def run_passthrough(profile: Profile, stored_credential: str, method: str, path_
     yields the upstream bytes exactly as they arrive. An error status is read
     whole (error bodies are small) and returned as-is.
 
-    One bounded exception to "byte-identical": a 400 refusing replayed
-    encrypted state is retried ONCE without every encrypted reasoning AND
-    compaction item and without x-codex-turn-state (see
-    _without_encrypted_items). Raises OpenAIBridgeError when there was no
-    response at all, and ValueError for a suffix that must not be forwarded
-    (the gateway checks it first)."""
+    One bounded exception to "byte-identical": a 400 whose error text
+    mentions encryption (see _ENCRYPTED_REASONING_REFUSAL), for a request
+    that carried encrypted input items or x-codex-turn-state, is retried
+    ONCE without every encrypted reasoning AND compaction item and without
+    x-codex-turn-state (see _without_encrypted_items). Raises
+    OpenAIBridgeError when there was no response at all, and ValueError for a
+    suffix that must not be forwarded (the gateway checks it first).
+
+    `on_stream_failure` is called (at most once, with the exception) when a
+    response that began < 400 then fails to read before its terminal event
+    (response.completed / failed / incomplete) — the upstream died
+    mid-stream. It is NOT called for a clean end, for a failure after the
+    terminal event, or when the client closed the body. It is how the gateway
+    learns of the failure without this module importing it; an exception it
+    raises is swallowed."""
     if not valid_responses_suffix(path_suffix):
         raise ValueError(f"refusing to forward /v1/responses{path_suffix!r}")
     cred, is_subscription = _load_credential(profile, stored_credential)
@@ -913,8 +925,11 @@ def run_passthrough(profile: Profile, stored_credential: str, method: str, path_
     reads = _stream_reads(resp, conn, parse_events="text/event-stream" in content_type)
 
     def _relayed_chunks() -> Iterator[bytes]:
+        terminal_event_seen = False
         try:
-            for chunk, _events in reads:
+            for chunk, events in reads:
+                if any(event.get("type") in _TERMINAL_EVENT_TYPES for event in events):
+                    terminal_event_seen = True
                 if chunk:
                     yield chunk
         except Exception as exc:  # noqa: BLE001 - the status line left long ago
@@ -923,6 +938,13 @@ def run_passthrough(profile: Profile, stored_credential: str, method: str, path_
             # which the Codex CLI already treats as a dropped stream to retry.
             print(f"[codex] {profile.name}: upstream stream ended early: "
                   f"{type(exc).__name__}: {exc}"[:500], file=sys.stderr, flush=True)
+            if not terminal_event_seen and on_stream_failure is not None:
+                # The account failed mid-response: tell the gateway, so the
+                # Codex CLI's own reconnect is not routed straight back here.
+                try:
+                    on_stream_failure(exc)
+                except Exception:  # noqa: BLE001 - the relay must still end cleanly
+                    pass
         finally:
             reads.close()
             conn.close()
