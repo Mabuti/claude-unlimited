@@ -423,6 +423,24 @@ def _codex_5h_percent(headers: dict) -> Optional[float]:
         return None
 
 
+def _anthropic_5h_percent(headers: dict) -> Optional[float]:
+    """The 5h window percentage an Anthropic response reported, on the same
+    0-100 scale `_codex_5h_percent` uses, so `usage_event.quota_5h_percent`
+    means one thing for every Profile kind.
+
+    Anthropic sends `anthropic-ratelimit-unified-5h-utilization` as a 0-1
+    float (see observation.ALLOWED_HEADERS). Recording it per usage row is
+    what lets the meter's own weighting of cached vs uncached input be
+    measured from the daemon's history instead of assumed: the delta between
+    consecutive rows on one account, regressed on that row's token counts.
+    Missing or malformed header -> None, never an error."""
+    value = {k.lower(): v for k, v in (headers or {}).items()}.get("anthropic-ratelimit-unified-5h-utilization")
+    try:
+        return round(float(value) * 100, 4) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _speech_level_of(stats) -> Optional[str]:
     return getattr(stats, "speech", None)
 
@@ -1604,7 +1622,8 @@ class Gateway:
 
             body_chunks = self._wrap_with_usage_capture(resp.body_chunks, resp.headers, profile.id, project_id,
                                                          eco_stats=eco_stats,
-                                                         sent_bytes=len(eco_body or body))
+                                                         sent_bytes=len(eco_body or body),
+                                                         quota_5h_percent=_anthropic_5h_percent(resp.headers))
             body_chunks = self._wrap_with_in_flight_clear(body_chunks, profile.id)
             return GatewayResult(status=resp.status, headers=resp.headers, body_chunks=body_chunks,
                                   profile_id=profile.id)

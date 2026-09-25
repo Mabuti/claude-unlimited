@@ -147,3 +147,42 @@ def test_non_streaming_response_also_tracked(pool_env):
     assert len(events) == 1
     assert events[0].model == "claude-sonnet-5"
     assert events[0].input_tokens == 5
+
+
+def test_anthropic_5h_utilization_recorded_on_usage_row(pool_env):
+    """Anthropic reports the 5h window as a 0-1 utilization header. The usage
+    row records it as a 0-100 percentage, the same scale the Codex path
+    already uses for quota_5h_percent, so one column means one thing."""
+    def response_with_quota():
+        resp = fake_sse_response()
+        resp.headers["anthropic-ratelimit-unified-5h-utilization"] = "0.4275"
+        resp.headers["anthropic-ratelimit-unified-5h-status"] = "allowed"
+        return resp
+
+    gw = Gateway(transport=lambda req: response_with_quota())
+    result = gw.handle("POST", "/v1/messages", {}, b"{}")
+    b"".join(result.body_chunks)
+
+    events = usage_history.list_events()
+    assert len(events) == 1
+    assert events[0].quota_5h_percent == 42.75
+
+
+def test_anthropic_5h_utilization_absent_or_malformed_records_none(pool_env):
+    def response_without_header():
+        return fake_sse_response()
+
+    gw = Gateway(transport=lambda req: response_without_header())
+    b"".join(gw.handle("POST", "/v1/messages", {}, b"{}").body_chunks)
+    assert usage_history.list_events()[0].quota_5h_percent is None
+
+    usage_history.reset()
+
+    def response_with_garbage():
+        resp = fake_sse_response()
+        resp.headers["anthropic-ratelimit-unified-5h-utilization"] = "n/a"
+        return resp
+
+    gw = Gateway(transport=lambda req: response_with_garbage())
+    b"".join(gw.handle("POST", "/v1/messages", {}, b"{}").body_chunks)
+    assert usage_history.list_events()[0].quota_5h_percent is None
