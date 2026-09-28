@@ -2456,12 +2456,14 @@ class Gateway:
         retry included). A 429 with nothing ELIGIBLE left first gets the same
         one last-resort attempt on a cooling account (the session's own
         first) as a network failure does. When nothing else can serve it, the
-        client gets the last upstream answer itself — except that a quota 429
-        seen earlier in the request outranks a later short 429 or a later
-        4xx-then-network-failure, a short (non-quota) 429 becomes a local 503
-        the Codex CLI retries, and a saved non-quota 4xx followed by a network
-        failure becomes a local 502. Any other local refusal is only for a
-        request no upstream ever answered (see _openai_ingress_refusal)."""
+        client gets the last upstream answer itself — except that (1) a short
+        (non-quota) 429 from any attempt makes the local 503 the Codex CLI
+        retries, whatever came after it; (2) otherwise a quota 429 from any
+        attempt outranks a later 401/4xx or 4xx-then-network-failure (a later
+        5xx is relayed: the CLI retries it); (3) a saved non-quota 4xx
+        followed by a network failure becomes a local 502. Any other local
+        refusal is only for a request no upstream ever answered (see
+        _openai_ingress_refusal)."""
         now = datetime.now(timezone.utc)
         raw_route = _strip_query(path)
         shown_route = "".join("?" if _has_control_character(ch) else ch for ch in raw_route[:200])
@@ -2799,6 +2801,28 @@ class Gateway:
                     return self._openai_short_rate_limit_refusal(
                         profile.id, profile.name, codex_headers, now, headers, pinned)
 
+                if result.status >= 400 and result.status != 429 and (
+                        short_answer is not None
+                        or (quota_answer is not None and result.status < 500)):
+                    # A final 401/4xx/5xx after an earlier 429 in this request:
+                    # answer precedence applies here too, not only after the
+                    # loop. (1) A short 429 wins — its account recovers in
+                    # seconds and the CLI retries the local 503. (2) Otherwise
+                    # a quota 429 outranks a 401/4xx: it is the real reason
+                    # and retrying will not fix it. A 5xx after a quota 429 is
+                    # relayed below: the CLI retries it, and it may clear.
+                    _read_and_close(result.body_chunks)
+                    with self._lock:
+                        self._mark_profile_idle(profile.id)
+                        owned = True  # released: the except below must not release again
+                        if short_answer is not None:
+                            name = self._profile_name(load_pool(), short_answer.profile_id)
+                    if short_answer is not None:
+                        return self._openai_short_rate_limit_refusal(
+                            short_answer.profile_id, name, _filter_openai_headers(short_answer.headers), now,
+                            headers, pinned)
+                    return self._openai_relay_saved_answer(quota_answer)
+
                 if not pinned and result.status < 400:
                     if session_key is not None:
                         self._remember_openai_session(session_key, profile.id)
@@ -2835,17 +2859,18 @@ class Gateway:
             #     seconds, so the local 503 (which the Codex CLI retries)
             #     beats every other answer, a saved quota 429 included.
             #  2. Otherwise a quota 429 saved from any attempt outranks a later
-            #     4xx followed by a network failure: it is the one answer that
-            #     tells the user why (and until when), and retrying does not
-            #     fix it. It is relayed as-is — also when it is itself the
-            #     answer a network failure followed.
+            #     401/4xx (whether or not a network failure followed): it is
+            #     the one answer that tells the user why (and until when), and
+            #     retrying does not fix it. It is relayed as-is — also when it
+            #     is itself the answer a network failure followed. A later 5xx
+            #     is relayed instead: the CLI retries it and it may clear.
             #  3. Otherwise, a network failure after a saved non-quota 4xx (a
             #     401, a 400) is a local 502 (below).
             #  4. Otherwise (a 5xx, or no later failure), the saved answer
             #     itself is relayed.
             if short_answer is not None:
                 last_answer = short_answer
-            elif quota_answer is not None and last_failure == "network" and 400 <= last_answer.status < 500:
+            elif quota_answer is not None and 400 <= last_answer.status < 500:
                 last_answer = quota_answer
             if last_answer.status == 429 and not last_answer.quota:
                 # A short 429 nothing else served: the same local 503 as when

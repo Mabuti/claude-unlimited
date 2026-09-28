@@ -249,3 +249,90 @@ def test_l2_a_saved_short_429_then_a_network_failure_is_the_local_503(pool_env, 
     assert result.status == 503 and result.error == gateway_module.OPENAI_ERROR_CODEX_UNAVAILABLE
     assert _tokens(up) == ["tok-c1", "tok-c2"]
     assert _counts(gw) == _BALANCED
+
+
+# ---- Precedence at the final attempt, not only after the loop --------------------------
+
+@pytest.mark.parametrize("home_answer", [lambda: _status(401), lambda: _status(503, body=b"busy")],
+                         ids=["401", "5xx"])
+def test_a_short_429_then_a_failing_last_resort_is_still_the_local_503(pool_env, monkeypatch, home_answer):
+    _two()
+    up = Upstream(monkeypatch, {"tok-c2": [_short_429({"retry-after": "8"})], "tok-c1": [home_answer()]})
+    gw = Gateway(transport=_no_transport)
+    _moved_off_cooling_home(gw)
+
+    result = gw.handle("POST", "/v1/responses", _session("s1"), MOVE_BODY)
+
+    assert result.status == 503 and result.error == gateway_module.OPENAI_ERROR_CODEX_UNAVAILABLE
+    assert result.headers["retry-after"] == "8"
+    assert _tokens(up) == ["tok-c2", "tok-c1"]
+    assert _counts(gw) == _BALANCED
+    assert all(c.closed for c in up.conns)
+
+
+@pytest.mark.parametrize("last", [lambda: _status(401), lambda: _status(503, body=b"busy")], ids=["401", "5xx"])
+def test_a_short_429_then_a_failing_final_account_is_still_the_local_503(pool_env, monkeypatch, last):
+    _two()
+    up = Upstream(monkeypatch, {"tok-c1": [_short_429({"retry-after": "7"})], "tok-c2": [last()]})
+    gw = Gateway(transport=_no_transport)
+
+    result = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
+
+    assert result.status == 503 and result.error == gateway_module.OPENAI_ERROR_CODEX_UNAVAILABLE
+    assert result.headers["retry-after"] == "7"
+    assert _counts(gw) == _BALANCED
+    assert all(c.closed for c in up.conns)
+
+
+def test_a_quota_429_outranks_a_final_401(pool_env, monkeypatch):
+    _two()
+    up = Upstream(monkeypatch, {"tok-c1": [_quota_429()], "tok-c2": [_status(401)]})
+    gw = Gateway(transport=_no_transport)
+
+    result = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
+
+    assert result.status == 429 and result.error is None and result.profile_id == "c1"
+    assert b"usage_limit_reached" in _drain(result)
+    assert _counts(gw) == _BALANCED
+    assert all(c.closed for c in up.conns)
+
+
+def test_a_final_5xx_after_a_quota_429_is_relayed(pool_env, monkeypatch):
+    _two()
+    up = Upstream(monkeypatch, {"tok-c1": [_quota_429()], "tok-c2": [_status(503, body=b"busy")]})
+    gw = Gateway(transport=_no_transport)
+
+    result = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
+
+    assert result.status == 503 and result.error is None and result.profile_id == "c2"
+    assert _drain(result) == b"busy"
+    assert _counts(gw) == _BALANCED
+
+
+def test_answer_precedence_holds_in_every_combination(pool_env, monkeypatch):
+    """Four accounts, session home (c1) cooling. When the request fails: any
+    short 429 among the answers -> the local 503; otherwise any quota 429 with
+    a final outcome that is not a 5xx -> that quota 429 relayed."""
+    ids = ["c1", "c2", "c3", "c4"]
+    behaviours = ["ok", "5xx", "net", "q429", "s429", "401"]
+    for i, combo in enumerate(itertools.product(behaviours, repeat=4)):
+        monkeypatch.setattr(gateway_module.runtime_state, "RUNTIME_STATE_FILE", pool_env / f"rp{i}.json")
+        monkeypatch.setattr(gateway_module, "secret_store", FakeSecretStore(
+            {pid: _codex_cred(f"tok-{pid}", f"acct-{pid}") for pid in ids}))
+        save_pool(Pool(profiles=[_codex(pid, priority=n) for n, pid in enumerate(ids, start=1)]))
+        by_token = {f"tok-{pid}": b for pid, b in zip(ids, combo)}
+        up = Upstream(monkeypatch, {t: _BEHAVIOURS[b]() for t, b in by_token.items()})
+        gw = Gateway(transport=_no_transport)
+        _moved_off_cooling_home(gw)
+        result = gw.handle("POST", "/v1/responses", _session("s1"), MOVE_BODY)
+        # What upstream actually answered, in order (a network failure is no answer).
+        seen = [by_token[t] for t in _tokens(up) if by_token[t] != "net"]
+        if result.status != 200:
+            if "s429" in seen:
+                assert (result.status, result.error) == (503, gateway_module.OPENAI_ERROR_CODEX_UNAVAILABLE), combo
+            elif "q429" in seen and seen[-1] not in ("5xx", "ok"):
+                assert result.status == 429 and result.error is None, combo
+        if result.body_chunks is not None:
+            _drain(result)
+        assert _counts(gw) == _BALANCED, combo
+        assert all(c.closed for c in up.conns), combo

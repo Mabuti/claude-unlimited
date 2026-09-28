@@ -232,12 +232,14 @@ Anthropic-shaped one "How a request flows" describes above:
     account stopped, and when it resets.
 
   **Answer precedence.** When one request saw several answers, the terminal answer is picked in
-  this order: (1) a short 429 from any attempt is the local `503` + `Retry-After` — that account
-  recovers in seconds and the CLI retries a 503, so this beats every other answer, a quota 429
-  included; (2) otherwise a quota 429 from any attempt outranks a later non-quota 4xx that a
-  network failure followed — it is relayed as-is, with its `Retry-After` and `x-codex-*` reset
-  headers; (3) otherwise a network failure after a saved non-quota 4xx is the local `502`;
-  (4) otherwise the last upstream answer (a 5xx, a 401, a 400, ...) is relayed.
+  this order, wherever the request ends (on its final attempt or after the loop): (1) a short
+  429 from any attempt is the local `503` + `Retry-After` from that 429 — that account recovers
+  in seconds and the CLI retries a 503, so this beats every other answer, a quota 429, a 401 and
+  a 5xx included; (2) otherwise a quota 429 from any attempt outranks a later 401 or other 4xx
+  (with or without a network failure after it) — it is relayed as-is, with its `Retry-After`
+  and `x-codex-*` reset headers; a later 5xx is relayed instead, since the CLI retries it;
+  (3) otherwise a network failure after a saved non-quota 4xx is the local `502`; (4) otherwise
+  the last upstream answer (a 5xx, a 401, a 400, ...) is relayed.
 
   A local refusal (an OpenAI-shaped error envelope) is otherwise only for a request no
   upstream answered, and its status is picked for how the Codex CLI reacts:
@@ -251,9 +253,9 @@ Anthropic-shaped one "How a request flows" describes above:
   | Every codex candidate is EXHAUSTED or DRAINING (out of quota) | `429` + `Retry-After` when known |
   | A stored credential could not be read, or no attempt was possible at all (e.g. the only cooling candidate was already tried in this request) | `503` + `Retry-After` when known — never `429` |
   | Every attempt made failed to connect (network error, TLS, timeout) — including a last-resort attempt on a cooling account | `502` — a 5xx, so the Codex CLI retries it |
-  | (An upstream did answer — see the two exceptions above) a short 429 from any attempt that nothing else could take, the last-resort attempt on a cooling account included — also when another attempt got a quota 429 or a network failure | `503` + `Retry-After` |
+  | (An upstream did answer — see the two exceptions above) a short 429 from any attempt that nothing else could take, the last-resort attempt on a cooling account included — also when another attempt got a quota 429, a 401, a 5xx or a network failure | `503` + `Retry-After` |
   | (An upstream did answer) a saved 401 or other non-quota, non-429 4xx, then the last attempt failed to connect | `502` |
-  | (An upstream did answer) a quota 429 and no short 429, then a network failure elsewhere | not a local refusal: the quota 429 itself is relayed (see "Answer precedence") |
+  | (An upstream did answer) a quota 429 and no short 429, then a 401/other 4xx or a network failure elsewhere | not a local refusal: the quota 429 itself is relayed (see "Answer precedence") |
 
   A candidate that is only cooling down no longer earns a local `503` by itself: it gets the
   last-resort attempt above, whose real answer is relayed.
