@@ -988,20 +988,23 @@ def test_failover_is_bounded_and_returns_the_last_real_answer(pool_env, monkeypa
 # ---- F4: truthful terminal answer ----------------------------------------------------
 
 def test_the_last_upstream_answer_wins_over_a_later_network_failure(pool_env, monkeypatch):
+    # A saved 5xx (which the Codex CLI retries) is relayed; a saved 4xx after
+    # a network failure is a local 502 instead (round 4, K4 — see
+    # test_gateway_openai_ingress_round4.py).
     save_pool(Pool(profiles=[_codex("c1"), _codex("c2", priority=2)]))
-    quota = _quota_429()
-    quota._headers["set-cookie"] = "x=y"
-    up = Upstream(monkeypatch, {"tok-c1": [quota], "tok-c2": [OSError("no route to host")]})
+    busy = _status(503, {"content-type": "application/json", "x-codex-primary-used-percent": "40",
+                         "set-cookie": "x=y"}, body=b'{"error":{"message":"upstream_overloaded"}}')
+    up = Upstream(monkeypatch, {"tok-c1": [busy], "tok-c2": [OSError("no route to host")]})
     gw = Gateway(transport=_no_transport)
 
     result = gw.handle("POST", "/v1/responses", _session("s1"), BODY)
 
-    assert result.status == 429
+    assert result.status == 503
     assert result.error is None
     assert result.profile_id == "c1"
-    assert b"usage_limit_reached" in _drain(result)
+    assert b"upstream_overloaded" in _drain(result)
     assert "set-cookie" not in {k.lower() for k in result.headers}
-    assert result.headers["x-codex-primary-used-percent"] == "100"
+    assert result.headers["x-codex-primary-used-percent"] == "40"
     assert all(c.closed for c in up.conns)
     assert gw.serving_now_ids() == set()
 

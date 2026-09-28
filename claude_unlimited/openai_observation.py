@@ -17,8 +17,9 @@ assume two exist.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from .observation import (
@@ -57,19 +58,44 @@ _WINDOW_LABELS = (
 )
 _WINDOW_TOLERANCE = 0.05
 
+# A 429 whose window reports at least this much used is quota exhaustion, not
+# a brief rate limit.
+_QUOTA_EXHAUSTED_PERCENT = 99.5
+
 
 def _parse_float(raw: Optional[str]) -> Optional[float]:
+    """A header's number, or None when it is absent, unparseable, or not
+    finite (`inf`, `nan`): a value no window, reset or backoff can be built
+    from is treated exactly like a missing header, never raised."""
     if raw is None:
         return None
     try:
-        return float(raw)
-    except ValueError:
+        value = float(raw)
+    except (TypeError, ValueError):
         return None
+    return value if math.isfinite(value) else None
 
 
 def _reset_from_epoch(raw: Optional[str]) -> Optional[datetime]:
     epoch = _parse_float(raw)
-    return datetime.fromtimestamp(epoch, tz=timezone.utc) if epoch is not None else None
+    if epoch is None:
+        return None
+    try:
+        return datetime.fromtimestamp(epoch, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None  # a timestamp no datetime can hold: as good as absent
+
+
+def _reset_from_seconds(raw: Optional[str], now: datetime) -> Optional[datetime]:
+    """`now` plus a reset-after-seconds header, or None when it is absent,
+    negative, not finite, or too large for a datetime."""
+    seconds = _parse_float(raw)
+    if seconds is None or seconds < 0:
+        return None
+    try:
+        return now + timedelta(seconds=seconds)
+    except (OverflowError, ValueError):
+        return None
 
 
 def _label_for_window_minutes(minutes: Optional[float]) -> Optional[str]:
@@ -134,15 +160,27 @@ def classify(status_code: int, headers: dict[str, str], now: datetime) -> Observ
         return AuthInvalid()
 
     if status_code == 429:
-        primary = _parse_window(headers, "primary", now)
         # This backend has no structured "fully exhausted" signal distinct
-        # from a bare rate-limit, so a used-percent at or near 100 on
-        # whichever window exists is treated as QuotaExhausted, mirroring
-        # Anthropic's `-status: rejected` handling. Anything else becomes a
-        # ShortRateLimit, which router.py handles with escalating backoff
-        # even without a retry-after.
-        if primary is not None and primary.used_percent >= 99.5:
-            return QuotaExhausted(resets_at=primary.resets_at)
+        # from a bare rate-limit, so a used-percent at or near 100 on EITHER
+        # window is treated as QuotaExhausted, mirroring Anthropic's
+        # `-status: rejected` handling: a spent weekly (secondary) window
+        # with a fresh 5h (primary) one is exhausted until the WEEKLY reset,
+        # not a brief rate limit. Anything else becomes a ShortRateLimit,
+        # which router.py handles with escalating backoff even without a
+        # retry-after.
+        resets: list[Optional[datetime]] = []
+        for prefix in ("primary", "secondary"):
+            window = _parse_window(headers, prefix, now)
+            if window is None or window.used_percent < _QUOTA_EXHAUSTED_PERCENT:
+                continue
+            # The absolute reset-at when it came; otherwise reset-after-seconds
+            # from now, so an exhausted window never loses its reset time.
+            resets.append(window.resets_at
+                          or _reset_from_seconds(headers.get(f"x-codex-{prefix}-reset-after-seconds"), now))
+        if resets:
+            known = [reset for reset in resets if reset is not None]
+            # Both spent: usable again only once the LATER one resets.
+            return QuotaExhausted(resets_at=max(known) if known else None)
         retry_after = _parse_float(headers.get("retry-after"))
         return ShortRateLimit(retry_after_seconds=retry_after)
 

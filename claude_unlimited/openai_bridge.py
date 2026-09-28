@@ -30,7 +30,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Iterator, Optional
 from urllib.parse import urlsplit
 
-from . import codex_state, openai_credential, openai_login
+from . import codex_state, openai_credential, openai_login, usage_tracking
 from . import openai_translate
 from .openai_translate import user_turn_index
 from .config import Profile
@@ -61,7 +61,12 @@ class OpenAIBridgeError(Exception):
     """A local or network-level failure with no response to classify.
 
     Mirrors upstream.py's OSError-shaped failures on the Anthropic path, so
-    gateway.py's codex branch handles it the same way (cooldown, rotate)."""
+    gateway.py's codex branch handles it the same way (cooldown, rotate).
+
+    `upstream_requests` is how many upstream requests run_passthrough had
+    sent before it failed (its one bounded retry makes it up to two)."""
+
+    upstream_requests: int = 1
 
 
 @dataclass
@@ -69,6 +74,9 @@ class OpenAIBridgeResult:
     status: int
     headers: dict[str, str]
     body_chunks: Iterator[bytes]
+    # How many upstream requests produced this result: 2 when
+    # run_passthrough's one bounded retry ran, else 1.
+    upstream_requests: int = 1
 
 
 def _uuid7() -> str:
@@ -428,7 +436,7 @@ _TERMINAL_EVENT_TYPES = frozenset({
 })
 
 
-def _stream_reads(resp, conn, *, parse_events: bool = True) -> Iterator[tuple[bytes, list]]:
+def _stream_reads(resp, conn, *, parse_events: Optional[bool] = True) -> Iterator[tuple[bytes, list]]:
     """Owns the socket read of a successful response.
 
     Yields (raw chunk exactly as read, provider events that chunk completed).
@@ -437,6 +445,12 @@ def _stream_reads(resp, conn, *, parse_events: bool = True) -> Iterator[tuple[by
     yielded. The raw chunk is never altered, so the translating path (run)
     and the verbatim relay (run_passthrough) share this one read loop.
 
+    `parse_events`: True parses SSE events, False never does, and None means
+    the response declared no Content-Type — the first bytes then decide
+    (usage_tracking.sniff_event_stream, the same sniff usage capture uses).
+    The ChatGPT Codex backend streams with no Content-Type at all (measured
+    live), so without the sniff its terminal event would never be seen.
+
     A chunked response closed without its zero-length terminator is accepted
     only once the terminal event has arrived (and said so on stderr);
     otherwise the http.client.IncompleteRead is raised to the caller, after
@@ -444,6 +458,8 @@ def _stream_reads(resp, conn, *, parse_events: bool = True) -> Iterator[tuple[by
     exit."""
     buffer = b""
     terminal_event_seen = False
+    # Bytes held (for parsing only) while an undeclared body is sniffed.
+    undecided = b""
     try:
         while True:
             incomplete = None
@@ -459,10 +475,19 @@ def _stream_reads(resp, conn, *, parse_events: bool = True) -> Iterator[tuple[by
                 # truncated SSE stream must still fail visibly.
                 incomplete = exc
                 chunk = exc.partial
-            if not chunk:
-                if incomplete is None:
-                    break
-            elif parse_events:
+            ended = not chunk and incomplete is None   # a clean end of the body
+            if parse_events is None:
+                # No declared type: hold the first bytes (a private copy,
+                # the raw chunk is still yielded below) until they decide.
+                # The body's end decides with whatever there is.
+                undecided += chunk or b""
+                parse_events = usage_tracking.sniff_event_stream(
+                    undecided, final=ended or incomplete is not None)
+                if parse_events:
+                    buffer += undecided
+                if parse_events is not None:
+                    undecided = b""
+            elif parse_events and chunk:
                 buffer += chunk
             events: list = []
             if parse_events:
@@ -483,6 +508,8 @@ def _stream_reads(resp, conn, *, parse_events: bool = True) -> Iterator[tuple[by
                         events.append(event)
             if chunk or events:
                 yield (chunk or b""), events
+            if ended:
+                break
             if incomplete is not None:
                 if terminal_event_seen:
                     # Not silent: this is us deciding a protocol-level
@@ -844,7 +871,8 @@ def _without_encrypted_items(body: bytes) -> tuple:
 def run_passthrough(profile: Profile, stored_credential: str, method: str, path_suffix: str,
                     body: bytes, client_headers: dict,
                     timeout: float = DEFAULT_TIMEOUT_SECONDS,
-                    on_stream_failure: Optional[Callable[[BaseException], None]] = None
+                    on_stream_failure: Optional[Callable[[BaseException], None]] = None,
+                    max_upstream_requests: int = 2,
                     ) -> OpenAIBridgeResult:
     """Relays one Codex CLI request (already OpenAI Responses-shaped) to this
     codex-kind Profile's backend, with nothing translated either way.
@@ -855,15 +883,20 @@ def run_passthrough(profile: Profile, stored_credential: str, method: str, path_
     (_passthrough_headers); the Profile's credential replaces the client's.
     The response comes back with its raw status and headers, and body_chunks
     yields the upstream bytes exactly as they arrive. An error status is read
-    whole (error bodies are small) and returned as-is.
+    up to _MAX_ERROR_BODY_BYTES (anything past that is left unread, the
+    connection is closed, and the truncated bytes are the error body) and
+    returned as-is.
 
     One bounded exception to "byte-identical": a 400 whose error text
     mentions encryption (see _ENCRYPTED_REASONING_REFUSAL), for a request
     that carried encrypted input items or x-codex-turn-state, is retried
     ONCE without every encrypted reasoning AND compaction item and without
-    x-codex-turn-state (see _without_encrypted_items). Raises
-    OpenAIBridgeError when there was no response at all, and ValueError for a
-    suffix that must not be forwarded (the gateway checks it first).
+    x-codex-turn-state (see _without_encrypted_items) — but only when
+    `max_upstream_requests` (what is left of the caller's attempt budget)
+    allows a second request; the result's `upstream_requests` says how many
+    were sent. Raises OpenAIBridgeError when there was no response at all
+    (its `upstream_requests` says how many were sent first), and ValueError
+    for a suffix that must not be forwarded (the gateway checks it first).
 
     `on_stream_failure` is called (at most once, with the exception) when a
     response that began < 400 then fails to read before its terminal event
@@ -880,9 +913,11 @@ def run_passthrough(profile: Profile, stored_credential: str, method: str, path_
     payload = body
     send_headers = client_headers
     retried_without_reasoning = False
+    sent = 0
     while True:
         headers = _passthrough_headers(send_headers, cred, is_subscription, len(payload))
         conn = None
+        sent += 1
         try:
             conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout)
             conn.request(method, parts.path or "/", body=payload, headers=headers)
@@ -890,19 +925,25 @@ def run_passthrough(profile: Profile, stored_credential: str, method: str, path_
         except (OSError, http.client.HTTPException) as exc:
             if conn is not None:
                 conn.close()
-            raise OpenAIBridgeError(f"Could not reach {parts.hostname}: {exc}") from exc
+            error = OpenAIBridgeError(f"Could not reach {parts.hostname}: {exc}")
+            error.upstream_requests = sent
+            raise error from exc
 
         response_headers = dict(resp.getheaders())
         if resp.status < 400:
             break
 
         try:
-            raw = resp.read()
+            raw = _read_error_body(resp)
         except (OSError, http.client.HTTPException) as exc:
-            raise OpenAIBridgeError(f"Connection to {parts.hostname} failed mid-response: {exc}") from exc
+            error = OpenAIBridgeError(f"Connection to {parts.hostname} failed mid-response: {exc}")
+            error.upstream_requests = sent
+            raise error from exc
         finally:
             conn.close()
-        if (resp.status == 400 and not retried_without_reasoning
+        # The retry is a second upstream request: only when the caller's
+        # attempt budget still has room for one.
+        if (resp.status == 400 and not retried_without_reasoning and sent < max_upstream_requests
                 and _ENCRYPTED_REASONING_REFUSAL.search(raw.decode("utf-8", errors="replace"))):
             stripped, compaction_dropped = _without_encrypted_items(payload)
             turn_state_sent = any(str(k).lower() == "x-codex-turn-state" for k in (send_headers or {}))
@@ -919,10 +960,16 @@ def run_passthrough(profile: Profile, stored_credential: str, method: str, path_
                     payload = stripped
                 send_headers = without_header(send_headers, "x-codex-turn-state")
                 continue
-        return OpenAIBridgeResult(status=resp.status, headers=response_headers, body_chunks=iter([raw]))
+        return OpenAIBridgeResult(status=resp.status, headers=response_headers, body_chunks=iter([raw]),
+                                  upstream_requests=sent)
 
-    content_type = {k.lower(): v for k, v in response_headers.items()}.get("content-type", "")
-    reads = _stream_reads(resp, conn, parse_events="text/event-stream" in content_type)
+    # Events are parsed whenever the body is a stream: declared as
+    # text/event-stream (any case, parameters ignored) or — the ChatGPT Codex
+    # backend sends no Content-Type at all — sniffed as SSE from its first
+    # bytes. Without them the terminal event is never seen, and the benign
+    # truncated chunked close after it would look like a mid-stream failure.
+    content_type = {str(k).lower(): v for k, v in response_headers.items()}.get("content-type")
+    reads = _stream_reads(resp, conn, parse_events=usage_tracking.declared_event_stream(content_type))
 
     def _relayed_chunks() -> Iterator[bytes]:
         terminal_event_seen = False
@@ -950,7 +997,27 @@ def run_passthrough(profile: Profile, stored_credential: str, method: str, path_
             conn.close()
 
     return OpenAIBridgeResult(status=resp.status, headers=response_headers,
-                              body_chunks=_ClosingChunks(_relayed_chunks(), conn))
+                              body_chunks=_ClosingChunks(_relayed_chunks(), conn), upstream_requests=sent)
+
+
+# How much of an upstream ERROR body run_passthrough reads. A real error body
+# is a small JSON envelope; one past this is not worth holding, and a body
+# that never ends must not keep the request (and its failover) waiting.
+_MAX_ERROR_BODY_BYTES = 64 * 1024
+
+
+def _read_error_body(resp) -> bytes:
+    """At most _MAX_ERROR_BODY_BYTES of an error response's body. One byte
+    past the cap is asked for, so a body of exactly the cap is read to its
+    end; anything longer is truncated to the cap and the rest is left unread
+    (the caller closes the connection)."""
+    data = b""
+    while len(data) <= _MAX_ERROR_BODY_BYTES:
+        chunk = resp.read(_MAX_ERROR_BODY_BYTES + 1 - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data[:_MAX_ERROR_BODY_BYTES]
 
 
 class _ClosingChunks:

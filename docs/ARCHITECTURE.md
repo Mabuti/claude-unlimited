@@ -164,13 +164,17 @@ Anthropic-shaped one "How a request flows" describes above:
   items or `x-codex-turn-state`, it is retried **once** on the same Profile without every
   `reasoning` AND `compaction` item carrying `encrypted_content`, and without
   `x-codex-turn-state`. Any other 400 is relayed as-is. The daemon log (stderr) says so, and
-  says when compacted history was dropped.
+  says when compacted history was dropped. The retry is an upstream request like any other:
+  it counts against the request's `MAX_ROTATION_ATTEMPTS`, and is skipped when that budget
+  has no request left.
 - **In-request failover.** Only status and headers have arrived when the gateway decides, so
   no body byte has reached the client yet. When the request is not pinned and another codex
   Profile can take it, a quota 429, any other 429, a 401, a 5xx/529 or a network failure moves
   **this** request to the next codex Profile — at most `MAX_ROTATION_ATTEMPTS` (4) upstream
-  attempts in total. Every discarded upstream response is read (error bodies are small) and
-  its connection closed before the next attempt. A 5xx that `openai_observation.classify()`
+  requests in total, the one bounded retry above included. An upstream error body is read
+  only up to 64 KiB (the rest is left unread and the connection closed; the truncated bytes
+  are what is kept and relayed), so an endless or huge error body cannot hold up failover.
+  A 5xx that `openai_observation.classify()`
   has no mapping for (504, 520-524, ...) is observed as `ProviderUnavailable` by the gateway,
   so it cools the account exactly like a 500/502/503/529.
 - **Mid-stream failure.** Once a `200` has started streaming, the request can no longer move.
@@ -180,33 +184,57 @@ Anthropic-shaped one "How a request flows" describes above:
   Profile as `ProviderUnavailable` — the same bounded cooldown a network failure earns — so
   the Codex CLI's own reconnect lands on another account instead of the same sticky one. A
   clean end, or a failure after the terminal event, cools nothing; nor does a pinned session,
-  which could not land anywhere else.
+  which could not land anywhere else. The relay looks for the terminal event whenever the
+  body is a stream: `Content-Type: text/event-stream` in any case and with any parameters,
+  or **no Content-Type at all** — which is what chatgpt.com actually sends (measured live) —
+  with a body whose first bytes are SSE (the same sniff usage capture uses). So the backend's
+  habit of closing a complete stream without the chunked terminator is accepted as the
+  benign close it is, instead of cooling the account that just served the turn.
 - **Last-resort attempt on a cooling account.** The Codex CLI retries a 503 about 30 times over
   roughly 24 seconds and ignores `Retry-After`, while a first cooldown is 30 seconds and
   doubles. So with one codex account, a single transient break (a mid-stream failure, an
   unmapped 5xx, a network error) would otherwise turn every retry of the next turn into a local
   503 until the CLI gave up. Instead, when nothing ELIGIBLE (or DRAINING, for a session already
   there) can take the request but an enabled codex candidate is in COOLDOWN, the request makes
-  **one** last-resort attempt on the COOLDOWN candidate whose cooldown ends soonest (never one
-  already tried in this request) and relays that account's real answer — success or failure; a
+  **one** last-resort attempt — on the session's **own** account when that one is cooling
+  down (its encrypted reasoning and turn state decrypt there, so nothing is stripped),
+  otherwise on the COOLDOWN candidate whose cooldown ends soonest (never one
+  already tried in this request) — and relays that account's real answer — success or failure; a
   failure is observed as usual and extends the cooldown. A pinned request whose account is only
   cooling down is likewise tried. EXHAUSTED, AUTH_INVALID and disabled accounts are never
   tried this way. The cooldown bookkeeping itself is unchanged: it still steers rotation away
   from the account whenever another one can serve.
 - **Truthful terminal answer.** When attempts fail and nothing else can serve the request, the
   client gets the **last upstream response itself** — its status, its allowlisted headers and
-  its body. A local refusal (an OpenAI-shaped error envelope) is only for a request no
-  upstream answered, and its status is picked for how the Codex CLI 0.144 reacts (it retries a
-  5xx — a 503 about 30 times — and shows a 400, 405 or 429 once):
+  its body — with two exceptions, both because the Codex CLI 0.144 retries a 5xx (a 503 about
+  30 times) but shows a 400, 401, 405 or 429 once and stops:
+  - **A short 429 with nowhere to go.** A 429 that is *not* quota exhaustion
+    (`ShortRateLimit`, or a 429 classify() cannot place) that no other codex account can take
+    this request from — the session is pinned, there is one account, or the attempt budget is
+    spent — is answered with a local `503` + `Retry-After` (the upstream's own
+    `retry-after`, else the soonest reset its `x-codex-*` headers name, else the cooldown the
+    account was just given). The CLI retries it, and its retry reaches the account again by
+    the last-resort attempt once the limit has cleared. A **quota** 429 is still relayed:
+    waiting seconds does not fix it.
+  - **A network failure after a saved 4xx.** When the last attempt never got a response (a
+    network error) and the answer saved from an earlier attempt is a 4xx (a 429 of either
+    kind, a 401), the client gets the local `502` instead, which it retries. A saved 5xx is
+    still relayed — the CLI retries that already.
+
+  A local refusal (an OpenAI-shaped error envelope) is otherwise only for a request no
+  upstream answered, and its status is picked for how the Codex CLI reacts:
 
   | Situation (no upstream answered) | Status |
   |---|---|
   | Not a `POST` (e.g. `GET /v1/responses/{id}`) — no upstream attempt at all | `405` + `Allow: POST` |
-  | A path or suffix that is not relayed, or a body over the size cap | `400` |
+  | A path or suffix that is not relayed | `400` |
+  | A `Content-Length` that is missing (on a `POST`), negative, malformed, given twice with different values, or over the 20 MB body cap, or any `Transfer-Encoding` — judged by the daemon from the headers **before a byte of the body is read**; the body is never read and the connection is closed (`Connection: close`) | `400` |
   | No codex Profile can ever serve it: none enabled, pinned to a non-codex or missing Profile, pinned Profile disabled or needing re-auth, or every enabled one needs re-auth or is manual | `400` |
   | Every codex candidate is EXHAUSTED or DRAINING (out of quota) | `429` + `Retry-After` when known |
   | A stored credential could not be read, or no attempt was possible at all (e.g. the only cooling candidate was already tried in this request) | `503` + `Retry-After` when known — never `429` |
   | Every attempt made failed to connect (network error, TLS, timeout) — including a last-resort attempt on a cooling account | `502` — a 5xx, so the Codex CLI retries it |
+  | (An upstream did answer — see the two exceptions above) a short 429 nothing else could take | `503` + `Retry-After` |
+  | (An upstream did answer) a saved 4xx, then the last attempt failed to connect | `502` |
 
   A candidate that is only cooling down no longer earns a local `503` by itself: it gets the
   last-resort attempt above, whose real answer is relayed.
@@ -237,8 +265,15 @@ Anthropic-shaped one "How a request flows" describes above:
   which the takeover is what makes servable. A session already mapped to a working account
   stays there. A takeover naming a Claude account has no effect on this ingress, and one whose
   codex Profile stops being ELIGIBLE is cleared, as on the Claude side.
-- Rotation and quota observation reuse `openai_observation.py` unchanged — the same
-  usage-header parsing a translated `codex`-kind response already goes through.
+- Rotation and quota observation reuse `openai_observation.py` — the same usage-header
+  parsing a translated `codex`-kind response already goes through, so both paths change
+  together. A 429 is quota exhaustion when **either** window (primary or secondary) is at
+  99.5% or more, parked until that window's reset (the later one when both are spent),
+  taken from `reset-at` or, failing that, `reset-after-seconds` from now: a spent weekly
+  window with a fresh 5h one is EXHAUSTED until the weekly reset, not a brief cooldown.
+  A header value that is not a finite number, or a time no datetime can hold (`inf`, `nan`,
+  `1e300`), is ignored as if absent — by the parser, and before it by the gateway's header
+  filter.
 
 **Phase 2 — Codex CLI traffic served by Claude accounts — is not implemented.** Every
 `POST /v1/responses` request is answered by a codex-kind Profile only; there is no reverse

@@ -56,6 +56,34 @@ def _looks_like_sse(head: bytes) -> bool:
     return head.startswith((b"event:", b"data:", b"id:", b"retry:", b":"))
 
 
+def declared_event_stream(content_type: Optional[str]) -> Optional[bool]:
+    """Whether a Content-Type header value declares an SSE body: True for
+    text/event-stream (any case, parameters such as `; charset=utf-8`
+    ignored), False for any other declared type, None when there is no
+    declared type at all (absent or blank) — the caller must sniff.
+
+    Shared by UsageCapture and openai_bridge's relay, so the two can never
+    disagree about whether a body is a stream."""
+    if content_type is None:
+        return None
+    media_type = str(content_type).split(";", 1)[0].strip().lower()
+    if not media_type:
+        return None
+    return media_type == "text/event-stream"
+
+
+def sniff_event_stream(head: bytes, final: bool = False) -> Optional[bool]:
+    """Decides, from the first bytes of a body with no declared type, whether
+    it is SSE: True/False, or None while too few bytes have arrived to say
+    (unless `final`, when what there is decides). An SSE body opens with a
+    field ("event:", "data:", "id:", "retry:") or a ":" comment line; a JSON
+    body never does."""
+    stripped = head.lstrip(_SNIFF_SKIP)
+    if not final and len(stripped) < _SNIFF_BYTES and b"\n" not in stripped:
+        return None
+    return _looks_like_sse(head)
+
+
 class UsageCapture:
     def __init__(self) -> None:
         self.model: Optional[str] = None
@@ -73,17 +101,18 @@ class UsageCapture:
         # ":" comment line, a JSON body never does.
         # Undecided bytes are only held for PARSING; every chunk is still
         # forwarded the moment it arrives.
-        is_sse: Optional[bool] = ("text/event-stream" in content_type) if content_type else None
+        # A declared type is matched case-insensitively, parameters ignored
+        # (`Text/Event-Stream; charset=utf-8` is a stream).
+        is_sse: Optional[bool] = declared_event_stream(content_type)
         undecided = b""
         for chunk in chunks:
             to_parse = chunk
             if is_sse is None:
                 undecided += chunk
-                head = undecided.lstrip(_SNIFF_SKIP)
-                if len(head) < _SNIFF_BYTES and b"\n" not in head:
+                is_sse = sniff_event_stream(undecided)
+                if is_sse is None:
                     yield chunk
                     continue
-                is_sse = _looks_like_sse(undecided)
                 to_parse, undecided = undecided, b""
             try:
                 if is_sse:
@@ -161,7 +190,7 @@ class UsageCapture:
         if self._json_buffer_capped or not self._json_buffer:
             return
         payload = json.loads(self._json_buffer.decode("utf-8"))
-        if _is_openai_usage(payload.get("usage")):
+        if _is_openai_response(payload):
             self._take_openai_response(payload)
             return
         if payload.get("model"):
@@ -182,14 +211,23 @@ class UsageCapture:
             self.usage = usage
 
 
-def _is_openai_usage(usage) -> bool:
-    """An OpenAI Responses usage object, as opposed to Anthropic's: it reports
-    cached input inside input_tokens_details and has no cache_* fields."""
-    return (isinstance(usage, dict)
-            and "cache_read_input_tokens" not in usage
-            and "cache_creation_input_tokens" not in usage
-            and ("input_tokens_details" in usage or "output_tokens_details" in usage
-                 or "total_tokens" in usage))
+def _is_openai_response(payload) -> bool:
+    """A JSON body that is an OpenAI Responses object, as opposed to an
+    Anthropic one — decided only on OpenAI-SPECIFIC markers: the body says
+    `"object": "response"`, or its usage reports input_tokens_details /
+    output_tokens_details (and none of Anthropic's cache_* fields). A usage
+    object with only input/output/total token counts is NOT enough: that
+    shape is generic, and anything short of a marker keeps the Anthropic
+    interpretation it always had."""
+    if not isinstance(payload, dict):
+        return False
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return False
+    if "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage:
+        return False
+    return (payload.get("object") == "response"
+            or "input_tokens_details" in usage or "output_tokens_details" in usage)
 
 
 def _openai_usage(usage) -> Optional[dict]:

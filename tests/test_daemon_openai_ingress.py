@@ -175,6 +175,24 @@ def test_quota_refusal_is_a_single_shot_429_with_retry_after(server_with, monkey
                                  "resets_in_seconds": 120}}
 
 
+@pytest.mark.parametrize("path", ["/v1/responses", "/v1/messages"])
+def test_a_refusal_sends_retry_after_exactly_once(server_with, monkeypatch, path):
+    # _send_json used to write every extra header twice (one unfiltered loop,
+    # then a filtered one), so each refusal carried two Retry-After headers.
+    base = server_with([_codex()])
+    monkeypatch.setattr(daemon._gateway, "handle", lambda *a, **kw: GatewayResult(
+        status=429, headers={"retry-after": "120"}, body_chunks=None, profile_id=None,
+        error="openai_codex_exhausted" if path == "/v1/responses" else "no_eligible_profile"))
+
+    try:
+        urllib.request.urlopen(_post(base, path, body=b'{"stream": false}'), timeout=5)
+    except urllib.error.HTTPError as e:
+        assert e.code == 429
+        assert e.headers.get_all("Retry-After") == ["120"]
+    else:
+        raise AssertionError("expected an HTTP error")
+
+
 def test_end_to_end_relay_through_the_daemon(server_with, monkeypatch):
     FakeHTTPSConnection.instances = []
     sse = (b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n"

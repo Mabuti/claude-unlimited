@@ -23,6 +23,7 @@ import hashlib
 import http.client
 import itertools
 import json
+import math
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -145,7 +146,39 @@ def _filter_openai_headers(headers: dict[str, str]) -> dict[str, str]:
     allowlist before classify() ever sees them, same contract as the
     Anthropic side."""
     lower = {k.lower(): v for k, v in headers.items()}
-    return {k: lower[k] for k in openai_observation.ALLOWED_HEADERS if k in lower}
+    return {k: lower[k] for k in openai_observation.ALLOWED_HEADERS
+            if k in lower and _usable_numeric_header(k, lower[k])}
+
+
+# Allowed OpenAI headers whose value is text, not a number.
+_OPENAI_TEXT_HEADERS = frozenset({"x-codex-plan-type", "x-codex-credits-has-credits"})
+
+
+def _usable_numeric_header(name: str, value) -> bool:
+    """False for a rate-limit, reset or retry-after header whose value is a
+    number nothing can be built from: `inf`/`nan`, a reset-at no datetime
+    can hold, or a number of seconds no timedelta can hold. Such a header is
+    dropped before openai_observation ever sees it, so a hostile or broken
+    upstream value yields a normal response rather than an exception
+    (openai_observation's own parser ignores them too — this is the second
+    line). A value that is not a number at all is left for the parser, which
+    already treats it as absent."""
+    if name in _OPENAI_TEXT_HEADERS:
+        return True
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(number):
+        return False
+    try:
+        if name.endswith("-reset-at"):
+            datetime.fromtimestamp(number, tz=timezone.utc)
+        elif name.endswith("-reset-after-seconds") or name == "retry-after":
+            datetime.now(timezone.utc) + timedelta(seconds=number)
+    except (OverflowError, OSError, ValueError):
+        return False
+    return True
 
 
 # ---- OpenAI-shaped ingress (the Codex CLI) ---------------------------------
@@ -332,15 +365,46 @@ def _openai_failover_reason(status: int, observation) -> Optional[str]:
 class _UpstreamAnswer:
     """An upstream response this request moved away from, kept so the
     client can still be given the truth if nothing else serves it. The body
-    is an error body (small, already read whole by run_passthrough)."""
+    is an error body (small: run_passthrough reads at most 64 KiB of one).
+    `quota` is whether it was observed as QuotaExhausted."""
 
-    __slots__ = ("status", "headers", "body", "profile_id")
+    __slots__ = ("status", "headers", "body", "profile_id", "quota")
 
-    def __init__(self, status: int, headers: dict, body: bytes, profile_id: str) -> None:
+    def __init__(self, status: int, headers: dict, body: bytes, profile_id: str, quota: bool = False) -> None:
         self.status = status
         self.headers = headers
         self.body = body
         self.profile_id = profile_id
+        self.quota = quota
+
+
+def _openai_short_limit_retry_after(codex_headers: dict, rt: Optional[ProfileRuntime],
+                                    now: datetime) -> Optional[int]:
+    """Retry-After, in whole seconds, for the local 503 that stands in for a
+    short (non-quota) 429 nothing else could take: the upstream's own
+    retry-after; else the soonest reset its x-codex-* headers name
+    (reset-after-seconds or reset-at, either window); else the cooldown the
+    account was just given. `codex_headers` must already be filtered by
+    _filter_openai_headers (lowercase, non-finite values dropped)."""
+    seconds = _retry_after_seconds(codex_headers.get("retry-after"))
+    if seconds is None:
+        deadlines = []
+        for prefix in ("primary", "secondary"):
+            after = _retry_after_seconds(codex_headers.get(f"x-codex-{prefix}-reset-after-seconds"))
+            if after is not None:
+                deadlines.append(after)
+            at = _retry_after_seconds(codex_headers.get(f"x-codex-{prefix}-reset-at"))
+            if at is not None:
+                remaining = at - now.timestamp()
+                if remaining > 0:
+                    deadlines.append(remaining)
+        if deadlines:
+            seconds = min(deadlines)
+    if seconds is not None:
+        return max(1, math.ceil(seconds))
+    if rt is not None:
+        return _pool_retry_after_seconds(PoolSnapshot(profiles=[rt]), now)
+    return None
 
 
 def _read_and_close(chunks) -> bytes:
@@ -385,6 +449,11 @@ def _close_all(closers) -> None:
             _close_quietly(closer)
 
 
+# How often a flowing response body refreshes its Profile's in-flight
+# timestamp (see Gateway._touch_in_flight): at most once per this many seconds.
+_IN_FLIGHT_TOUCH_SECONDS = 1.0
+
+
 class _InFlightBody:
     """A response body that owns one in-flight slot (see
     Gateway._mark_profile_busy) and the upstream it was read from.
@@ -416,11 +485,14 @@ class _InFlightBody:
     exhaustion keep the plain blocking release."""
 
     def __init__(self, chunks, release: Callable[[], None], closers=(),
-                 try_release: Optional[Callable[[], bool]] = None) -> None:
+                 try_release: Optional[Callable[[], bool]] = None,
+                 touch: Optional[Callable[[], None]] = None) -> None:
         self._chunks = iter(chunks)
         self._inner = chunks
         self._release = release
         self._try_release = try_release
+        self._touch = touch
+        self._last_touch = float("-inf")
         self._closers = tuple(c for c in closers if c is not None)
         self._closed = False
         self._close_lock = threading.Lock()
@@ -432,11 +504,24 @@ class _InFlightBody:
         if self._closed:
             raise StopIteration
         try:
-            return next(self._chunks)
+            chunk = next(self._chunks)
         except BaseException:
             # StopIteration (drained) and a failed read both end the body.
             self.close()
             raise
+        if self._touch is not None:
+            # Bytes are flowing: the slot is live, however long the stream
+            # has run (see Gateway._touch_in_flight). At most once per
+            # _IN_FLIGHT_TOUCH_SECONDS, so a fast stream takes the gateway
+            # lock about once a second, not once per chunk.
+            now = time.monotonic()
+            if now - self._last_touch >= _IN_FLIGHT_TOUCH_SECONDS:
+                self._last_touch = now
+                try:
+                    self._touch()
+                except Exception:  # noqa: BLE001 - bookkeeping must never break the relay
+                    pass
+        return chunk
 
     def close(self) -> None:
         self._close(finalizing=False)
@@ -745,9 +830,11 @@ def _codex_5h_percent(headers: dict) -> Optional[float]:
     """The primary (5h) window percentage a Codex response reported."""
     value = {k.lower(): v for k, v in (headers or {}).items()}.get("x-codex-primary-used-percent")
     try:
-        return float(value) if value is not None else None
+        percent = float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+    # `nan`/`inf` is not a percentage; never record one in usage history.
+    return percent if percent is None or math.isfinite(percent) else None
 
 
 def _anthropic_5h_percent(headers: dict) -> Optional[float]:
@@ -1083,12 +1170,13 @@ class Gateway:
     dropped, not restored — see _sync_snapshot()."""
 
     _USED_NOW_GRACE_SECONDS = 900.0  # 15 minutes — see the class docstring
-    # Upper bound on how long a single in-flight request can keep a Profile
-    # "Used now". A real streaming request finishes in seconds to a couple of
-    # minutes; anything still marked in-flight past this is a leaked/hung slot
-    # (a client that walked away, an upstream that never closed), so stop
-    # counting it rather than pinning the indicator — and the idle check — on
-    # forever. Generous enough never to drop a genuinely-live request.
+    # Upper bound on how long an in-flight slot with NO bytes flowing can keep
+    # a Profile "Used now". Measured from the slot's last sign of life (its
+    # start, or the last chunk a body delivered — see _touch_in_flight), so a
+    # long stream that keeps sending stays live however long it runs; a slot
+    # silent this long is a leaked/hung one (a client that walked away, an
+    # upstream that never closed), so stop counting it rather than pinning
+    # the indicator — and the idle check — on forever.
     _IN_FLIGHT_MAX_SECONDS = 300.0  # 5 minutes
     _REFRESH_CHECK_COOLDOWN_SECONDS = 60.0
     # Recovery attempts on a Profile that is ALREADY needs-re-auth get their
@@ -1168,7 +1256,9 @@ class Gateway:
         # (real traffic or usage_probe) — so a background check can skip an
         # account real traffic already refreshed.
         self._usage_observed_at: dict[str, float] = {}
-        # Monotonic time each Profile's current in-flight streak began. A
+        # Monotonic time each Profile's current in-flight streak began, moved
+        # forward whenever one of its response bodies delivers bytes (see
+        # _touch_in_flight) — so it is really "last sign of life". A
         # request that never drains — a client that abandons the stream, or an
         # upstream connection that hangs open — would otherwise leave its
         # Profile in _in_flight forever, pinning "Used now" and wedging the
@@ -2362,9 +2452,13 @@ class Gateway:
         In-request failover: while no body byte has reached the client, a
         quota 429, any other 429, a rejected credential, a 5xx or a network
         failure moves THIS request to the next codex account, up to
-        MAX_ROTATION_ATTEMPTS. When nothing else can serve it, the client gets
-        the last upstream answer itself; a local refusal is only for a request
-        no upstream ever answered (see _openai_ingress_refusal)."""
+        MAX_ROTATION_ATTEMPTS upstream requests (run_passthrough's one bounded
+        retry included). When nothing else can serve it, the client gets the
+        last upstream answer itself — except a short (non-quota) 429, which
+        becomes a local 503 the Codex CLI retries, and a saved 4xx followed by
+        a network failure, which becomes a local 502. Any other local refusal
+        is only for a request no upstream ever answered (see
+        _openai_ingress_refusal)."""
         now = datetime.now(timezone.utc)
         raw_route = _strip_query(path)
         shown_route = "".join("?" if _has_control_character(ch) else ch for ch in raw_route[:200])
@@ -2419,8 +2513,13 @@ class Gateway:
         # Whether this request already spent its one last-resort attempt on an
         # account that is only cooling down (see _openai_last_resort_target).
         last_resort_used = False
+        # Upstream requests sent so far. run_passthrough's one bounded
+        # encrypted-state retry is a request too, so this — not the attempt
+        # count — is what MAX_ROTATION_ATTEMPTS bounds.
+        requests_sent = 0
         for attempt in range(MAX_ROTATION_ATTEMPTS):
-            final_attempt = attempt == MAX_ROTATION_ATTEMPTS - 1
+            if requests_sent >= MAX_ROTATION_ATTEMPTS:
+                break
             by_session = False
             with self._lock:
                 pool = load_pool()
@@ -2462,7 +2561,7 @@ class Gateway:
                         # rather than a local 503 for every one of the Codex
                         # CLI's retries (~30 over ~24 s, Retry-After ignored)
                         # while a single account's cooldown outlasts them all.
-                        last_resort = self._openai_last_resort_target(pool, attempted)
+                        last_resort = self._openai_last_resort_target(pool, attempted, session_home)
                         if last_resort is not None:
                             chosen_id, reason, last_resort_used = last_resort, "last_resort_cooldown", True
 
@@ -2498,13 +2597,16 @@ class Gateway:
 
             send_body, send_headers = body, headers
             session_moved = session_home is not None and profile.id != session_home
-            # In-request failover is a move too: the account the first attempt
-            # went to is the one the request's turn state and encrypted
-            # reasoning were most plausibly issued by — and with no session map
-            # entry (a daemon restart, a request with no session header) it is
-            # the only evidence there is.
+            # In-request failover is a move too: with no session map entry (a
+            # daemon restart, a request with no session header) the account
+            # the first attempt went to is the one the request's turn state and
+            # encrypted reasoning were most plausibly issued by — the only
+            # evidence there is. When the map DOES know the session's account,
+            # that is the better evidence: going back to it (a last-resort
+            # attempt on the session's own cooling account after another one
+            # failed) is not a move, and nothing is stripped.
             failed_over = profile.id != first_profile_id
-            if session_moved or failed_over:
+            if session_moved or (session_home is None and failed_over):
                 # The session is MOVING to another account. Its turn state and
                 # encrypted reasoning only decrypt on the account that issued
                 # them, so they stay behind — before the first send, rather
@@ -2547,9 +2649,12 @@ class Gateway:
             result = None
             try:
                 try:
-                    result = openai_bridge.run_passthrough(profile, credential, method, suffix, send_body,
-                                                           send_headers, on_stream_failure=on_stream_failure)
+                    result = openai_bridge.run_passthrough(
+                        profile, credential, method, suffix, send_body, send_headers,
+                        on_stream_failure=on_stream_failure,
+                        max_upstream_requests=MAX_ROTATION_ATTEMPTS - requests_sent)
                 except openai_bridge.OpenAIBridgeError as exc:
+                    requests_sent += getattr(exc, "upstream_requests", 1)
                     with self._lock:  # same atomicity reasoning as the Anthropic path
                         self._mark_profile_idle(profile.id)
                         owned = True
@@ -2566,6 +2671,10 @@ class Gateway:
                                      meta=f"Codex CLI, network error, trying the next codex profile ({exc})")
                     continue
                 last_failure = None
+                requests_sent += getattr(result, "upstream_requests", 1)
+                # No further attempt is possible after this one: the loop is
+                # on its last pass, or the request budget is spent.
+                final_attempt = attempt == MAX_ROTATION_ATTEMPTS - 1 or requests_sent >= MAX_ROTATION_ATTEMPTS
 
                 codex_headers = _filter_openai_headers(result.headers)
                 observation = openai_observation.classify(result.status, codex_headers, now)
@@ -2621,11 +2730,27 @@ class Gateway:
                         activity.record("rotation", f"{profile.name} {why}",
                                          meta="Codex CLI, moving this request to the next codex profile")
                         last_answer = _UpstreamAnswer(result.status, dict(result.headers),
-                                                      _read_and_close(result.body_chunks), profile.id)
+                                                      _read_and_close(result.body_chunks), profile.id,
+                                                      quota=isinstance(observation, QuotaExhausted))
                         with self._lock:
                             self._mark_profile_idle(profile.id)
                             owned = True  # released: the except below must not release again
                         continue
+
+                if result.status == 429 and not isinstance(observation, QuotaExhausted):
+                    # A short (non-quota) 429 with nowhere else to go this
+                    # request — pinned, a single account, or the attempt
+                    # budget spent. The Codex CLI shows a 429 once and stops,
+                    # while it retries a 503: so a local 503 (with the wait
+                    # the upstream named) stands in for it, and the retry
+                    # gets a last-resort attempt once the limit has cleared.
+                    # A quota 429 is still relayed: waiting does not fix it.
+                    _read_and_close(result.body_chunks)
+                    with self._lock:
+                        self._mark_profile_idle(profile.id)
+                        owned = True  # released: the except below must not release again
+                    return self._openai_short_rate_limit_refusal(
+                        profile.id, profile.name, codex_headers, now, headers, pinned)
 
                 if not pinned and result.status < 400:
                     if session_key is not None:
@@ -2658,6 +2783,27 @@ class Gateway:
                                   body_chunks=body_chunks, profile_id=profile.id)
 
         if last_answer is not None:
+            if last_failure == "network" and 400 <= last_answer.status < 500:
+                # The last attempt never got a response, and the answer saved
+                # from an earlier one is a status the Codex CLI will not retry
+                # (a 429 or a 401 is shown once): a local 502 instead, which it
+                # does retry — the network failure may well clear, or the
+                # earlier account's limit. A saved 5xx is relayed below: the
+                # CLI retries that already, and it is the truth.
+                with self._lock:
+                    pool = load_pool()
+                    snapshot = self._sync_snapshot(pool)
+                return self._openai_ingress_refusal(pool, snapshot, now, forced_profile_id,
+                                                    stopped_because or "rotation_attempts_exhausted",
+                                                    last_failure, headers)
+            if last_answer.status == 429 and not last_answer.quota:
+                # A short 429 nothing else served: the same local 503 as when
+                # it was the only answer (see the loop above).
+                with self._lock:
+                    name = self._profile_name(load_pool(), last_answer.profile_id)
+                return self._openai_short_rate_limit_refusal(
+                    last_answer.profile_id, name, _filter_openai_headers(last_answer.headers), now, headers,
+                    forced_profile_id is not None)
             # Something upstream DID answer, and nothing else could serve the
             # request: that answer is the truth, not a refusal invented here.
             return GatewayResult(status=last_answer.status, headers=_openai_client_headers(last_answer.headers),
@@ -2718,17 +2864,31 @@ class Gateway:
             return None
         return manual
 
-    def _openai_last_resort_target(self, pool: Pool, attempted: set) -> Optional[str]:
+    def _openai_last_resort_target(self, pool: Pool, attempted: set,
+                                   session_home: Optional[str] = None) -> Optional[str]:
         """The codex Profile to try once when nothing ELIGIBLE (or DRAINING,
-        for a session already there) can take a Codex CLI request: of the
-        enabled codex accounts rotation could hand it to that are only in
-        COOLDOWN and not yet tried for this request, the one whose cooldown
-        ends soonest. None when there is no such account. EXHAUSTED,
-        AUTH_INVALID and disabled accounts are never returned.
+        for a session already there) can take a Codex CLI request. The
+        session's own account (`session_home`, from the session map) comes
+        first when it is an enabled codex account in COOLDOWN not yet tried
+        for this request: its encrypted reasoning and turn state decrypt only
+        there, so going back to it costs nothing, while any other account is
+        a move. Otherwise, of the enabled codex accounts rotation could hand
+        it to that are only in COOLDOWN and not yet tried for this request,
+        the one whose cooldown ends soonest. None when there is no such
+        account. EXHAUSTED, AUTH_INVALID and disabled accounts are never
+        returned.
 
         The cooldown bookkeeping itself is untouched: it still steers
         rotation away from the account whenever anything else can serve.
         Call with self._lock held, after self._runtime was refreshed."""
+        if session_home is not None and session_home not in attempted:
+            home = pool.get(session_home)
+            home_rt = self._runtime.get(session_home)
+            # Like session affinity itself, no `automatic` requirement: the
+            # session is already there.
+            if (home is not None and home.kind == "codex" and home.enabled
+                    and home_rt is not None and home_rt.state == ProfileState.COOLDOWN):
+                return session_home
         best: Optional[tuple] = None
         for profile in pool.profiles:
             if profile.kind != "codex" or not profile.enabled or profile.id in attempted:
@@ -2852,6 +3012,33 @@ class Gateway:
                              meta=f"{message} client={_client_label(headers)}")
         return GatewayResult(status=status, headers=error_headers, body_chunks=None, profile_id=None,
                               error=code, error_detail=message)
+
+    def _openai_short_rate_limit_refusal(self, profile_id: str, name: str, codex_headers: dict,
+                                         now: datetime, headers: dict, pinned: bool) -> GatewayResult:
+        """The local 503 that stands in for an upstream short (non-quota) 429
+        no other codex account could take this request from: the Codex CLI
+        0.144 shows a 429 once and stops, but retries a 503 — and its retry
+        lands on the next account, or on this one's last-resort attempt once
+        the limit clears. Retry-After is the upstream's own wait when it named
+        one (retry-after, else a reset header), else this account's cooldown.
+        A quota 429 never comes here: it is relayed, because waiting seconds
+        does not fix it."""
+        with self._lock:
+            rt = self._runtime.get(profile_id)
+        error_headers: dict = {}
+        retry_after = _openai_short_limit_retry_after(codex_headers, rt, now)
+        if retry_after is not None:
+            error_headers["retry-after"] = str(retry_after)
+        if pinned:
+            message = f"{name}, the account this session is pinned to, is briefly rate limited by OpenAI."
+        else:
+            message = (f"{name} is briefly rate limited by OpenAI, and no other Codex/ChatGPT account in "
+                       "Claude Unlimited can take this request right now.")
+        activity.record("rotation", f"{name} was rate limited (HTTP 429)",
+                         meta=f"Codex CLI, nowhere else to send it — answering 503 so the CLI retries "
+                              f"client={_client_label(headers)}")
+        return GatewayResult(status=503, headers=error_headers, body_chunks=None, profile_id=None,
+                              error=OPENAI_ERROR_CODEX_UNAVAILABLE, error_detail=message)
 
     @staticmethod
     def _set_retry_after(error_headers: dict, runtimes: list, now: datetime) -> None:
@@ -3837,8 +4024,9 @@ class Gateway:
         """Takes one in-flight slot on a Profile — call with `self._lock`
         held. Every call is paired with exactly one _mark_profile_idle, either
         at the exit that abandons the attempt or by the _InFlightBody that
-        owns the response. The streak clock starts only when the count goes
-        0 -> 1, so a second concurrent request does not extend it."""
+        owns the response. The clock starts only when the count goes 0 -> 1,
+        so merely opening a second concurrent request does not extend it;
+        only bytes actually flowing do (see _touch_in_flight)."""
         count = self._in_flight_count.get(profile_id, 0)
         if count <= 0 or profile_id not in self._in_flight:
             self._in_flight_since[profile_id] = time.monotonic()
@@ -3892,7 +4080,27 @@ class Gateway:
             _close_all(closers)
             return chunks
         return _InFlightBody(chunks, lambda: self._release_in_flight(profile_id), closers,
-                             try_release=lambda: self._try_release_in_flight(profile_id))
+                             try_release=lambda: self._try_release_in_flight(profile_id),
+                             touch=lambda: self._touch_in_flight(profile_id))
+
+    def _touch_in_flight(self, profile_id: str) -> None:
+        """A response body on this Profile just delivered bytes: its in-flight
+        timestamp moves to now.
+
+        _IN_FLIGHT_MAX_SECONDS exists so a LEAKED slot — a client that walked
+        away, an upstream that hangs open without sending — stops pinning
+        "Used now" and the idle check after five minutes. It was measured
+        from when the slot was taken, which also dropped a perfectly live
+        stream (a long Codex turn) after five minutes, letting is_idle() call
+        a busy pool idle and the updater restart under it. Refreshing the
+        timestamp while bytes flow keeps both halves of the intent: a live
+        stream counts as activity however long it runs, and a slot whose
+        bytes stopped still ages out five minutes after the last one.
+        Treating any non-zero count as busy regardless of age would have
+        lost the second half — one leaked slot would block updates forever."""
+        with self._lock:
+            if profile_id in self._in_flight:
+                self._in_flight_since[profile_id] = time.monotonic()
 
     def seconds_since_last_activity(self) -> Optional[float]:
         """How long since any Profile last served a request, or None if this

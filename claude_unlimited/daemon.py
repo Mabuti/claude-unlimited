@@ -74,7 +74,9 @@ from .config import (
     set_port,
     update_settings,
 )
-from .gateway import Gateway, is_openai_ingress
+from .gateway import (
+    _OPENAI_INGRESS_MAX_BODY_BYTES, OPENAI_ERROR_BAD_REQUEST, Gateway, GatewayResult, is_openai_ingress,
+)
 from .router import spending_on_credits
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -589,13 +591,19 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         for k, v in _security_headers().items():
             self.send_header(k, v)
+        self.send_header("Content-Type", "application/json")
         # e.g. Retry-After on a "no capacity" rejection, so a client that
         # honours it waits for the quota window instead of retrying at once.
+        # Sent once: an earlier unfiltered copy of this loop wrote every
+        # extra header twice. The one framing header allowed through is an
+        # explicit `Connection: close` (a refused over-cap body is never
+        # read, so the connection cannot be reused).
         for k, v in (extra_headers or {}).items():
-            self.send_header(k, v)
-        self.send_header("Content-Type", "application/json")
-        for k, v in (extra_headers or {}).items():
-            if k.lower() in ("connection", "transfer-encoding", "content-length", "content-type"):
+            lk = k.lower()
+            if lk == "connection" and str(v).strip().lower() == "close":
+                self.send_header(k, v)
+                continue
+            if lk in ("connection", "transfer-encoding", "content-length", "content-type"):
                 continue
             self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
@@ -1704,7 +1712,12 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
         (grant,) = auth_result
 
-        length = int(self.headers.get("Content-Length", 0) or 0)
+        if openai:
+            length = self._openai_body_length(method)
+            if length is None:
+                return  # refused (400, connection closed) before a byte of the body was read
+        else:
+            length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length > 0 else b""
         inbound_headers = {k: v for k, v in self.headers.items()}
 
@@ -1718,6 +1731,43 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
         # The Codex CLI always gets the real upstream status and headers.
         self._write_proxy_result(serve(), openai=openai)
+
+    def _openai_body_length(self, method: str) -> Optional[int]:
+        """How many body bytes a Codex CLI request carries, judged from its
+        headers alone, BEFORE anything is read: a body the gateway would
+        refuse as too large must not be read (or waited for) first.
+
+        None — after sending an OpenAI-shaped 400 and marking the connection
+        to close, its body left unread — when the declared length is
+        negative, not a plain decimal number, given more than once with
+        different values, over the gateway's cap
+        (gateway._OPENAI_INGRESS_MAX_BODY_BYTES), or missing on a POST (the
+        only method relayed; the Codex CLI always sends it). A
+        Transfer-Encoding is refused too: this server reads only a
+        Content-Length body, so a chunked one could never be read correctly."""
+        values = self.headers.get_all("Content-Length") or []
+        problem = None
+        length = 0
+        if self.headers.get("Transfer-Encoding") is not None:
+            problem = "a Transfer-Encoding body is not accepted; send Content-Length"
+        elif not values:
+            if method == "POST":
+                problem = "Content-Length is required"
+        elif len({v.strip() for v in values}) != 1 or not values[0].strip().isdigit() \
+                or not values[0].strip().isascii():
+            problem = "Content-Length is malformed"
+        else:
+            length = int(values[0].strip())
+            if length > _OPENAI_INGRESS_MAX_BODY_BYTES:
+                problem = "The request body is too large for Claude Unlimited to forward."
+        if problem is None:
+            return length
+        self.close_connection = True
+        status, payload = _openai_error_payload(GatewayResult(
+            status=400, headers={}, body_chunks=None, profile_id=None,
+            error=OPENAI_ERROR_BAD_REQUEST, error_detail=problem))
+        self._send_json(status, payload, extra_headers={"Connection": "close"})
+        return None
 
     def _write_proxy_result(self, result, openai: bool = False) -> None:
         """The ordinary response: whatever the gateway decided, as-is.
