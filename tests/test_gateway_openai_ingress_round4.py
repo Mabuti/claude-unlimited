@@ -256,9 +256,10 @@ def test_k3_back_to_the_sessions_own_account_after_another_one_failed_is_not_a_m
 
 # ---- K4: a later network failure does not leave the client with a 4xx --------------
 
+# A saved QUOTA 429 and a saved SHORT 429 are no longer here: since round 5 the
+# quota one is relayed as-is and the short one is the local 503 — see
+# test_gateway_openai_ingress_round5.py.
 @pytest.mark.parametrize("first", [
-    lambda: _short_429(),
-    lambda: _quota_429(),
     lambda: _status(401),
 ])
 def test_k4_a_saved_4xx_then_a_network_failure_is_a_local_502(pool_env, monkeypatch, first):

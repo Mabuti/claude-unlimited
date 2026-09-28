@@ -2453,12 +2453,15 @@ class Gateway:
         quota 429, any other 429, a rejected credential, a 5xx or a network
         failure moves THIS request to the next codex account, up to
         MAX_ROTATION_ATTEMPTS upstream requests (run_passthrough's one bounded
-        retry included). When nothing else can serve it, the client gets the
-        last upstream answer itself — except a short (non-quota) 429, which
-        becomes a local 503 the Codex CLI retries, and a saved 4xx followed by
-        a network failure, which becomes a local 502. Any other local refusal
-        is only for a request no upstream ever answered (see
-        _openai_ingress_refusal)."""
+        retry included). A 429 with nothing ELIGIBLE left first gets the same
+        one last-resort attempt on a cooling account (the session's own
+        first) as a network failure does. When nothing else can serve it, the
+        client gets the last upstream answer itself — except that a quota 429
+        seen earlier in the request outranks a later short 429 or a later
+        4xx-then-network-failure, a short (non-quota) 429 becomes a local 503
+        the Codex CLI retries, and a saved non-quota 4xx followed by a network
+        failure becomes a local 502. Any other local refusal is only for a
+        request no upstream ever answered (see _openai_ingress_refusal)."""
         now = datetime.now(timezone.utc)
         raw_route = _strip_query(path)
         shown_route = "".join("?" if _has_control_character(ch) else ch for ch in raw_route[:200])
@@ -2508,6 +2511,14 @@ class Gateway:
         last_failure: Optional[str] = None
         # The last upstream response this request moved away from.
         last_answer: Optional[_UpstreamAnswer] = None
+        # The last quota 429 this request moved away from. It outranks a later
+        # network failure in the terminal answer: it is the more informative
+        # one (see the terminal-answer block after the loop).
+        quota_answer: Optional[_UpstreamAnswer] = None
+        # The last short (non-quota) 429 this request moved away from. It
+        # outranks a quota 429: that account recovers in seconds, so the
+        # retryable local 503 beats a quota 429 the Codex CLI stops on.
+        short_answer: Optional[_UpstreamAnswer] = None
         # Set when routing found nothing to try: why, for the refusal.
         stopped_because: Optional[str] = None
         # Whether this request already spent its one last-resort attempt on an
@@ -2725,26 +2736,62 @@ class Gateway:
                             PoolSnapshot(profiles=list(self._runtime.values()),
                                          current_profile_id=self._openai_ingress_profile_id),
                             now, exclude=not_codex | attempted)
+                        # A 429 (quota or short) with nothing ELIGIBLE left:
+                        # before giving up, the same last-resort rule as for a
+                        # network failure — the session's own account when it
+                        # is only cooling down (going back there is not a
+                        # move), else the soonest-ending cooldown. Without it
+                        # a session that moved off its briefly cooling home
+                        # onto an account that answers 429 would end here
+                        # while its home could still serve. The loop's own
+                        # routing makes the attempt and spends last_resort_used.
+                        last_resort_pending = (
+                            alternative.profile_id is None and result.status == 429 and not last_resort_used
+                            and self._openai_last_resort_target(pool, attempted, session_home) is not None)
                     # With nothing else to serve it, the real answer is relayed below.
-                    if alternative.profile_id is not None:
+                    if alternative.profile_id is not None or last_resort_pending:
                         activity.record("rotation", f"{profile.name} {why}",
-                                         meta="Codex CLI, moving this request to the next codex profile")
+                                         meta="Codex CLI, moving this request to the next codex profile"
+                                         if alternative.profile_id is not None else
+                                         "Codex CLI, trying a codex profile that is only cooling down")
                         last_answer = _UpstreamAnswer(result.status, dict(result.headers),
                                                       _read_and_close(result.body_chunks), profile.id,
                                                       quota=isinstance(observation, QuotaExhausted))
+                        if last_answer.quota:
+                            quota_answer = last_answer
+                        elif last_answer.status == 429:
+                            short_answer = last_answer
                         with self._lock:
                             self._mark_profile_idle(profile.id)
                             owned = True  # released: the except below must not release again
                         continue
 
+                if (result.status == 429 and isinstance(observation, QuotaExhausted)
+                        and short_answer is not None):
+                    # A quota 429 with nowhere else to go, after an earlier
+                    # attempt of this request got a short 429: that account
+                    # recovers in seconds, so the retryable local 503 for it
+                    # wins over relaying this quota 429 (answer precedence 1).
+                    _read_and_close(result.body_chunks)
+                    with self._lock:
+                        self._mark_profile_idle(profile.id)
+                        owned = True  # released: the except below must not release again
+                        name = self._profile_name(load_pool(), short_answer.profile_id)
+                    return self._openai_short_rate_limit_refusal(
+                        short_answer.profile_id, name, _filter_openai_headers(short_answer.headers), now,
+                        headers, pinned)
+
                 if result.status == 429 and not isinstance(observation, QuotaExhausted):
                     # A short (non-quota) 429 with nowhere else to go this
-                    # request — pinned, a single account, or the attempt
-                    # budget spent. The Codex CLI shows a 429 once and stops,
-                    # while it retries a 503: so a local 503 (with the wait
-                    # the upstream named) stands in for it, and the retry
-                    # gets a last-resort attempt once the limit has cleared.
-                    # A quota 429 is still relayed: waiting does not fix it.
+                    # request — pinned, a single account, the attempt budget
+                    # spent, or the last-resort attempt already made. The
+                    # Codex CLI shows a 429 once and stops, while it retries a
+                    # 503: so a local 503 (with the wait the upstream named)
+                    # stands in for it, and the retry gets a last-resort
+                    # attempt once the limit has cleared. This outranks a quota
+                    # 429 saved from an earlier attempt of this request: this
+                    # account recovers in seconds, the quota one does not, and
+                    # relaying the quota 429 would stop the CLI for good.
                     _read_and_close(result.body_chunks)
                     with self._lock:
                         self._mark_profile_idle(profile.id)
@@ -2783,19 +2830,23 @@ class Gateway:
                                   body_chunks=body_chunks, profile_id=profile.id)
 
         if last_answer is not None:
-            if last_failure == "network" and 400 <= last_answer.status < 500:
-                # The last attempt never got a response, and the answer saved
-                # from an earlier one is a status the Codex CLI will not retry
-                # (a 429 or a 401 is shown once): a local 502 instead, which it
-                # does retry — the network failure may well clear, or the
-                # earlier account's limit. A saved 5xx is relayed below: the
-                # CLI retries that already, and it is the truth.
-                with self._lock:
-                    pool = load_pool()
-                    snapshot = self._sync_snapshot(pool)
-                return self._openai_ingress_refusal(pool, snapshot, now, forced_profile_id,
-                                                    stopped_because or "rotation_attempts_exhausted",
-                                                    last_failure, headers)
+            # Answer precedence, when nothing else can serve the request:
+            #  1. A short 429 from any attempt wins: that account recovers in
+            #     seconds, so the local 503 (which the Codex CLI retries)
+            #     beats every other answer, a saved quota 429 included.
+            #  2. Otherwise a quota 429 saved from any attempt outranks a later
+            #     4xx followed by a network failure: it is the one answer that
+            #     tells the user why (and until when), and retrying does not
+            #     fix it. It is relayed as-is — also when it is itself the
+            #     answer a network failure followed.
+            #  3. Otherwise, a network failure after a saved non-quota 4xx (a
+            #     401, a 400) is a local 502 (below).
+            #  4. Otherwise (a 5xx, or no later failure), the saved answer
+            #     itself is relayed.
+            if short_answer is not None:
+                last_answer = short_answer
+            elif quota_answer is not None and last_failure == "network" and 400 <= last_answer.status < 500:
+                last_answer = quota_answer
             if last_answer.status == 429 and not last_answer.quota:
                 # A short 429 nothing else served: the same local 503 as when
                 # it was the only answer (see the loop above).
@@ -2804,16 +2855,37 @@ class Gateway:
                 return self._openai_short_rate_limit_refusal(
                     last_answer.profile_id, name, _filter_openai_headers(last_answer.headers), now, headers,
                     forced_profile_id is not None)
+            if last_failure == "network" and 400 <= last_answer.status < 500 and not last_answer.quota:
+                # The last attempt never got a response, and the answer saved
+                # from an earlier one is a status the Codex CLI will not retry
+                # (a short 429 or a 401 is shown once): a local 502 instead,
+                # which it does retry — the network failure may well clear, or
+                # the earlier account's limit. A saved 5xx is relayed below:
+                # the CLI retries that already, and it is the truth. So is a
+                # saved quota 429: retrying would only hide it.
+                with self._lock:
+                    pool = load_pool()
+                    snapshot = self._sync_snapshot(pool)
+                return self._openai_ingress_refusal(pool, snapshot, now, forced_profile_id,
+                                                    stopped_because or "rotation_attempts_exhausted",
+                                                    last_failure, headers)
             # Something upstream DID answer, and nothing else could serve the
             # request: that answer is the truth, not a refusal invented here.
-            return GatewayResult(status=last_answer.status, headers=_openai_client_headers(last_answer.headers),
-                                  body_chunks=iter([last_answer.body]), profile_id=last_answer.profile_id)
+            return self._openai_relay_saved_answer(last_answer)
         with self._lock:
             pool = load_pool()
             snapshot = self._sync_snapshot(pool)
         return self._openai_ingress_refusal(pool, snapshot, now, forced_profile_id,
                                             stopped_because or "rotation_attempts_exhausted",
                                             last_failure, headers)
+
+    @staticmethod
+    def _openai_relay_saved_answer(answer: _UpstreamAnswer) -> GatewayResult:
+        """An upstream answer this request moved away from, relayed as the
+        final answer: its status, allowlisted headers (Retry-After and the
+        x-codex-* reset information included) and its saved body."""
+        return GatewayResult(status=answer.status, headers=_openai_client_headers(answer.headers),
+                              body_chunks=iter([answer.body]), profile_id=answer.profile_id)
 
     def _openai_session_target(self, pool: Pool, session_key: Optional[str], attempted: set) -> Optional[str]:
         """The codex Profile this Codex session should stay on, or None when
