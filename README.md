@@ -1341,9 +1341,11 @@ own, or a local one once all are marked exhausted), with `Retry-After` when know
 it doesn't keep retrying a 429 on its own. Add or enable another Codex account, or wait for the
 reset, then run the command again.
 
-If an account is only briefly rate-limited (a short, non-quota 429), you get a **503** instead,
-which the Codex CLI retries on its own. An account that is only cooling down gets one more try
-first, and its real answer is passed back.
+If nothing else can take the request and any account it tried was only briefly rate-limited
+(a short, non-quota 429), you get a **503** instead — even when the other accounts are out of
+quota — which the Codex CLI retries on its own. When another account can serve, the request
+just moves there. An account that is only cooling down gets one more try before that, and its
+answer is passed back (a short 429 from it becomes the same 503).
 </details>
 
 ---
