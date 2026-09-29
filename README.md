@@ -757,8 +757,10 @@ claude-unlimited codex exec "list the files in this repo"  # codex's own `exec`,
 With more than one enabled Codex account, it asks which to use, the same way `cu code` does —
 `--account <name-or-id>` skips the prompt.
 
-**`--port` and `--account` are cu's own, and only right after `codex`.** They're read only in
-the run of tokens immediately following `codex`, before any other argument. From the first
+**`--port`, `--account`, and `-h`/`--help` are cu's own, and only right after `codex`.** They're
+read only in the run of tokens immediately following `codex`, before any other argument — so
+`cu codex -h` or `cu codex --help` shows cu's own help for the `codex` command, not the real
+Codex CLI's; use `cu codex -- --help` to reach Codex's own `--help` instead. From the first
 other argument on, everything is handed to the real `codex` verbatim and in order — including
 Codex's own `-p`/`--profile`, and a `--port` or `--account` meant for Codex itself
 (`cu codex exec --port 9` hands `--port 9` to `codex`, not to `cu`). A `--` right after cu's
@@ -766,8 +768,8 @@ own options is dropped rather than passed through.
 
 **Routing, not reconfiguration.** `cu codex` points Codex at the pool with `-c
 model_providers.*` overrides on the command line only — it never writes to
-`~/.codex/config.toml` or anywhere under `CODEX_HOME`. Nothing persists once the process
-exits.
+`~/.codex/config.toml` or anywhere under `CODEX_HOME`. Nothing is written to Codex's own
+configuration; the overrides last only for that one `codex` process.
 
 **Account choice.** Each Codex session stays on the account that served it until that account
 runs out, needs re-auth, is disabled, or is cooling down. A Codex session never moves Claude
@@ -794,8 +796,8 @@ says so when it happens. Nothing else in `env` is touched, and no file is modifi
 > servers are unaffected.
 
 The same holds for `claude-unlimited codex`: it points the real Codex CLI at the pool with
-command-line overrides only, so `~/.codex/config.toml` and anything else under `CODEX_HOME`
-are never edited.
+command-line overrides only, and never edits `~/.codex/config.toml` or anything else under
+`CODEX_HOME` itself — Codex's own writes under `CODEX_HOME` are unaffected.
 
 ### Calling the daemon from your own app
 
@@ -1142,7 +1144,7 @@ Every command below also works under the short alias **`cu`** — e.g. `cu code`
 | `claude-unlimited code` | **The one you'll use.** Launches `claude` routed through your pool — or whatever **Settings → Launch commands** has in its place. Also repairs the `cu` shortcut if an update dropped it. |
 | `claude-unlimited code --profile <name>` | Pin the session to one account instead of rotating. |
 | `claude-unlimited code --distribute` | Balance the session across accounts — the main agent and each subagent start on the least-busy account and stay there, each keeping its own prompt cache warm. |
-| `claude-unlimited codex [--port <n>] [--account <name>] [--] [codex args…]` | Launches the real **Codex CLI**, routed through your pool's enabled Codex/ChatGPT accounts — needs at least one (add-codex-account). Routes with `-c` overrides on the command line only; it never edits `~/.codex/config.toml`. A Codex session never moves the Claude Code rotation, and each Codex session stays on the account that served it until that account runs out, needs re-auth or is cooling down. With more than one enabled Codex account, prompts you to pick one; `--account <name>` skips the prompt. `--port` and `--account` are read only right after `codex`, before any other argument: from the first other argument on, everything goes to `codex` verbatim and in order — including Codex's own `-p`/`--profile`, and a `--port` or `--account` meant for Codex (`cu codex exec --port 9` hands `--port 9` to Codex) — and a `--` right after these options is dropped. |
+| `claude-unlimited codex [--port <n>] [--account <name>] [--] [codex args…]` | Launches the real **Codex CLI**, routed through your pool's enabled Codex/ChatGPT accounts — needs at least one (add-codex-account). Routes with `-c` overrides on the command line only; it never edits `~/.codex/config.toml`. A Codex session never moves the Claude Code rotation, and each Codex session stays on the account that served it until that account runs out, needs re-auth or is cooling down. With more than one enabled Codex account, prompts you to pick one — default is rotated accounts, the same as `cu code` — and `--account <name>` skips the prompt. `--port` and `--account` are read only right after `codex`, before any other argument: from the first other argument on, everything goes to `codex` verbatim and in order — including Codex's own `-p`/`--profile`, and a `--port` or `--account` meant for Codex (`cu codex exec --port 9` hands `--port 9` to Codex) — and a `--` right after these options is dropped. |
 | `claude-unlimited desktop` | Route the Claude **desktop app** through your pool, then launch it. `--revert` undoes it. |
 | `claude-unlimited status` | Is the daemon installed and running, and its pid. |
 | `claude-unlimited start` | Run the daemon in this terminal (Ctrl-C to stop). `--port` overrides for this run only; otherwise `CLAUDE_UNLIMITED_PORT` if set, then the port saved in Settings. |
@@ -1322,21 +1324,24 @@ or enable one you already added, in the dashboard.
 <summary><b><code>cu codex --account &lt;name&gt;</code> doesn't match anything</b></summary>
 <br>
 
-If `<name>` is a Claude account, `cu codex` says *"`<name>` is not a Codex account — `cu codex`
-only routes through codex-kind Profiles."* If it isn't an enabled account at all, it says *"No
-enabled Codex account matches --account `<name>`."* and, when you do have other enabled Codex
-accounts, lists them. Either way, rerun with the exact name or id of an enabled Codex account
-(the dashboard shows both).
+If `<name>` matches an *enabled* Claude account, `cu codex` says *"'<name>' is not a Codex
+account — `cu codex` only routes through codex-kind Profiles."* Otherwise — no match, or a
+match that's disabled — it says *"No enabled Codex account matches --account '<name>'."* and,
+when you do have other enabled Codex accounts, lists them. Either way, rerun with the exact
+name or id of an enabled Codex account (the dashboard shows both).
 </details>
 
 <details>
-<summary><b>Every Codex account is out of quota</b></summary>
+<summary><b>Every Codex account is out of quota, or briefly rate-limited</b></summary>
 <br>
 
-When every enabled Codex account is exhausted or already draining its quota, the request gets
-a local **429** with `Retry-After` when it's known. The Codex CLI shows a 429 once and stops —
-it doesn't keep retrying on its own the way it does for a 503 — so add or enable another
-Codex account, or wait for the reset, then run the command again.
+When every enabled Codex account is out of quota, the Codex CLI gets a **429** (the account's
+own, or a local one once all are marked exhausted), with `Retry-After` when known, and stops —
+it doesn't keep retrying a 429 on its own. Add or enable another Codex account, or wait for the
+reset, then run the command again.
+
+If any account is only briefly rate-limited or cooling down — not fully exhausted — you get a
+**503** instead, which the Codex CLI retries on its own.
 </details>
 
 ---

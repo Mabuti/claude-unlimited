@@ -100,10 +100,11 @@ Everyday use is:
 
 ```bash
 claude-unlimited code
+claude-unlimited codex
 ```
 
-which starts the daemon if needed and launches `claude` routed through the
-pool.
+which starts the daemon if needed and launches `claude` (or the real Codex
+CLI) routed through the pool.
 
 ## If you are contributing code
 
