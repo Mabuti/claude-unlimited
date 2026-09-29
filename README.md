@@ -61,6 +61,7 @@ dashboard's activity log is the only place you'll find out it happened.
 | **[Models parity](#which-gpt-model-runs-your-claude-model)** | Which GPT model runs each Claude model |
 | **[Usage](#usage)** | Daily driving |
 | **[The Claude desktop app](#using-the-claude-desktop-app)** | Route the app through your pool too |
+| **[The Codex CLI](#using-the-codex-cli)** | Route it through your pool's ChatGPT/Codex accounts |
 | **[Your own app](#calling-the-daemon-from-your-own-app)** | Anything that speaks the Messages API |
 | **[The dashboard](#the-dashboard)** | What you can see and control |
 | **[ECO](#eco--efficient-context-optimization)** | Fewer tokens for the same work |
@@ -106,6 +107,7 @@ Anthropic API keys, your own gateway — and treats them as one continuous suppl
 | ⚖️ | **[Balanced sessions](#balancing-sessions-and-subagents-across-accounts)** — `cu code --distribute` spreads the main agent and each subagent across accounts, each staying put so its prompt cache stays warm. |
 | ⏳ | **[Per-model limits](#when-fable-runs-out-but-the-account-hasnt)** — when a plan's Fable week runs out before the account does, the session can move on instead of failing every Fable request. |
 | 🖥️ | **[The Claude desktop app too](#using-the-claude-desktop-app)** — not just the terminal. One command points it at your pool, and `--revert` puts it back. |
+| <img src="docs/logos/openai.png" height="14" alt=""> | **[The Codex CLI too](#using-the-codex-cli)** — `cu codex` launches the real Codex CLI routed through your pool's Codex/ChatGPT accounts, never a Claude account. |
 | 📊 | **A dashboard you'll actually open** — live usage bars, cost tracking, model split, per-project attribution, activity log. |
 | 📈 | **[Statistics](#the-dashboard)** — spend and tokens over time as line charts, broken down by model, project and account, plus what each request *asked for* versus what served it. |
 | 🌿 | **[ECO](#eco--efficient-context-optimization)** — shortens what tools printed before it is sent, so the same work costs fewer tokens. Off by default; only tool output is ever rewritten. |
@@ -354,6 +356,9 @@ Code keeps speaking the Anthropic API, and requests routed to this account are t
 to and from OpenAI's transparently, streaming included.
 
 Also isolated: your existing `codex` login is left alone.
+
+The same account also serves the real Codex CLI, routed through the pool with
+[`claude-unlimited codex`](#using-the-codex-cli).
 
 ### Purchased credits
 
@@ -724,6 +729,52 @@ This is the only command that writes outside `~/.claude-unlimited/` and
 for now. The Help page in the dashboard also documents the manual route, if you
 would rather set it up in the app yourself.
 
+### Using the Codex CLI
+
+Not just Claude Code — the real **Codex CLI** can run through the pool too:
+
+```bash
+claude-unlimited codex
+```
+
+Starts the daemon if it isn't running, then launches `codex` with its own model provider
+pointed at the pool, so Codex sessions are served by your enabled ChatGPT/Codex accounts —
+never by a Claude account.
+
+**Before you run it:**
+- At least one enabled Codex/ChatGPT account — add one with
+  [`claude-unlimited add-codex-account`](#add-a-chatgpt--codex-subscription), or enable one
+  in the dashboard.
+- The Codex CLI (`codex`) itself installed and on `PATH`. Without it, `cu codex` stops before
+  starting anything: *"Codex CLI (`codex`) not found on PATH. Install it first:
+  https://github.com/openai/codex"*.
+
+```bash
+claude-unlimited codex --account "Personal ChatGPT"        # pin this session to one account
+claude-unlimited codex exec "list the files in this repo"  # codex's own `exec`, unmodified
+```
+
+With more than one enabled Codex account, it asks which to use, the same way `cu code` does —
+`--account <name-or-id>` skips the prompt.
+
+**`--port` and `--account` are cu's own, and only right after `codex`.** They're read only in
+the run of tokens immediately following `codex`, before any other argument. From the first
+other argument on, everything is handed to the real `codex` verbatim and in order — including
+Codex's own `-p`/`--profile`, and a `--port` or `--account` meant for Codex itself
+(`cu codex exec --port 9` hands `--port 9` to `codex`, not to `cu`). A `--` right after cu's
+own options is dropped rather than passed through.
+
+**Routing, not reconfiguration.** `cu codex` points Codex at the pool with `-c
+model_providers.*` overrides on the command line only — it never writes to
+`~/.codex/config.toml` or anywhere under `CODEX_HOME`. Nothing persists once the process
+exits.
+
+**Account choice.** Each Codex session stays on the account that served it until that account
+runs out, needs re-auth, is disabled, or is cooling down. A Codex session never moves Claude
+Code's own rotation — the two are routed independently, even when they draw from the same
+pool — and a Claude account can never serve a Codex session: only your codex-kind (ChatGPT/
+Codex) accounts do.
+
 ### Your project setup is untouched
 
 `claude-unlimited code` runs the same `claude` binary in the same directory. Your
@@ -741,6 +792,10 @@ says so when it happens. Nothing else in `env` is touched, and no file is modifi
 > One other difference: because the daemon authenticates you with its own local token,
 > claude.ai-hosted connectors are disabled for that session. Locally-configured MCP
 > servers are unaffected.
+
+The same holds for `claude-unlimited codex`: it points the real Codex CLI at the pool with
+command-line overrides only, so `~/.codex/config.toml` and anything else under `CODEX_HOME`
+are never edited.
 
 ### Calling the daemon from your own app
 
@@ -1243,6 +1298,45 @@ it at sign-in, so the daemon can't read its tokens. It treats that as the accoun
 down, not as an auth problem — which is why `reauth` finds nothing to do. Fix:
 [`docs/linux-keyring.md`](docs/linux-keyring.md). Stop the daemon before restarting the
 keyring, or it can come back locked again.
+</details>
+
+<details>
+<summary><b><code>cu codex</code> says "Codex CLI (`codex`) not found on PATH"</b></summary>
+<br>
+
+The Codex CLI itself isn't installed, or isn't on `PATH` — `cu codex` checks for it before
+starting anything, so nothing is launched. Install it from
+[github.com/openai/codex](https://github.com/openai/codex) and try again.
+</details>
+
+<details>
+<summary><b><code>cu codex</code> says "No enabled Codex/ChatGPT account in the pool"</b></summary>
+<br>
+
+`cu codex` only routes through codex-kind Profiles — an Anthropic/Claude account can never
+serve it, enabled or not. Add a Codex/ChatGPT account with `claude-unlimited add-codex-account`,
+or enable one you already added, in the dashboard.
+</details>
+
+<details>
+<summary><b><code>cu codex --account &lt;name&gt;</code> doesn't match anything</b></summary>
+<br>
+
+If `<name>` is a Claude account, `cu codex` says *"`<name>` is not a Codex account — `cu codex`
+only routes through codex-kind Profiles."* If it isn't an enabled account at all, it says *"No
+enabled Codex account matches --account `<name>`."* and, when you do have other enabled Codex
+accounts, lists them. Either way, rerun with the exact name or id of an enabled Codex account
+(the dashboard shows both).
+</details>
+
+<details>
+<summary><b>Every Codex account is out of quota</b></summary>
+<br>
+
+When every enabled Codex account is exhausted or already draining its quota, the request gets
+a local **429** with `Retry-After` when it's known. The Codex CLI shows a 429 once and stops —
+it doesn't keep retrying on its own the way it does for a 503 — so add or enable another
+Codex account, or wait for the reset, then run the command again.
 </details>
 
 ---
