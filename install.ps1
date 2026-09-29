@@ -559,7 +559,7 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
     Say "Next steps:"
     Say "  1. Add an account:            claude-unlimited add-account   (or use the dashboard)"
     Say "  2. Run Claude Code through it: claude-unlimited code"
-    Say "  3. Run the Codex CLI through it: claude-unlimited codex"
+    Say "  3. Run Codex through it:       claude-unlimited codex   (needs claude-unlimited add-codex-account)"
     Say ""
     Say "(If 'claude-unlimited' isn't recognized, open a NEW terminal first, or use"
     Say " 'py -m claude_unlimited' instead.)"
