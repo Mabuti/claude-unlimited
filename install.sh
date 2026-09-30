@@ -5,6 +5,7 @@ REPO_URL="${CLAUDE_UNLIMITED_REPO:-https://github.com/Mabuti/claude-unlimited.gi
 REPO_BRANCH="${CLAUDE_UNLIMITED_BRANCH:-main}"
 INSTALL_ROOT="$HOME/.local/share/claude-unlimited"
 BIN_DIR="$HOME/.local/bin"
+PATH_NOTE=""
 
 # Works two ways: run from a checkout (./install.sh), or piped straight from
 # the network (curl … | bash), in which case there is no checkout to copy from
@@ -86,6 +87,7 @@ case ":$PATH:" in
     echo
     echo "NOTE: $BIN_DIR is not on your PATH. Add this to your shell profile:"
     echo '  export PATH="$HOME/.local/bin:$PATH"'
+    PATH_NOTE=1
     ;;
 esac
 
@@ -94,7 +96,11 @@ CLI="$BIN_DIR/claude-unlimited"
 echo
 echo "Checking the install…"
 echo
-if ! "$CLI" doctor; then
+# doctor looks the launchers up on PATH, and on a fresh account $BIN_DIR isn't
+# on it yet — the NOTE above already told the reader to add it. Put it first for
+# this one command so the check judges the install rather than this shell, and
+# the steps below (service, HUD, dashboard) still run.
+if ! PATH="$BIN_DIR:$PATH" "$CLI" doctor; then
   echo
   echo "Install finished, but the check above found something. Fix it, then run:"
   echo "  claude-unlimited doctor"
@@ -171,3 +177,8 @@ echo "  claude-unlimited uninstall             # stop it starting on login"
 echo
 echo "To remove everything later:"
 echo "  claude-unlimited purge"
+if [ -n "$PATH_NOTE" ]; then
+  echo
+  echo "Before using the commands above, add $BIN_DIR to your PATH:"
+  echo '  export PATH="$HOME/.local/bin:$PATH"'
+fi

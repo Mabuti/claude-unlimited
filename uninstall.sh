@@ -5,8 +5,32 @@ set -euo pipefail
 # credential from the OS keystore, which needs the config that names those
 # Profiles to still exist. This script only handles the case where the CLI is
 # already gone or broken.
-if command -v claude-unlimited >/dev/null 2>&1; then
-  exec claude-unlimited purge "$@"
+#
+# Look for the installed launcher by path first: ~/.local/bin is often not on
+# PATH (a fresh account), and a PATH-only lookup would skip the purge and leave
+# the stored credentials behind. The install's own venv copy goes first, then
+# the symlink in ~/.local/bin, then whatever is on PATH.
+INSTALL_ROOT="$HOME/.local/share/claude-unlimited"
+LAUNCHER=""
+for candidate in \
+  "$INSTALL_ROOT/venv/bin/claude-unlimited" \
+  "$HOME/.local/bin/claude-unlimited" \
+  "$(command -v claude-unlimited 2>/dev/null || true)"; do
+  if [ -n "$candidate" ] && [ -f "$candidate" ] && [ -x "$candidate" ]; then
+    LAUNCHER="$candidate"
+    break
+  fi
+done
+if [ -n "$LAUNCHER" ]; then
+  # Not `exec`: a launcher that cannot start at all (its interpreter is gone)
+  # must fall through to the manual removal below. Any other exit status is
+  # purge's own answer — including declining its confirmation — and is final.
+  purge_status=0
+  "$LAUNCHER" purge "$@" || purge_status=$?
+  case "$purge_status" in
+    126|127) echo "$LAUNCHER could not be run (exit $purge_status)." ;;
+    *) exit "$purge_status" ;;
+  esac
 fi
 
 echo "The claude-unlimited command isn't available — removing files directly."
