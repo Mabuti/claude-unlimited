@@ -1348,6 +1348,38 @@ just moves there. An account that is only cooling down gets one more try before 
 answer is passed back (a short 429 from it becomes the same 503).
 </details>
 
+<details>
+<summary><b><code>CERTIFICATE_VERIFY_FAILED</code> — adding an account or checking for updates fails (macOS)</b></summary>
+<br>
+
+You see *"Could not reach Anthropic to resolve this account: … CERTIFICATE_VERIFY_FAILED"*
+when adding an account, *"Could not reach GitHub: CERTIFICATE_VERIFY_FAILED"* under
+**Settings → Updates**, or the same error on every request the proxy makes.
+
+The Python from python.org ships on macOS with no CA certificates until you run its
+*Install Certificates.command*, so every HTTPS call fails verification. Current versions
+notice the empty store and use the operating system's CA bundle instead, so in the default
+setup the release after 1.3.1.2 and everything later need nothing from you. Check with
+`cu doctor`: its **TLS certificates** line reads *OK* and says which store it uses, or
+*MISSING* if none was found. If it shows *MISSING* and names `SSL_CERT_FILE` or
+`SSL_CERT_DIR`, that variable is set and isn't overridden: point it at a valid CA bundle
+file (or certificate directory), or unset it.
+
+Versions up to and including 1.3.1.2 can't fix this themselves, and can't update to a
+version that does — the update check is one of the calls that fails. Either:
+
+- **Re-run the install command** from [Install](#install). `curl` and `git` use the
+  operating system's trust, not Python's, so it installs the current version:
+
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/Mabuti/claude-unlimited/main/install.sh | bash
+  ```
+
+- **Or fix Python's store**: run *Install Certificates.command* from the Python folder in
+  `/Applications`, then `cu restart` — a running service keeps the broken trust until it
+  restarts — and update as usual.
+</details>
+
 ---
 
 ## Where your data lives
