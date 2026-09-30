@@ -284,6 +284,9 @@ def doctor_env(monkeypatch, tmp_path):
     monkeypatch.setattr(cli.updater, "ensure_cli_aliases", lambda *a, **kw: None)
     monkeypatch.setattr(daemon_installer, "status",
                         lambda: {"installed": True, "running": True, "pid": 1})
+    # doctor() repairs a missing HUD. conftest already points the HUD's paths
+    # at tmp_path; this keeps these tests from running that step at all.
+    monkeypatch.setattr(cli.hud_installer, "is_supported", lambda: False)
 
 
 def test_doctor_reports_default_store(doctor_env, monkeypatch, capsys):
