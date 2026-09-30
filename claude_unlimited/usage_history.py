@@ -270,7 +270,12 @@ def events_in_last_days(days: int) -> list[UsageEvent]:
 # differ in any of these and a breakdown would move numbers into the wrong
 # bucket. The minute is what bounds the time error: every bucket edge the
 # helpers use (hour, local day, month) falls on a minute boundary.
-_AGGREGATE_KEY = """strftime('%Y-%m-%dT%H:%M:00+00:00', ts, 'utc'),
+#
+# No 'utc' modifier on the strftime: a timestamp with an explicit offset is
+# already normalized to UTC there, and the modifier would treat that result as
+# local time and shift it again on SQLite builds that do (the process's UTC
+# offset then leaks into every bucket).
+_AGGREGATE_KEY = """strftime('%Y-%m-%dT%H:%M:00+00:00', ts),
                     profile_id, project_id, model, requested_model,
                     eco_mode, speech_mode,
                     (cost_usd IS NULL), (COALESCE(eco_bytes_saved, 0) = 0)"""
@@ -298,7 +303,7 @@ def _aggregated_rows(cutoff_iso: str, exact_cutoff_iso: Optional[str] = None) ->
             merged_requests=int(r["merged_requests"]),
         )
         for r in db.query(
-            f"""SELECT strftime('%Y-%m-%dT%H:%M:00+00:00', ts, 'utc') AS bucket_ts,
+            f"""SELECT strftime('%Y-%m-%dT%H:%M:00+00:00', ts) AS bucket_ts,
                        profile_id, project_id, model, requested_model, eco_mode, speech_mode,
                        SUM(input_tokens)  AS input_tokens,
                        SUM(output_tokens) AS output_tokens,

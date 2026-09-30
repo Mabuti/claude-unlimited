@@ -1,4 +1,5 @@
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -12,6 +13,21 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
     monkeypatch.setattr(usage_history, "USAGE_HISTORY_FILE", tmp_path / "usage_history.jsonl")
     return tmp_path
+
+
+@pytest.fixture
+def denver_tz():
+    """Run the process in a non-UTC zone, so a bucket that leaks the local
+    offset shows up on any machine (CI itself runs in UTC)."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("no time.tzset on this platform")
+    # Its own MonkeyPatch, so restoring TZ doesn't also undo other fixtures'
+    # patches early.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("TZ", "America/Denver")
+        time.tzset()
+        yield
+    time.tzset()
 
 
 def test_list_events_empty_by_default(env):
@@ -656,6 +672,16 @@ def test_aggregated_rows_fold_but_report_the_same_numbers(env):
     kinds = {"prof-0": "oauth", "prof-1": "codex", "prof-2": "api"}
     assert (usage_history.series_by_kind(folded, buckets, kinds)
             == usage_history.series_by_kind(raw, buckets, kinds))
+
+
+def test_aggregated_rows_bucket_in_utc_whatever_the_process_zone(env, denver_tz):
+    """The bucket is the row's UTC minute, not shifted by the local offset —
+    whether the row was written in UTC or with another offset."""
+    for ts in ("2026-09-29T19:38:12+00:00", "2026-09-29T13:38:40-06:00"):
+        db.execute("INSERT INTO usage_event (ts, profile_id, model, input_tokens, output_tokens)"
+                   " VALUES (?, ?, ?, ?, ?)", (ts, "prof-a", "claude-sonnet-5", 10, 1))
+    rows = usage_history._aggregated_rows("")
+    assert [(r.timestamp, r.merged_requests) for r in rows] == [("2026-09-29T19:38:00+00:00", 2)]
 
 
 def test_aggregated_since_holds_the_range_boundary_exactly(env):
