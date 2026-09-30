@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from . import __version__
 from . import anthropic_oauth
@@ -118,6 +118,66 @@ def _banner() -> None:
     print("=" * (18 + len(__version__)))
 
 
+class _LauncherStatus(NamedTuple):
+    found: list[str]          # launcher names that resolve to ours
+    missing: list[str]        # names not on PATH at all
+    shadowed_by: str | None   # path of a foreign `cu` that wins on PATH
+    hint: str                 # what to do about it
+
+    @property
+    def ok(self) -> bool:
+        return not self.missing and not self.shadowed_by
+
+
+def _real(path: str) -> str:
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _cli_launcher_status() -> _LauncherStatus:
+    """Which of our launchers a shell would actually run.
+
+    `cu` is also a real system tool (the old serial "call UNIX" client), and a
+    foreign `cu` can sit in our own bin directory (the updater never replaces
+    one), so neither its name nor its directory proves it is ours. It counts
+    only when, with symlinks resolved, it is our virtualenv's `cu` or sits
+    beside our `claude-unlimited` (Windows' `cu.cmd`, pip and dev installs).
+    Directories are compared, not filenames, so Windows resolves the same way."""
+    main = shutil.which("claude-unlimited")
+    main_dir = _real(os.path.dirname(os.path.realpath(main))) if main else None
+    venv_cu = _real(str(updater.VENV_SCRIPTS / "cu"))
+
+    def is_ours(cu: str) -> bool:
+        resolved = os.path.realpath(cu)
+        return (_real(resolved) == venv_cu
+                or (main_dir is not None and _real(os.path.dirname(resolved)) == main_dir))
+
+    found = ["claude-unlimited"] if main else []
+    missing = [] if main else ["claude-unlimited"]
+    cu = shutil.which("cu")
+    if not cu:
+        missing.append("cu")
+        return _LauncherStatus(found, missing, None, "")
+    if is_ours(cu):
+        return _LauncherStatus(found + ["cu"], missing, None, "")
+
+    if not main:
+        # The missing line already says what to do; `claude-unlimited` isn't there to suggest.
+        return _LauncherStatus(found, missing, cu, "")
+    winner_dir = os.path.dirname(cu)
+    ours_later = next((os.path.dirname(c) for d in os.environ.get("PATH", "").split(os.pathsep)
+                       if d and (c := shutil.which("cu", path=d)) and is_ours(c)), None)
+    our_dirs = [str(updater.BIN_DIR), os.path.dirname(main)]
+    if ours_later:
+        hint = f"put {ours_later} before {winner_dir} on PATH, or use `claude-unlimited`"
+    elif any(_real(winner_dir) == _real(d) for d in our_dirs):
+        hint = (f"that file in {winner_dir} was left alone — use "
+                "`claude-unlimited`, or remove or rename it and run "
+                "`claude-unlimited doctor` to recreate ours")
+    else:
+        hint = "use `claude-unlimited`"
+    return _LauncherStatus(found, missing, cu, hint)
+
+
 def doctor() -> int:
     _banner()
     ok = True
@@ -171,14 +231,19 @@ def doctor() -> int:
         updater.ensure_cli_aliases()
     except Exception:
         pass
-    on_path = [name for name in ("claude-unlimited", "cu") if shutil.which(name)]
-    if len(on_path) == 2:
-        print("CLI launchers: OK — claude-unlimited and cu both on PATH")
-    else:
-        missing = [n for n in ("claude-unlimited", "cu") if n not in on_path]
-        print(f"CLI launchers: {', '.join(on_path) or 'none'} on PATH — "
-              f"{', '.join(missing)} missing (ensure ~/.local/bin is on your PATH)")
+    launchers = _cli_launcher_status()
+    if launchers.missing:
+        print(f"CLI launchers: {', '.join(launchers.found) or 'none'} on PATH — "
+              f"{', '.join(launchers.missing)} missing (ensure ~/.local/bin is on your PATH)")
         ok = False
+    if launchers.shadowed_by:
+        # A warning, not a failure: the full name still works, and the
+        # installer aborts on a failing doctor.
+        lead = "claude-unlimited OK — but " if not launchers.missing else ""
+        print(f"CLI launchers: {lead}`cu` runs {launchers.shadowed_by}, not ours"
+              + (f" — {launchers.hint}" if launchers.hint else ""))
+    elif not launchers.missing:
+        print("CLI launchers: OK — claude-unlimited and cu both on PATH")
 
     print("Live proxy: ready — rotation, credential substitution, and usage tracking active.")
 
