@@ -35,6 +35,7 @@ from . import anthropic_oauth
 from . import daemon_installer
 from . import hud as hud_installer
 from . import i18n
+from . import tls_trust
 from . import updater
 from . import profiles as profile_repo
 from .config import CLAUDE_ACCOUNTS_DIR, CODEX_ACCOUNTS_DIR, DEFAULT_SWITCH_THRESHOLD, ensure_app_dir, load_pool, launch_argv, resolve_port
@@ -122,6 +123,32 @@ def doctor() -> int:
     ok = True
 
     print(f"Python: OK — {sys.version.split()[0]}")
+
+    # Offline: reads Python's own trust store, makes no request.
+    tls = tls_trust.ensure_ca_bundle()
+    if tls.source == "default":
+        print("TLS certificates: OK — system default store")
+    elif tls.source == "env":
+        print(f"TLS certificates: OK — set by {' and '.join(tls.env)}")
+    elif tls.source == "directory":
+        print(f"TLS certificates: OK — system CA directory {tls.path}")
+    elif tls.source == "fallback":
+        print(f"TLS certificates: OK — using {tls.path} (Python's own store is empty)")
+    else:
+        if tls.env:
+            names = " and ".join(tls.env)
+            verb, pronoun = ("provide", "them") if len(tls.env) > 1 else ("provides", "it")
+            targets = " and ".join(
+                f"{name} at a valid CA " + ("bundle file" if name == "SSL_CERT_FILE" else "certificate directory")
+                for name in tls.env)
+            print(f"TLS certificates: MISSING — {names} {verb} no CA certificates, so HTTPS "
+                  f"to Anthropic will fail. Point {targets}, or unset {pronoun}.")
+        else:
+            print("TLS certificates: MISSING — Python has no CA certificates, so HTTPS to "
+                  "Anthropic will fail. On the python.org macOS Python, run "
+                  "\"Install Certificates.command\" from its folder in /Applications; "
+                  "otherwise set SSL_CERT_FILE to a CA bundle file.")
+        ok = False
 
     try:
         import claude_unlimited.secret_store as _ss
@@ -2577,6 +2604,10 @@ def _split_codex_passthrough(argv: list) -> tuple:
 
 
 def main(argv=None) -> int:
+    # First, before anything can call urlopen: from Python 3.12 urllib's
+    # cached global opener holds a TLS context built at first use, so a
+    # later fix would not take.
+    tls_trust.ensure_ca_bundle()
     parser = argparse.ArgumentParser(
         prog="claude-unlimited", add_help=True,
         epilog="Also available as `cu` — every command works under both names "

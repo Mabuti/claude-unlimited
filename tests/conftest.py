@@ -1,3 +1,5 @@
+import ssl
+
 import pytest
 
 import claude_unlimited.activity as activity
@@ -9,6 +11,7 @@ import claude_unlimited.placeholder_token as placeholder_token
 import claude_unlimited.project_usage as project_usage
 import claude_unlimited.runtime_state as runtime_state
 import claude_unlimited.session_tokens as session_tokens
+import claude_unlimited.tls_trust as tls_trust
 import claude_unlimited.usage_history as usage_history
 import claude_unlimited.usage_probe as usage_probe
 
@@ -25,6 +28,15 @@ def no_real_desktop_notifications(monkeypatch):
     monkeypatch.setattr(notifications, "send_macos_notification", lambda title, message: None)
     monkeypatch.setattr(notifications, "send_linux_notification", lambda title, message: None)
     monkeypatch.setattr(notifications, "send_windows_notification", lambda title, message: None)
+
+
+@pytest.fixture(autouse=True)
+def isolated_tls_trust(monkeypatch):
+    """Anything that reaches tls_trust.ensure_ca_bundle() (doctor, main) caches
+    its result and, on a box with an empty CA store, replaces the process-wide
+    ssl._create_default_https_context. Neither may outlive the test."""
+    monkeypatch.setattr(ssl, "_create_default_https_context", ssl._create_default_https_context)
+    monkeypatch.setattr(tls_trust, "_status", None)
 
 
 @pytest.fixture(autouse=True)
