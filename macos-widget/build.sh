@@ -71,10 +71,10 @@ fi
 # that installs Claude Unlimited downloads, and an arm64-only binary installs
 # fine on an Intel Mac and then never launches. A local build stays native.
 if [ -n "$RELEASE" ]; then
-  swift build -c release --arch arm64 --arch x86_64 "${SWIFT_FLAGS[@]}"
+  swift build -c release --arch arm64 --arch x86_64 ${SWIFT_FLAGS[@]+"${SWIFT_FLAGS[@]}"}
   BINARY=".build/apple/Products/Release/HUD"
 else
-  swift build -c release "${SWIFT_FLAGS[@]}"
+  swift build -c release ${SWIFT_FLAGS[@]+"${SWIFT_FLAGS[@]}"}
   BINARY=".build/release/HUD"
 fi
 

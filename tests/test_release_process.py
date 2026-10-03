@@ -30,6 +30,16 @@ def test_the_release_build_is_universal():
     assert 'cleanup() { rm -rf "$GENERATED"' in build
 
 
+def test_the_release_build_expands_empty_swift_flags_safely_on_bash_32():
+    # Bash 3.2 treats an empty array as unset under `set -u`, unlike modern
+    # Bash. Keep the expansion conditional so shader-free builds work there.
+    build = (ROOT / "macos-widget" / "build.sh").read_text(encoding="utf-8")
+    safe_expansion = '${SWIFT_FLAGS[@]+"${SWIFT_FLAGS[@]}"}'
+    swift_builds = [line for line in build.splitlines() if line.lstrip().startswith("swift build")]
+    assert len(swift_builds) == 2
+    assert all(line.endswith(safe_expansion) for line in swift_builds)
+
+
 def test_the_installer_checks_with_its_own_bin_dir_on_path():
     # A fresh account has no ~/.local/bin on PATH. doctor finds the launchers
     # there, so a bare call fails and aborts the install before the service,
