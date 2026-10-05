@@ -43,8 +43,13 @@ automatically from that tag.
 
    ```bash
    git tag v0.2.0
-   git push origin main --follow-tags
+   git push origin main
+   git push origin v0.2.0
    ```
+
+   Push the tag by name. `git tag v0.2.0` makes a lightweight tag, and
+   `git push --follow-tags` only sends annotated tags, so it would push `main`,
+   skip the tag, and the release workflow would never start.
 
    (The examples above use upstream's plain `0.2.0`. On this fork, tags are
    four-part — see "On this fork" under Versioning — so a real fork release
