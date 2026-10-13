@@ -1,6 +1,6 @@
 """Pure translation between Anthropic's Messages API shape (what Claude Code
 sends and expects) and OpenAI's Responses API shape (what a codex-kind
-Profile talks to). No I/O, no network, no subprocess — the OpenAI-side
+Profile talks to). No network or subprocess — the OpenAI-side
 counterpart of proxy.py's pure request-building and usage_tracking.py's pure
 event parsing.
 """
@@ -8,6 +8,9 @@ event parsing.
 from __future__ import annotations
 
 import json
+import sys
+import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Iterator, Optional, Callable
@@ -300,6 +303,28 @@ def _map_tools(anthropic_tools) -> list[dict]:
 
 # ---- OpenAI SSE response -> Anthropic SSE response ----
 
+_missing_arguments_warning_at = float("-inf")
+_arguments_warning_lock = threading.Lock()
+
+
+@dataclass
+class _ToolBlock:
+    index: int
+    name: str
+    item_id: Optional[str]
+    output_index: Optional[int]
+    arguments: str = ""
+    events: set[str] = field(default_factory=set)
+    used_fallback: bool = False
+    warned_mismatch: bool = False
+
+
+def _warn_tool_arguments(block: _ToolBlock, reason: str) -> None:
+    # Match the bridge's stderr diagnostics; never include argument values.
+    print(f"[codex] WARNING: {reason}; call={json.dumps(block.name)} "
+          f"events={','.join(sorted(block.events))}", file=sys.stderr, flush=True)
+
+
 @dataclass
 class TranslatedUsage:
     input_tokens: int = 0
@@ -327,14 +352,14 @@ class ResponseTranslator:
     model: str = ""
     _started: bool = False
     _current_block_index: int = -1
-    _current_block_open: bool = False
-    _current_block_type: Optional[str] = None  # "text" | "tool_use"
     _stop_reason: str = "end_turn"
     usage: TranslatedUsage = field(default_factory=TranslatedUsage)
     _saw_any_output: bool = False
     # A message item has been opened upstream but has produced no text yet, so
     # no Anthropic block has been started for it. See _start_block.
     _pending_text_block: bool = False
+    _text_block_index: Optional[int] = None
+    _tool_blocks: dict[int, _ToolBlock] = field(default_factory=dict)
     # What this response produced that a later request must be able to match:
     # the reasoning items to replay, and the anchors they belong to.
     reasoning_items: list = field(default_factory=list)
@@ -355,6 +380,11 @@ class ResponseTranslator:
             yield from self._text_delta(event)
         elif event_type == "response.function_call_arguments.delta":
             yield from self._tool_input_delta(event)
+        elif event_type == "response.function_call_arguments.done":
+            block = self._tool_block(event)
+            if block is not None:
+                block.events.add(event_type)
+                yield from self._tool_input_fallback(block, event.get("arguments"))
         elif event_type == "response.output_item.done":
             item = event.get("item") or {}
             if item.get("type") == "reasoning" and item.get("encrypted_content"):
@@ -386,10 +416,7 @@ class ResponseTranslator:
         `error` event is a terminal event in Anthropic's SSE protocol, so the
         turn fails in seconds instead of hanging.
         """
-        if self._current_block_open:
-            yield self._sse("content_block_stop",
-                            {"type": "content_block_stop", "index": self._current_block_index})
-            self._current_block_open = False
+        yield from self._close_open_blocks()
         yield self._sse("error", {"type": "error",
                                   "error": {"type": "api_error", "message": message}})
 
@@ -420,12 +447,9 @@ class ResponseTranslator:
             # "400 messages: text content blocks must be non-empty", so a
             # single empty block from here breaks the conversation on a
             # different account entirely.
-            self._current_block_type = "text"
             self._pending_text_block = True
         elif item_type == "function_call":
-            self._current_block_type = "tool_use"
             self._current_block_index += 1
-            self._current_block_open = True
             # Never an empty id: the client matches the tool_result it sends
             # back against this value, and an empty one silently breaks that
             # pairing. Claude Code 2.1.246 also fixed a render error on a
@@ -436,6 +460,11 @@ class ResponseTranslator:
             )
             self._pending_tool_name = item.get("name", "")
             self.call_ids.append(self._pending_tool_call_id)
+            self._tool_blocks[self._current_block_index] = _ToolBlock(
+                self._current_block_index, self._pending_tool_name,
+                item.get("id"), event.get("output_index"),
+                events={event["type"]},
+            )
             yield self._sse("content_block_start", {
                 "type": "content_block_start", "index": self._current_block_index,
                 "content_block": {"type": "tool_use", "id": self._pending_tool_call_id,
@@ -451,51 +480,108 @@ class ResponseTranslator:
         if self._pending_text_block:
             self._pending_text_block = False
             self._current_block_index += 1
-            self._current_block_open = True
+            self._text_block_index = self._current_block_index
             yield self._sse("content_block_start", {
                 "type": "content_block_start", "index": self._current_block_index,
                 "content_block": {"type": "text", "text": ""},
             })
-        if self._current_block_index < 0:
+        if self._text_block_index is None:
             return
         self._saw_any_output = True
         self.text += delta
         yield self._sse("content_block_delta", {
-            "type": "content_block_delta", "index": self._current_block_index,
+            "type": "content_block_delta", "index": self._text_block_index,
             "delta": {"type": "text_delta", "text": delta},
         })
 
+    def _tool_block(self, event: dict) -> Optional[_ToolBlock]:
+        item_id = event.get("item_id") or (event.get("item") or {}).get("id")
+        output_index = event.get("output_index")
+        if item_id is not None:
+            for block in self._tool_blocks.values():
+                if block.item_id == item_id:
+                    return block
+        if output_index is not None:
+            for block in self._tool_blocks.values():
+                if block.output_index == output_index:
+                    return block
+        if item_id is None and output_index is None:
+            return self._tool_blocks.get(self._current_block_index)
+        return None
+
     def _tool_input_delta(self, event: dict) -> Iterator[bytes]:
-        delta = event.get("delta", "")
-        if not delta or self._current_block_index < 0:
+        block = self._tool_block(event)
+        if block is None:
             return
+        block.events.add(event["type"])
+        delta = event.get("delta", "")
+        if not delta or block.used_fallback:
+            return
+        yield from self._emit_tool_input(block, delta)
+
+    def _emit_tool_input(self, block: _ToolBlock, delta: str) -> Iterator[bytes]:
+        block.arguments += delta
         self._saw_any_output = True
         self._stop_reason = "tool_use"
         yield self._sse("content_block_delta", {
-            "type": "content_block_delta", "index": self._current_block_index,
+            "type": "content_block_delta", "index": block.index,
             "delta": {"type": "input_json_delta", "partial_json": delta},
         })
 
+    def _tool_input_fallback(self, block: _ToolBlock, arguments: Optional[str]) -> Iterator[bytes]:
+        if arguments is None:
+            return
+        if not block.arguments:
+            if arguments:
+                block.used_fallback = True
+                yield from self._emit_tool_input(block, arguments)
+        elif arguments != block.arguments and not block.warned_mismatch:
+            block.warned_mismatch = True
+            _warn_tool_arguments(block, "tool arguments differ; keeping emitted arguments")
+
+    def _close_tool_block(self, block: _ToolBlock) -> Iterator[bytes]:
+        global _missing_arguments_warning_at
+        if not block.arguments:
+            with _arguments_warning_lock:
+                now = time.monotonic()
+                if now - _missing_arguments_warning_at >= 60:
+                    _missing_arguments_warning_at = now
+                    _warn_tool_arguments(block, "tool call closed with no arguments")
+        del self._tool_blocks[block.index]
+        self._stop_reason = "tool_use"
+        yield self._sse("content_block_stop", {
+            "type": "content_block_stop", "index": block.index,
+        })
+
     def _end_block(self, event: dict) -> Iterator[bytes]:
+        item = event.get("item", {})
+        if item.get("type") == "function_call":
+            block = self._tool_block(event)
+            if block is not None:
+                block.events.add(event["type"])
+                yield from self._tool_input_fallback(block, item.get("arguments"))
+                yield from self._close_tool_block(block)
+            return
+        if item.get("type") != "message":
+            return
         # A message item that never produced text: nothing was started, so
         # nothing is stopped, and no empty block reaches the client.
         self._pending_text_block = False
-        if not self._current_block_open:
+        if self._text_block_index is None:
             return
-        item = event.get("item", {})
-        if item.get("type") == "function_call":
-            self._stop_reason = "tool_use"
-        self._current_block_open = False
+        index = self._text_block_index
+        self._text_block_index = None
         yield self._sse("content_block_stop", {
-            "type": "content_block_stop", "index": self._current_block_index,
+            "type": "content_block_stop", "index": index,
         })
 
+    def _close_open_blocks(self) -> Iterator[bytes]:
+        for block in list(self._tool_blocks.values()):
+            yield from self._close_tool_block(block)
+        yield from self._end_block({"item": {"type": "message"}})
+
     def _finish(self, event: dict, stop_reason: Optional[str]) -> Iterator[bytes]:
-        if self._current_block_open:
-            yield self._sse("content_block_stop", {
-                "type": "content_block_stop", "index": self._current_block_index,
-            })
-            self._current_block_open = False
+        yield from self._close_open_blocks()
         response = event.get("response", {})
         usage = response.get("usage") or {}
         # The Responses API nests the cache and reasoning counts:

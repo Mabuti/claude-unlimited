@@ -424,3 +424,219 @@ def test_an_assembled_message_never_carries_an_empty_text_block():
     ])
     body = openai_translate.assemble_message_from_sse(iter(chunks))
     assert [b["type"] for b in body["content"]] == ["tool_use"]
+
+
+# ---- tool arguments delivered without delta events ----
+
+def _tool_item_event(kind, number=0, arguments=None):
+    item = {"type": "function_call", "id": f"fc_{number}",
+            "call_id": f"call_{number}", "name": "Skill"}
+    if arguments is not None:
+        item["arguments"] = arguments
+    return {"type": f"response.output_item.{kind}", "output_index": number,
+            "item": item}
+
+
+def _argument_event(kind, number=0, text='', key="item_id"):
+    event = {"type": f"response.function_call_arguments.{kind}",
+             "delta" if kind == "delta" else "arguments": text}
+    if key == "item_id":
+        event[key] = f"fc_{number}"
+    elif key == "output_index":
+        event[key] = number
+    return event
+
+
+def _tool_stream(events):
+    events = [{"type": "response.created", "response": {}}] + events
+    events.append({"type": "response.completed", "response": {}})
+    out = _translate(events)
+    return [json.loads(line[6:]) for line in out.splitlines() if line.startswith("data: ")]
+
+
+def _tool_arguments(events):
+    # Verify ordering for every block, including interleaved closures.
+    opened, stopped, parts = set(), set(), {}
+    for event in events:
+        kind, index = event["type"], event.get("index")
+        if kind == "content_block_start":
+            assert index not in opened
+            opened.add(index)
+            parts[index] = []
+        elif kind == "content_block_delta":
+            assert index in opened and index not in stopped
+            parts[index].append(event["delta"]["partial_json"])
+        elif kind == "content_block_stop":
+            assert index in opened and index not in stopped
+            stopped.add(index)
+    assert opened == stopped
+    return parts
+
+
+@pytest.mark.parametrize("key", ["item_id", "output_index", None])
+def test_tool_arguments_done_only(key):
+    arguments = '{"skill":"review"}'
+    translator = ResponseTranslator()
+    list(translator.feed(_tool_item_event("added")))
+    immediate = list(translator.feed(_argument_event("done", text=arguments, key=key)))
+    assert len(immediate) == 1
+    assert json.loads(immediate[0].decode().split("data: ")[1])["delta"] == {
+        "type": "input_json_delta", "partial_json": arguments,
+    }
+    out = _tool_stream([
+        _tool_item_event("added"),
+        _argument_event("done", text=arguments, key=key),
+        _tool_item_event("done", arguments=arguments),
+    ])
+    assert _tool_arguments(out) == {0: [arguments]}
+    assert out[-2]["delta"]["stop_reason"] == "tool_use"
+
+
+def test_tool_arguments_output_item_done_only_after_empty_events():
+    arguments = '{"skill":"review"}'
+    out = _tool_stream([
+        _tool_item_event("added"),
+        _argument_event("delta"),
+        _argument_event("done"),
+        _tool_item_event("done", arguments=arguments),
+    ])
+    assert _tool_arguments(out) == {0: [arguments]}
+
+
+@pytest.mark.parametrize("key", ["item_id", "output_index"])
+def test_tool_arguments_delta_only_ignores_unknown_and_closed_calls(key):
+    arguments = '{"skill":"review"}'
+    out = _tool_stream([
+        _tool_item_event("added"),
+        _argument_event("delta", number=99, text='{"wrong":true}', key=key),
+        _argument_event("delta", text=arguments[:10], key=key),
+        _argument_event("delta", text=arguments[10:], key=key),
+        _tool_item_event("done"),
+        _tool_item_event("added", number=1),
+        _argument_event("delta", text='{"late":true}', key=key),
+        _argument_event("delta", number=1, text='{}', key=key),
+        _tool_item_event("done", number=1),
+    ])
+    assert _tool_arguments(out) == {0: [arguments[:10], arguments[10:]], 1: ['{}']}
+
+
+@pytest.mark.parametrize("source", ["done", "output_item.done"])
+@pytest.mark.parametrize("different", ['{"skill":"different-private-input"}', ''])
+def test_tool_arguments_delta_plus_done_keeps_deltas_and_warns_on_mismatch(source, different, capsys):
+    arguments = '{"skill":"private-input"}'
+    matching = (_argument_event("done", text=arguments) if source == "done"
+                else _tool_item_event("done", arguments=arguments))
+    out = _tool_stream([
+        _tool_item_event("added"),
+        _argument_event("delta", text=arguments),
+        matching,
+        _tool_item_event("done", arguments=arguments),
+    ])
+    assert _tool_arguments(out) == {0: [arguments]}
+    assert capsys.readouterr().err == ""
+
+    mismatching = (_argument_event("done", text=different) if source == "done"
+                   else _tool_item_event("done", arguments=different))
+    out = _tool_stream([
+        _tool_item_event("added"),
+        _argument_event("delta", text=arguments[:10]),
+        _argument_event("delta", text=arguments[10:]),
+        mismatching,
+        _tool_item_event("done", arguments=different),
+    ])
+    assert _tool_arguments(out) == {0: [arguments[:10], arguments[10:]]}
+    warning = capsys.readouterr().err
+    assert warning.count("WARNING") == 1
+    assert "Skill" in warning and "arguments differ" in warning
+    assert "private-input" not in warning
+
+
+@pytest.mark.parametrize("key", ["item_id", "output_index"])
+@pytest.mark.parametrize("delivery", ["delta", "done", "output_item.done"])
+def test_tool_arguments_interleaved_calls(key, delivery):
+    first, second = '{"skill":"first"}', '{"skill":"second"}'
+    added = [_tool_item_event("added", number=n) for n in (0, 1)]
+    closed = [_tool_item_event("done", number=n, arguments=args)
+              for n, args in ((0, first), (1, second))]
+    if key == "item_id":
+        for event in added + closed:
+            event.pop("output_index")
+    else:
+        for event in added + closed:
+            event["item"].pop("id")
+    if delivery == "delta":
+        middle = [
+            _argument_event("delta", 0, first[:10], key),
+            _argument_event("delta", 1, second[:10], key),
+            _argument_event("delta", 0, first[10:], key),
+            closed[0],
+            _argument_event("delta", 1, second[10:], key),
+            closed[1],
+        ]
+        expected = {0: [first[:10], first[10:]], 1: [second[:10], second[10:]]}
+    elif delivery == "done":
+        for event in closed:
+            event["item"].pop("arguments")
+        middle = [_argument_event("done", 0, first, key), closed[0],
+                  _argument_event("done", 1, second, key), closed[1]]
+        expected = {0: [first], 1: [second]}
+    else:
+        middle, expected = closed, {0: [first], 1: [second]}
+    assert _tool_arguments(_tool_stream(added + middle)) == expected
+
+
+def test_tool_arguments_done_only_non_streaming_assembly():
+    out = _tool_stream([
+        _tool_item_event("added"),
+        _argument_event("done", text='{"skill":"review"}'),
+        _tool_item_event("done"),
+    ])
+    message = openai_translate.assemble_message_from_sse(iter(_sse(out)))
+    assert message["content"] == [
+        {"type": "tool_use", "id": "call_0", "name": "Skill", "input": {"skill": "review"}},
+    ]
+    assert message["stop_reason"] == "tool_use"
+
+
+def test_tool_arguments_missing_warning_is_rate_limited_across_requests(monkeypatch, capsys):
+    import time
+
+    now = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(openai_translate, "_missing_arguments_warning_at", float("-inf"), raising=False)
+    events = [_tool_item_event("added"), _argument_event("delta"),
+              _argument_event("done"), _tool_item_event("done"), _tool_item_event("done")]
+    for _ in range(2):
+        assert _tool_arguments(_tool_stream(events)) == {0: []}
+    warning = capsys.readouterr().err
+    assert warning.count("WARNING") == 1
+    assert "Skill" in warning and "no arguments" in warning
+    for kind in ("output_item.added", "function_call_arguments.delta",
+                 "function_call_arguments.done", "output_item.done"):
+        assert f"response.{kind}" in warning
+    now[0] += 60
+    _tool_stream(events)
+    assert capsys.readouterr().err.count("WARNING") == 1
+
+
+@pytest.mark.parametrize("terminal", ["response.completed", "response.failed", "abort"])
+def test_tool_arguments_all_open_calls_close_on_terminal(terminal):
+    translator = ResponseTranslator()
+    chunks = []
+    for event in [_tool_item_event("added"), _tool_item_event("added", number=1),
+                  _argument_event("delta", 0, '{}'), _argument_event("delta", 1, '{}')]:
+        chunks.extend(translator.feed(event))
+    chunks.extend(translator.abort("test failure") if terminal == "abort"
+                  else translator.feed({"type": terminal, "response": {}}))
+    out = [json.loads(chunk.decode().split("data: ")[1]) for chunk in chunks]
+    assert _tool_arguments(out) == {0: ['{}'], 1: ['{}']}
+
+
+def test_tool_arguments_reasoning_done_does_not_close_tool_call():
+    out = _tool_stream([
+        _tool_item_event("added"),
+        {"type": "response.output_item.done", "item": {"type": "reasoning"}},
+        _argument_event("delta", text='{}'),
+        _tool_item_event("done"),
+    ])
+    assert _tool_arguments(out) == {0: ['{}']}
