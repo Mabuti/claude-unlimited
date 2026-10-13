@@ -656,10 +656,10 @@ def _tier_live_label(live: dict, tier_id: str, family: str):
 # Pinned to a codex Profile: every request this session makes is served by
 # OpenAI, so name the real backing model outright.
 _CODEX_MODEL_LABELS = {
-    "FABLE": ("Fable 5.1 | GPT-6 Astra", "Served by Codex · reasoning: high"),
-    "OPUS": ("Opus 5.5 | GPT-5.6 Terra", "1M context · Served by Codex · reasoning: high"),
-    "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "1M context · Served by Codex · reasoning: medium"),
-    "HAIKU": ("Haiku 4.5 | GPT-5.6 Luna", "Served by Codex · reasoning: low"),
+    "FABLE": ("Fable 5.1 | GPT-6 Astra", "Served by Codex · reasoning: follows Claude Code"),
+    "OPUS": ("Opus 5.5 | GPT-5.6 Terra", "1M context · Served by Codex · reasoning: follows Claude Code"),
+    "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "1M context · Served by Codex · reasoning: follows Claude Code"),
+    "HAIKU": ("Haiku 4.5 | GPT-5.6 Luna", "Served by Codex · reasoning: follows Claude Code"),
 }
 
 # Rotated across a pool that mixes providers: which provider serves a given
@@ -668,10 +668,10 @@ _CODEX_MODEL_LABELS = {
 # to stays accurate whichever one serves, and still says what is being
 # picked; a provider-neutral tier word would name no model at all.
 _MIXED_MODEL_LABELS = {
-    "FABLE": ("Fable 5.1 | GPT-6 Astra", "Whichever account is active · Codex reasoning: high"),
-    "OPUS": ("Opus 5.5 | GPT-5.6 Terra", "1M context · Whichever account is active · Codex reasoning: high"),
-    "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "1M context · Whichever account is active · Codex reasoning: medium"),
-    "HAIKU": ("Haiku 4.5 | GPT-5.6 Luna", "Whichever account is active · Codex reasoning: low"),
+    "FABLE": ("Fable 5.1 | GPT-6 Astra", "Whichever account is active · Codex reasoning: follows Claude Code"),
+    "OPUS": ("Opus 5.5 | GPT-5.6 Terra", "1M context · Whichever account is active · Codex reasoning: follows Claude Code"),
+    "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "1M context · Whichever account is active · Codex reasoning: follows Claude Code"),
+    "HAIKU": ("Haiku 4.5 | GPT-5.6 Luna", "Whichever account is active · Codex reasoning: follows Claude Code"),
 }
 
 

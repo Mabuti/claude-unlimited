@@ -2306,3 +2306,44 @@ def test_is_model_refusal_wording():
     assert refusal(400, b'{"error":{"message":"model claude-x does not exist"}}')
     assert not refusal(400, b'{"error":{"message":"model: field required"}}')
     assert not refusal(404, b'{"error":{"message":"prompt is too long"}}')
+
+
+@pytest.mark.parametrize("kind", ["oauth", "api"])
+@pytest.mark.parametrize("effort, expected", [(None, "medium"), ("low", "medium"), ("max", "low")])
+def test_claude_parity_effort_overrides_reach_transport(pool_env, kind, effort, expected):
+    from claude_unlimited.config import Settings
+    rows = [{"claude_model": "claude-fable-5-1", "claude_effort": "medium"},
+            {"claude_model": "claude-fable-5-1", "source_effort": "max", "claude_effort": "low"}]
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind=kind, automatic=True, enabled=True)], settings=Settings(model_parity=rows)))
+    sent = []
+
+    def transport(req):
+        sent.append(json.loads(req.body))
+        return fake_response(200)
+
+    body = {"model": "claude-fable-5-1", "messages": [], "output_config": {"effort": effort}}
+    result = Gateway(transport=transport).handle("POST", "/v1/messages", {}, json.dumps(body).encode())
+    assert result.status == 200
+    list(result.body_chunks)
+    assert sent[0]["output_config"]["effort"] == expected
+
+
+def test_claude_model_retry_selects_override_from_original_request_effort(pool_env):
+    from claude_unlimited.config import Settings
+    rows = [{"claude_model": "claude-fable-5-1", "claude_effort": "low"},
+            {"claude_model": "claude-sonnet-5", "claude_effort": "medium"},
+            {"claude_model": "claude-sonnet-5", "source_effort": "max", "claude_effort": "high"}]
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="api", automatic=True, enabled=True, default_model="claude-sonnet-5")],
+                   settings=Settings(model_parity=rows)))
+    sent = []
+
+    def transport(req):
+        sent.append(json.loads(req.body))
+        return fake_response(403 if len(sent) == 1 else 200)
+
+    body = {"model": "claude-fable-5-1", "messages": [], "output_config": {"effort": "max"}}
+    result = Gateway(transport=transport).handle("POST", "/v1/messages", {}, json.dumps(body).encode())
+    assert result.status == 200
+    list(result.body_chunks)
+    assert [(r["model"], r["output_config"]["effort"]) for r in sent] == [
+        ("claude-fable-5-1", "low"), ("claude-sonnet-5", "high")]

@@ -999,7 +999,7 @@ def _blocked_models_for(profile: Profile, model_usage, settings, now: datetime) 
                 claude_model,
                 override_model=profile.codex_model,
                 override_reasoning_effort=profile.codex_reasoning_effort,
-                parity=rows)
+                parity=rows, requested_effort=None)
         except Exception:
             continue
         if target.model and target.model.strip().lower() in unavailable:
@@ -1052,7 +1052,8 @@ def _request_guard(body: bytes, parsed: Optional[dict], pool: Pool) -> Optional[
             try:
                 target = openai_models.map_model(
                     requested, override_model=profile.codex_model,
-                    override_reasoning_effort=profile.codex_reasoning_effort, parity=rows)
+                    override_reasoning_effort=profile.codex_reasoning_effort, parity=rows,
+                    requested_effort=openai_models.requested_effort(parsed))
                 model = target.model
             except Exception:
                 model = profile.codex_model  # unknown → assumed at the floor
@@ -1853,7 +1854,19 @@ class Gateway:
             known_bad = self._default_model_body(profile, eco_body)
             if known_bad is not None:
                 eco_body = known_bad
-            claude_effort = openai_models.claude_effort_for(request_model(eco_body), pool.settings.model_parity)
+            claude_effort = None
+            if profile.kind in ("oauth", "api"):
+                parity_rows = openai_models.normalize_parity(pool.settings.model_parity)
+                if any(row.get("claude_effort") for row in parity_rows):
+                    # No injection configured means no need to parse. Branch
+                    # routing may already have parsed these exact bytes.
+                    effort_body = (parsed_request if eco_body is body and parsed_request is not None
+                                   else _parsed_request(eco_body))
+                    if eco_body is body:
+                        parsed_request = effort_body
+                    claude_effort = openai_models.claude_effort_for(
+                        _requested_model(effort_body), parity_rows,
+                        requested_effort=openai_models.requested_effort(effort_body))
             try:
                 upstream_req = build_upstream_request(profile, credential, method, path, headers, eco_body,
                                                       claude_effort=claude_effort)
@@ -3500,7 +3513,9 @@ class Gateway:
         # one that failed — carrying the original's effort could push a value
         # default_model rejects (e.g. onto a Haiku-class default). Rebuilt from
         # the original body so build_upstream_request injects the right one.
-        retry_effort = openai_models.claude_effort_for(profile.default_model, parity)
+        retry_effort = openai_models.claude_effort_for(
+            profile.default_model, parity,
+            requested_effort=openai_models.requested_effort(_parsed_request(body)))
         try:
             retry_req = build_upstream_request(profile, credential, method, path, headers, retry_body,
                                                claude_effort=retry_effort)

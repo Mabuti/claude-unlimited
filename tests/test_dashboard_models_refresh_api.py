@@ -100,3 +100,17 @@ def test_model_map_endpoint_returns_the_wire_keys_the_dashboard_reads(running_se
     # claude_selectable_models are {id,label} objects; defaults are full rows.
     assert set(body["claude_selectable_models"][0]) >= {"id", "label"}
     assert set(body["defaults"][0]) >= {"claude_model", "model", "effort"}
+
+
+def test_parity_grid_endpoint_matches_saved_settings(running_server):
+    from claude_unlimited.config import update_settings
+    from claude_unlimited.openai_models import parity_grid
+    rows = [{"claude_model": "claude-fable-5-1", "effort": "follow"},
+            {"claude_model": "claude-fable-5-1", "source_effort": "max", "effort": "low"}]
+    update_settings(model_parity=rows)
+    status, body = _get(f"{running_server}/api/model-parity/grid")
+    assert status == 200
+    assert body == {"grid": parity_grid(rows)}
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _get(f"{running_server}/api/model-parity/grid", headers={"Host": "evil.example"})
+    assert excinfo.value.code == 400

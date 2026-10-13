@@ -880,3 +880,18 @@ def test_leave_on_fable_limit_survives_an_export_import_round_trip(env, monkeypa
     ei.apply_import(ei.import_bundle(bundle, passphrase="hunter22"), import_profiles=True,
                     import_settings=False, conflict_strategy="use_imported")
     assert {p.name: p.leave_on_fable_limit for p in profile_repo.list_profiles()} == {"Leaver": True, "Stayer": False}
+
+
+def test_effort_parity_settings_round_trip(env):
+    from claude_unlimited.config import update_settings
+    rows = [
+        {"claude_model": "claude-fable-5-1", "source_effort": "*", "effort": "follow"},
+        {"claude_model": "claude-fable-5-1", "source_effort": "max", "model": "gpt-6-astra",
+         "effort": "high", "claude_effort": "low"},
+    ]
+    update_settings(model_parity=rows)
+    bundle = ei.build_export_bundle(include_profiles=False, include_settings=True, include_activity=False)
+    assert json.loads(bundle)["data"]["settings"]["model_parity"] == rows
+    update_settings(model_parity=[])
+    ei.apply_import(ei.import_bundle(bundle), import_profiles=False, import_settings=True)
+    assert load_pool().settings.model_parity == rows

@@ -1188,3 +1188,13 @@ def test_claude_code_subagent_headers_reach_the_codex_bridge(pool_env, monkeypat
 
     assert [(c.claude_session_id, c.agent_id, c.parent_agent_id) for c in seen] == [
         ("sess-1", "a-child", None), ("sess-1", "a-grand", "a-child")]
+
+
+def test_capacity_guard_maps_requested_effort_override(pool_env):
+    rows = [{"claude_model": "claude-fable-5-1", "model": "gpt-6-astra", "effort": "follow"},
+            {"claude_model": "claude-fable-5-1", "source_effort": "low", "model": "gpt-5.6-luna"}]
+    pool = Pool(profiles=[_codex_profile()], settings=Settings(model_parity=rows))
+    body = {"model": "claude-fable-5-1", "messages": [{"role": "user", "content": "x" * (_gw.CERTAINLY_FITS_BYTES + 1)}],
+            "output_config": {"effort": "low"}}
+    guard = gateway_module._request_guard(json.dumps(body).encode(), body, pool)
+    assert guard.windows["c"].model == "gpt-5.6-luna"

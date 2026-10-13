@@ -765,6 +765,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"profiles": items})
             return
 
+        if path == "/api/model-parity/grid":
+            self._send_json(200, {"grid": openai_models.parity_grid(load_pool().settings.model_parity)})
+            return
+
         if path == "/api/codex/model-map":
             # Served rather than restated in the page: the Dashboard used to
             # carry its own copy of this table, which went stale the first

@@ -975,3 +975,33 @@ def test_passthrough_network_failure_is_a_bridge_error(monkeypatch):
     monkeypatch.setattr(bridge_module.http.client, "HTTPSConnection", factory)
     with pytest.raises(OpenAIBridgeError):
         bridge_module.run_passthrough(_subscription_profile(), _cred(), "POST", "", _PASSTHROUGH_BODY, {})
+
+
+@pytest.mark.parametrize("effort", [None, "", "low", "medium", "high", "xhigh", "max"])
+def test_bridge_passes_requested_effort_to_parity_target(monkeypatch, effort):
+    conns = _install_fake_connections(monkeypatch, [_ok()])
+    rows = [{"claude_model": "claude-fable-5-1", "model": "gpt-5.6-sol", "effort": "follow"},
+            {"claude_model": "claude-fable-5-1", "source_effort": "max",
+             "model": "gpt-6-astra", "effort": "follow"}]
+    body = {"model": "claude-fable-5-1", "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": effort}}
+    result = run(_subscription_profile(), _cred(), json.dumps(body).encode(), parity=rows)
+    list(result.body_chunks)
+    sent = json.loads(conns[0].requests[0]["body"])
+    assert sent["model"] == ("gpt-6-astra" if effort == "max" else "gpt-5.6-sol")
+    assert sent["reasoning"]["effort"] == (effort or "medium")
+
+
+def test_follow_effort_still_uses_refused_effort_substitution(monkeypatch):
+    conns = _install_fake_connections(monkeypatch, [
+        FakeHTTPResponse(400, {}, json.dumps({"error": {
+            "param": "reasoning.effort",
+            "message": "Unsupported value: 'max' is not supported with the 'gpt-5.6-sol' model. Supported values are: 'low', 'medium', and 'high'.",
+        }}).encode()),
+        _ok(),
+    ])
+    body = {"model": "claude-fable-5-1", "messages": [], "output_config": {"effort": "max"}}
+    result = run(_subscription_profile(), _cred(), json.dumps(body).encode(), parity=[
+        {"claude_model": "claude-fable-5-1", "model": "gpt-5.6-sol", "effort": "follow"}])
+    list(result.body_chunks)
+    assert [json.loads(c.requests[0]["body"])["reasoning"]["effort"] for c in conns] == ["max", "high"]

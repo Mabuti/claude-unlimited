@@ -788,3 +788,19 @@ def test_the_pinned_session_note_is_repeated_for_the_next_spent_week(pool_env):
     notes = [e for e in activity_module.list_events(limit=50)
              if e.text == "A has spent its Fable weekly limit"]
     assert len(notes) == 2
+
+
+@pytest.mark.parametrize("distribute", [False, True])
+def test_claude_effort_mapping_reuses_branch_parse(pool_env, monkeypatch, distribute):
+    import json
+    from claude_unlimited.config import Settings
+    rows = [{"claude_model": "claude-fable-5-1", "claude_effort": "medium"},
+            {"claude_model": "claude-fable-5-1", "source_effort": "max", "claude_effort": "low"}]
+    save_pool(Pool(profiles=[prof("a")], settings=Settings(model_parity=rows)))
+    calls = _count_body_parses(monkeypatch)
+    body = json.dumps({"model": "claude-fable-5-1", "messages": [],
+                       "output_config": {"effort": "max"}}).encode()
+    result = healthy_gateway().handle("POST", "/v1/messages", hdrs(agent="ag1"), body, distribute=distribute)
+    assert result.status == 200
+    list(result.body_chunks)
+    assert calls == [1]

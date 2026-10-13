@@ -4586,7 +4586,7 @@ function updateCodexModelHelp(prefix) {
 // by index (not Claude id), because the Claude model of a row is itself
 // editable and rows can be added/removed. The row set and the dropdown option
 // lists still come from /api/codex/model-map, never hardcoded here.
-let _parityRows = [];   // working list: {claude_model, model, effort, claude_effort}
+let _parityRows = [];   // working list: {claude_model, source_effort, model, effort, claude_effort}
 let _parityMeta = { defaults: [], claude_selectable: [], claude_efforts: [] };
 
 function _claudeModelOptionsFor(current) {
@@ -4600,15 +4600,17 @@ function _codexModelOptionsFor(current) {
   return opts;
 }
 function _codexEffortOptions() {
-  return _reasoningEfforts.map((e) => ({ value: e, label: codexEffortLabel(e) }));
+  return [{ value: 'follow', label: t('settings.parity.follow') },
+          ..._reasoningEfforts.map((e) => ({ value: e, label: codexEffortLabel(e) }))];
 }
 
 /// "none" is the one level whose name does not explain itself.
 function codexEffortLabel(effort) {
+  if (effort === 'follow') return t('settings.parity.follow');
   return effort === 'none' ? t('settings.parity.effort_none') : effort;
 }
 function _claudeEffortOptions() {
-  return [{ value: '', label: t('modal.add_profile.automatic_option') },
+  return [{ value: '', label: t('settings.parity.leave_requested') },
           ..._parityMeta.claude_efforts.map((e) => ({ value: e, label: e }))];
 }
 
@@ -4617,7 +4619,7 @@ function collectParity() {
   return _parityRows
     .filter((r) => r.claude_model)
     .map((r) => {
-      const entry = { claude_model: r.claude_model, model: r.model, effort: r.effort };
+      const entry = { claude_model: r.claude_model, source_effort: r.source_effort || '*', model: r.model, effort: r.effort };
       if (r.claude_effort) entry.claude_effort = r.claude_effort;
       return entry;
     });
@@ -4629,31 +4631,94 @@ function renderParityRows() {
   const body = document.getElementById('parityRows');
   if (!body) return;
   const sel = (id, val) => `<div class="select-input" id="${id}" data-value="${esc(val || '')}"><span class="select-value"></span>${_CHEVRON}</div>`;
-  body.innerHTML = _parityRows.map((r, i) => `
-    <tr>
-      <td>${sel(`parity_claude_${i}`, r.claude_model)}</td>
-      <td>${sel(`parity_ceffort_${i}`, r.claude_effort || '')}</td>
-      <td>${sel(`parity_model_${i}`, r.model)}</td>
-      <td>${sel(`parity_effort_${i}`, r.effort)}</td>
-      <td><button class="parity-del" data-row="${i}" title="${esc(t('settings.parity.delete_row'))}" aria-label="${esc(t('settings.parity.delete_row'))}">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6M14 11v6"/></svg>
-      </button></td>
-    </tr>`).join('');
+  const groups = new Map();
   _parityRows.forEach((r, i) => {
-    setupSelectInput(document.getElementById(`parity_claude_${i}`), _claudeModelOptionsFor(r.claude_model), (v) => { _parityRows[i].claude_model = v; });
-    setupSelectInput(document.getElementById(`parity_ceffort_${i}`), _claudeEffortOptions(), (v) => { _parityRows[i].claude_effort = v || null; });
-    setupSelectInput(document.getElementById(`parity_model_${i}`), _codexModelOptionsFor(r.model), (v) => { _parityRows[i].model = v; });
-    setupSelectInput(document.getElementById(`parity_effort_${i}`), _codexEffortOptions(), (v) => { _parityRows[i].effort = v; });
+    const key = _baseId(r.claude_model);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(i);
+  });
+  body.innerHTML = [...groups.values()].map((indices) => {
+    const base = indices.find((i) => (_parityRows[i].source_effort || '*') === '*');
+    const ordered = [base, ...indices.filter((i) => i !== base)].filter((i) => i !== undefined);
+    return ordered.map((i) => {
+      const r = _parityRows[i];
+      return `<tr>
+        <td>${i === base ? sel(`parity_claude_${i}`, r.claude_model) : esc(r.claude_model)}</td>
+        <td>${i === base ? esc(t('settings.parity.any')) : sel(`parity_source_${i}`, r.source_effort)}</td>
+        <td aria-hidden="true">→</td>
+        <td>${sel(`parity_model_${i}`, r.model)}</td>
+        <td>${sel(`parity_effort_${i}`, r.effort)}</td>
+        <td>${sel(`parity_ceffort_${i}`, r.claude_effort || '')}</td>
+        <td><button class="parity-del" data-row="${i}" title="${esc(t('settings.parity.delete_row'))}" aria-label="${esc(t('settings.parity.delete_row'))}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6M14 11v6"/></svg>
+        </button></td>
+      </tr>`;
+    }).join('') + (base === undefined ? '' : `<tr><td colspan="7"><button class="btn parity-override" data-row="${base}" ${indices.length >= 6 || _parityRows.length >= 64 ? 'disabled' : ''}>${esc(t('settings.parity.add_override'))}</button></td></tr>`);
+  }).join('');
+  _parityRows.forEach((r, i) => {
+    if ((r.source_effort || '*') === '*') {
+      const options = _claudeModelOptionsFor(r.claude_model).filter((o) =>
+        _baseId(o.value) === _baseId(r.claude_model) || !groups.has(_baseId(o.value)));
+      setupSelectInput(document.getElementById(`parity_claude_${i}`), options, (v) => {
+        const old = r.claude_model;
+        _parityRows.forEach((row) => { if (row.claude_model === old) row.claude_model = v; });
+        renderParityRows();
+      });
+    } else {
+      const used = new Set(_parityRows.filter((row) => row !== r && row.claude_model === r.claude_model).map((row) => row.source_effort));
+      setupSelectInput(document.getElementById(`parity_source_${i}`),
+        _parityMeta.claude_efforts.filter((e) => !used.has(e)).map((e) => ({ value: e, label: e })),
+        (v) => { r.source_effort = v; renderParityRows(); });
+    }
+    setupSelectInput(document.getElementById(`parity_ceffort_${i}`), _claudeEffortOptions(), (v) => { r.claude_effort = v || null; });
+    setupSelectInput(document.getElementById(`parity_model_${i}`), _codexModelOptionsFor(r.model), (v) => { r.model = v; });
+    setupSelectInput(document.getElementById(`parity_effort_${i}`), _codexEffortOptions(), (v) => { r.effort = v; });
   });
   body.querySelectorAll('.parity-del').forEach((btn) => {
     btn.addEventListener('click', () => onDeleteParityRow(Number(btn.dataset.row)));
   });
+  body.querySelectorAll('.parity-override').forEach((btn) => {
+    btn.addEventListener('click', () => onAddEffortOverride(Number(btn.dataset.row)));
+  });
+}
+
+function onAddEffortOverride(i) {
+  const base = _parityRows[i];
+  const used = new Set(_parityRows.filter((r) => r.claude_model === base.claude_model).map((r) => r.source_effort));
+  const effort = _parityMeta.claude_efforts.find((e) => !used.has(e));
+  if (!effort || _parityRows.length >= 64) return;
+  _parityRows.splice(i + 1, 0, { ...base, source_effort: effort });
+  renderParityRows();
 }
 
 function onDeleteParityRow(i) {
-  if (_parityRows.length <= 1) { showToast('error', t('settings.parity.last_row'), ''); return; }
-  _parityRows.splice(i, 1);
+  const row = _parityRows[i];
+  const remaining = _parityRows.filter((r, j) => (row.source_effort || '*') === '*'
+    ? r.claude_model !== row.claude_model : j !== i);
+  if (!remaining.length) { showToast('error', t('settings.parity.last_row'), ''); return; }
+  _parityRows = remaining;
   renderParityRows();
+}
+
+async function loadParityGrid() {
+  const body = document.getElementById('parityGridRows');
+  body.innerHTML = '';
+  try {
+    const data = await api('/api/model-parity/grid');
+    const noteLabel = (note) => note.split('; ').filter(Boolean).map((part) => {
+      if (part.startsWith('clamped to ')) return t('settings.parity.note_clamped').replace('{effort}', part.slice(11));
+      const keys = { follows: 'note_follows', override: 'note_override', 'not supported by this model': 'note_unsupported' };
+      return keys[part] ? t(`settings.parity.${keys[part]}`) : part;
+    }).join('; ');
+    body.innerHTML = data.grid.map((r) => `<tr>
+      <td>${esc(r.claude_model)}</td><td>${esc(r.requested_effort || t('settings.parity.absent'))}</td>
+      <td>→</td><td>${esc(r.model)}</td><td>${esc(codexEffortLabel(r.effort))}</td>
+      <td>${esc(r.claude_effort || t('settings.parity.leave_requested'))}</td>
+      <td>${r.row_index + 1}</td><td>${esc(noteLabel(r.note))}</td>
+    </tr>`).join('');
+  } catch (e) {
+    body.innerHTML = `<tr><td colspan="8">${esc(t('settings.parity.grid_failed'))}</td></tr>`;
+  }
 }
 
 // Strip a trailing date stamp, matching the server's base_id() — so a saved
@@ -4686,7 +4751,7 @@ function onAddMissingParityRows() {
   for (const m of _parityUnmapped) {
     if (used.has(_baseId(m.claude_model))) continue;
     _parityRows.push({ claude_model: m.claude_model, model: m.would_map_to,
-                       effort: m.would_use_effort, claude_effort: null });
+                       source_effort: '*', effort: 'follow', claude_effort: null });
   }
   _parityUnmapped = [];
   renderParityBanner();
@@ -4699,9 +4764,9 @@ function onAddParityRow() {
   if (!seed) {
     const claude = _parityMeta.claude_selectable.find((m) => !used.has(_baseId(m.id)));
     seed = { claude_model: claude ? claude.id : '', model: (_selectableModels[0] || ''),
-             effort: (_reasoningEfforts[0] || 'medium'), claude_effort: null };
+             effort: 'follow', claude_effort: null };
   }
-  _parityRows.push({ claude_model: seed.claude_model, model: seed.model,
+  _parityRows.push({ claude_model: seed.claude_model, source_effort: '*', model: seed.model,
                      effort: seed.effort, claude_effort: seed.claude_effort || null });
   renderParityRows();
 }
@@ -4725,14 +4790,16 @@ async function loadModelParity() {
     claude_efforts: data.claude_efforts || [],
   };
   _parityRows = (data.mapping || []).map((r) => ({
-    claude_model: r.claude_model, model: r.openai_model,
+    claude_model: r.claude_model, source_effort: r.source_effort || '*', model: r.openai_model,
     effort: r.reasoning_effort, claude_effort: r.claude_effort || null,
   }));
   _parityUnmapped = data.unmapped || [];
+  _codexMappingRows = null;
   refreshCodexSelectOptions();
   section.style.display = '';
   renderParityRows();
   renderParityBanner();
+  await loadParityGrid();
 }
 
 async function saveModelParity() {
@@ -4803,15 +4870,15 @@ document.getElementById('advancedToggle').addEventListener('click', () => {
 // The mapping table is served, not written into the page: it was hardcoded in
 // two places and both went stale the first time the mapping changed, telling
 // people a model and effort the bridge had stopped using. Fetched once and
-// reused, since it only changes when the daemon itself does.
+// reused until the parity editor reloads the saved mapping.
 let _codexMappingRows = null;
 async function loadCodexMapping() {
   if (!_codexMappingRows) {
     const data = await api('/api/codex/model-map');
     _codexMappingRows = (data.mapping || []).map((m) =>
-      `<tr><td>${esc(m.claude_label)}</td>` +
+      `<tr><td>${esc(m.claude_label)} · ${esc(m.source_effort === '*' || !m.source_effort ? t('settings.parity.any') : m.source_effort)}</td>` +
       `<td class="mono">${esc(m.openai_model)}</td>` +
-      `<td class="mono">${esc(m.reasoning_effort)}</td></tr>`).join('');
+      `<td class="mono">${esc(codexEffortLabel(m.reasoning_effort))}</td></tr>`).join('');
   }
   for (const id of ['f_codex_mapping_rows', 'pd_codex_mapping_rows']) {
     const el = document.getElementById(id);

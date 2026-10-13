@@ -288,8 +288,8 @@ class Settings:
     # no messages, and the Dashboard is wrong without it.
     keep_usage_fresh: bool = True
     # The editable model-parity list: an ORDERED list of rows
-    # [{"claude_model", "model"?, "effort"?, "claude_effort"?}, ...] that IS the
-    # set of models Claude Code's /model picker offers for Codex-served
+    # [{"claude_model", "source_effort"?, "model"?, "effort"?, "claude_effort"?}, ...].
+    # Distinct model ids are what Claude Code's /model picker offers for Codex-served
     # sessions. Empty ([] or {}) means "the default rows" (the 4 family heads),
     # never "advertise nothing". A legacy sparse dict {claude_id: {...}} is
     # still accepted and migrated at read time by openai_models.normalize_parity
@@ -593,9 +593,10 @@ def _validated_model_row_fields(where, row, entry):
             raise ValueError(f"{where}.model must be a short non-empty string")
         entry["model"] = model.strip()
     effort = upgrade_reasoning_effort(row.get("effort"))
+    valid_efforts = (*VALID_REASONING_EFFORTS, "follow")
     if effort is not None:
-        if effort not in VALID_REASONING_EFFORTS:
-            raise ValueError(f"{where}.effort must be one of {list(VALID_REASONING_EFFORTS)}")
+        if effort not in valid_efforts:
+            raise ValueError(f"{where}.effort must be one of {list(valid_efforts)}")
         entry["effort"] = effort
     claude_effort = row.get("claude_effort")
     if claude_effort is not None:
@@ -613,17 +614,18 @@ def _validated_model_parity(raw):
 
     Accepts BOTH shapes so old config files and export bundles keep working:
       * the current ORDERED LIST of rows [{claude_model, model?, effort?,
-        claude_effort?}, ...] — the editable parity list; order is preserved;
+        source_effort?, claude_effort?}, ...] — order is preserved;
       * the legacy sparse dict {claude_id: {model?, effort?, claude_effort?}}.
     openai_models.normalize_parity() turns either into the in-force row list at
     read time, and the empty case ([]/{}) means "the default rows"."""
     from .model_catalogue import base_id
+    from .openai_models import CLAUDE_REASONING_EFFORTS
 
     if isinstance(raw, list):
         if len(raw) > 64:
             raise ValueError("model_parity has too many entries")
         cleaned_list: list = []
-        seen_bases: set = set()
+        groups: dict = {}
         for i, row in enumerate(raw):
             if not isinstance(row, dict):
                 raise ValueError(f"model_parity[{i}] must be an object")
@@ -632,12 +634,23 @@ def _validated_model_parity(raw):
                 raise ValueError(f"model_parity[{i}].claude_model must be a short non-empty model id")
             claude_id = claude_id.strip()
             base = base_id(claude_id)
-            if base in seen_bases:
-                raise ValueError(f"model_parity has a duplicate Claude model: {claude_id}")
-            seen_bases.add(base)
+            source = row.get("source_effort", "*")
+            if source not in ("*", *CLAUDE_REASONING_EFFORTS):
+                raise ValueError(f"model_parity[{i}].source_effort is invalid")
+            spelling, efforts = groups.setdefault(base, (claude_id, set()))
+            if spelling != claude_id:
+                raise ValueError(f"model_parity has duplicate spellings of Claude model: {claude_id}")
+            if source in efforts:
+                raise ValueError(f"model_parity has a duplicate Claude model/source_effort: {claude_id}/{source}")
+            efforts.add(source)
             entry = {"claude_model": claude_id}
+            if "source_effort" in row:
+                entry["source_effort"] = source
             _validated_model_row_fields(f"model_parity[{i}]", row, entry)
             cleaned_list.append(entry)
+        for claude_id, efforts in groups.values():
+            if "*" not in efforts:
+                raise ValueError(f"model_parity group {claude_id} needs a '*' base row")
         return cleaned_list
 
     if not isinstance(raw, dict):
@@ -645,11 +658,16 @@ def _validated_model_parity(raw):
     if len(raw) > 64:
         raise ValueError("model_parity has too many entries")
     cleaned: dict = {}
+    seen_bases: set = set()
     for claude_id, row in raw.items():
         if not isinstance(claude_id, str) or not claude_id.strip():
             raise ValueError("model_parity keys must be non-empty model ids")
         if not isinstance(row, dict):
             raise ValueError(f"model_parity[{claude_id}] must be an object")
+        base = base_id(claude_id.strip())
+        if base in seen_bases:
+            raise ValueError(f"model_parity has a duplicate Claude model: {claude_id}")
+        seen_bases.add(base)
         entry = _validated_model_row_fields(f"model_parity[{claude_id}]", row, {})
         if entry:
             cleaned[claude_id.strip()] = entry

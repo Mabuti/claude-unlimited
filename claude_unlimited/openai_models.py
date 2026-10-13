@@ -196,7 +196,7 @@ def effective_model_map(catalogue: Optional[Catalogue] = None) -> dict[str, Open
 
 def map_model(requested_claude_model: Optional[str], *, override_model: Optional[str] = None,
               override_reasoning_effort: Optional[str] = None,
-              parity=None,
+              parity=None, requested_effort: Optional[str] = None,
               catalogue: Optional[Catalogue] = None) -> OpenAIModelTarget:
     """Resolves what to send to OpenAI for a given incoming Claude model id.
 
@@ -205,7 +205,7 @@ def map_model(requested_claude_model: Optional[str], *, override_model: Optional
     list, which beats the built-in table. Model and effort are independent at
     every level, so overriding only the model keeps the effort this model
     would otherwise have used."""
-    mapped = _resolve(requested_claude_model, parity, catalogue)
+    mapped = _resolve(requested_claude_model, parity, catalogue, requested_effort)
     if override_model is not None:
         # Effort falls back to the effort for THIS model, not the global
         # default. Taking _DEFAULT_TARGET's "medium" here meant a Haiku
@@ -267,7 +267,7 @@ def default_parity_rows(catalogue: Optional[Catalogue] = None) -> list[dict]:
             head = max(members, key=lambda m: model_catalogue._version_of(m.id)).id
             target = _curated_fallback(head, cat)
             rows.append({"claude_model": head, "model": target.model,
-                         "effort": target.reasoning_effort, "claude_effort": None})
+                         "effort": "follow", "claude_effort": None})
     if not rows:
         # One row per family here too: _MODEL_MAP can hold several ids of one
         # family (Opus 5.5 beside Opus 5), newest first, and a fresh install
@@ -279,13 +279,13 @@ def default_parity_rows(catalogue: Optional[Catalogue] = None) -> list[dict]:
                 continue
             seen.add(family)
             rows.append({"claude_model": claude_id, "model": target.model,
-                         "effort": target.reasoning_effort, "claude_effort": None})
+                         "effort": "follow", "claude_effort": None})
     return rows
 
 
 def normalize_parity(raw, catalogue: Optional[Catalogue] = None) -> list[dict]:
     """The parity list actually in force, as an ordered list of complete rows
-    ({claude_model, model, effort, claude_effort}).
+    ({claude_model, source_effort?, model, effort, claude_effort}).
 
     Accepts every shape the config has ever stored, so old files and export
     bundles keep working without a migration pass on load:
@@ -310,13 +310,17 @@ def normalize_parity(raw, catalogue: Optional[Catalogue] = None) -> list[dict]:
             fallback = _curated_fallback(claude_id, cat)
             rows.append({
                 "claude_model": claude_id,
+                **({"source_effort": entry["source_effort"]} if "source_effort" in entry else {}),
                 "model": entry.get("model") or fallback.model,
                 "effort": entry.get("effort") or fallback.reasoning_effort,
                 "claude_effort": entry.get("claude_effort") or None,
             })
         return rows or defaults
     if isinstance(raw, dict) and raw:
-        rows = [dict(row) for row in defaults]
+        # Legacy sparse maps keep concrete curated efforts, even on rows
+        # without an overlay. Only a reset opts them into follow.
+        rows = [dict(row, effort=_curated_fallback(row["claude_model"], cat).reasoning_effort)
+                for row in defaults]
         by_base = {base_id(row["claude_model"]): row for row in rows}
         for claude_id, overlay in raw.items():
             if not isinstance(overlay, dict):
@@ -341,39 +345,65 @@ def normalize_parity(raw, catalogue: Optional[Catalogue] = None) -> list[dict]:
     return defaults
 
 
-def _match_row(rows: list[dict], requested_claude_model: str) -> Optional[dict]:
-    """The parity row that governs a requested model: exact id, then
-    dated/undated base id, then family prefix."""
+def requested_effort(body: Optional[dict]) -> Optional[str]:
+    """Read Claude Code's explicit effort; missing/null/blank means absent."""
+    output = body.get("output_config") if isinstance(body, dict) else None
+    effort = output.get("effort") if isinstance(output, dict) else None
+    return effort if effort in CLAUDE_REASONING_EFFORTS else None
+
+
+def _parity_groups(rows: list[dict]) -> list[list[dict]]:
+    groups: dict[str, list[dict]] = {}
     for row in rows:
-        if row["claude_model"] == requested_claude_model:
-            return row
-    base = base_id(requested_claude_model)
-    for row in rows:
-        if base_id(row["claude_model"]) == base:
-            return row
-    lowered = requested_claude_model.lower()
-    for family in _DEFAULT_FAMILIES:
-        if family in lowered:
-            for row in rows:
-                if base_id(row["claude_model"]).lower().startswith(family):
-                    return row
-    return None
+        groups.setdefault(base_id(row["claude_model"]), []).append(row)
+    return list(groups.values())
+
+
+def _match_row(rows: list[dict], requested_claude_model: str,
+               requested_effort: Optional[str] = None) -> Optional[dict]:
+    """Exact id, then base id, then family; explicit effort overrides its base."""
+    groups = _parity_groups(rows)
+    group = next((g for g in groups if g[0]["claude_model"] == requested_claude_model), None)
+    if group is None:
+        base = base_id(requested_claude_model)
+        group = next((g for g in groups if base_id(g[0]["claude_model"]) == base), None)
+    if group is None:
+        lowered = requested_claude_model.lower()
+        for family in _DEFAULT_FAMILIES:
+            if family in lowered:
+                group = next((g for g in groups
+                              if base_id(g[0]["claude_model"]).lower().startswith(family)), None)
+                if group is not None:
+                    break
+    if group is None:
+        return None
+    if requested_effort in CLAUDE_REASONING_EFFORTS:
+        override = next((r for r in group if r.get("source_effort", "*") == requested_effort), None)
+        if override is not None:
+            return override
+    return next((r for r in group if r.get("source_effort", "*") == "*"), None)
 
 
 def _resolve(requested_claude_model: Optional[str], parity=None,
-             catalogue: Optional[Catalogue] = None) -> OpenAIModelTarget:
+             catalogue: Optional[Catalogue] = None,
+             requested_effort: Optional[str] = None) -> OpenAIModelTarget:
     cat = _catalogue_or_current(catalogue)
     if requested_claude_model:
-        row = _match_row(normalize_parity(parity, cat), requested_claude_model)
+        row = _match_row(normalize_parity(parity, cat), requested_claude_model, requested_effort)
         if row is not None:
-            return OpenAIModelTarget(row["model"], row["effort"])
+            effort = row["effort"]
+            if effort == "follow":
+                effort = (requested_effort if requested_effort in CLAUDE_REASONING_EFFORTS
+                          else _curated_fallback(requested_claude_model, cat).reasoning_effort)
+            return OpenAIModelTarget(row["model"], effort)
     # Not in the saved list (or no model requested): fall back to the built-in
     # curated target so a typed-but-unlisted id still routes sanely.
     return _curated_fallback(requested_claude_model, cat)
 
 
 def claude_effort_for(requested_claude_model: Optional[str], parity=None,
-                      catalogue: Optional[Catalogue] = None) -> Optional[str]:
+                      catalogue: Optional[Catalogue] = None, *,
+                      requested_effort: Optional[str] = None) -> Optional[str]:
     """The output_config.effort to inject for an oauth/api-served request, or
     None to leave the request untouched. Matches the requested model to a
     parity row, then runs the row's claude_effort through the per-model support
@@ -381,10 +411,43 @@ def claude_effort_for(requested_claude_model: Optional[str], parity=None,
     if not requested_claude_model:
         return None
     cat = _catalogue_or_current(catalogue)
-    row = _match_row(normalize_parity(parity, cat), requested_claude_model)
+    row = _match_row(normalize_parity(parity, cat), requested_claude_model, requested_effort)
     if row is None:
         return None
     return apply_claude_effort(requested_claude_model, row.get("claude_effort"))
+
+
+def parity_grid(rows, catalogue: Optional[Catalogue] = None) -> list[dict]:
+    """Effective settings for every group × request effort, before backend retries.
+
+    row_index refers to the normalized saved list, including when overrides
+    precede their base. Claude effort is the injection, not the incoming value.
+    """
+    cat = _catalogue_or_current(catalogue)
+    rows = normalize_parity(rows, cat)
+    indices = {id(row): i for i, row in enumerate(rows)}
+    grid = []
+    for group in _parity_groups(rows):
+        model = group[0]["claude_model"]
+        for effort in (None, *CLAUDE_REASONING_EFFORTS):
+            row = _match_row(rows, model, effort)
+            target = map_model(model, parity=rows, catalogue=cat, requested_effort=effort)
+            applied = apply_claude_effort(model, row.get("claude_effort"))
+            notes = []
+            if row.get("source_effort", "*") != "*":
+                notes.append("override")
+            if row["effort"] == "follow":
+                notes.append("follows")
+            if row.get("claude_effort"):
+                if applied is None:
+                    notes.append("not supported by this model")
+                elif applied != row["claude_effort"]:
+                    notes.append(f"clamped to {applied}")
+            grid.append({"claude_model": model, "requested_effort": effort,
+                         "row_index": indices[id(row)], "model": target.model,
+                         "effort": target.reasoning_effort, "claude_effort": applied,
+                         "note": "; ".join(notes)})
+    return grid
 
 
 # Display names for the OpenAI models this mapping can target. Only used to
@@ -485,13 +548,14 @@ def automatic_mapping(parity=None,
         rows.append({
             "claude_model": claude_id,
             "claude_label": _claude_label(claude_id, cat),
+            "source_effort": row.get("source_effort", "*"),
             "openai_model": row["model"],
             "reasoning_effort": row["effort"],
             "claude_effort": row.get("claude_effort"),
             "default_model": default.model,
             "default_effort": default.reasoning_effort,
             "overridden": (row["model"] != default.model
-                           or row["effort"] != default.reasoning_effort
+                           or row["effort"] not in ("follow", default.reasoning_effort)
                            or bool(row.get("claude_effort"))),
         })
     return rows
@@ -630,15 +694,17 @@ def advertised_models(parity=None,
     Claude-side effort when the row sets one and the model accepts it)."""
     cat = _catalogue_or_current(catalogue)
     out: list[tuple[str, str]] = []
-    for row in normalize_parity(parity, cat):
-        claude_id = row["claude_model"]
+    for group in _parity_groups(normalize_parity(parity, cat)):
+        claude_id = group[0]["claude_model"]
+        row = _match_row(group, claude_id)
         claude_label = _claude_label(claude_id, cat)
         backing = _openai_label(row["model"], cat)
         applied = apply_claude_effort(claude_id, row.get("claude_effort"))
         lead = f"{claude_label} (effort {applied})" if applied else claude_label
         # `<claude> | <openai> · <codex effort>` — codex effort stays the LAST
         # ` · ` segment so cli.py's _fetch_parity_labels keeps parsing it out.
-        out.append((claude_id, f"{lead} | {backing} · {row['effort']}"))
+        effort = "follows Claude Code" if row["effort"] == "follow" else row["effort"]
+        out.append((claude_id, f"{lead} | {backing} · {effort}"))
     return out
 
 
@@ -686,20 +752,20 @@ def codex_profile_windows(profile, parity=None, catalogue: Optional[Catalogue] =
     base_url = getattr(profile, "base_url", None)
     override = getattr(profile, "codex_model", None)
     effort = getattr(profile, "codex_reasoning_effort", None)
-    claude_ids: list = [None]
+    claude_ids: list = [(None, None)]
     try:
         rows = normalize_parity(parity, catalogue)
         for row in rows:
             claude_model = row.get("claude_model")
             if isinstance(claude_model, str) and claude_model:
-                claude_ids.append(claude_model)
+                claude_ids.append((claude_model, row.get("source_effort")))
     except Exception:
         rows = None
     targets: list[str] = []
-    for claude_id in claude_ids:
+    for claude_id, source_effort in claude_ids:
         try:
             model = map_model(claude_id, override_model=override, override_reasoning_effort=effort,
-                              parity=rows, catalogue=catalogue).model
+                              parity=rows, catalogue=catalogue, requested_effort=source_effort).model
         except Exception:
             model = override
         if model and model not in targets:

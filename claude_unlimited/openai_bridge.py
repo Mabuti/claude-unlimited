@@ -34,7 +34,7 @@ from . import codex_state, openai_credential, openai_login, usage_tracking
 from . import openai_translate
 from .openai_translate import user_turn_index
 from .config import Profile
-from .openai_models import fallback_models, map_model
+from .openai_models import fallback_models, map_model, requested_effort
 from . import wire_formats
 
 CHATGPT_BACKEND_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -552,6 +552,7 @@ def run(profile: Profile, stored_credential: str, body: bytes,
         override_model=profile.codex_model,
         override_reasoning_effort=profile.codex_reasoning_effort,
         parity=parity,
+        requested_effort=requested_effort(anthropic_body),
     )
     fmt = wire_formats.get(getattr(profile, "wire_format", None))
     parts = _backend_parts(profile, is_subscription, fmt.endpoint_path)
