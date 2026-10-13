@@ -4633,7 +4633,7 @@ function renderParityRows() {
   const sel = (id, val) => `<div class="select-input" id="${id}" data-value="${esc(val || '')}"><span class="select-value"></span>${_CHEVRON}</div>`;
   const groups = new Map();
   _parityRows.forEach((r, i) => {
-    const key = _baseId(r.claude_model);
+    const key = r.claude_model;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(i);
   });
@@ -4658,7 +4658,7 @@ function renderParityRows() {
   _parityRows.forEach((r, i) => {
     if ((r.source_effort || '*') === '*') {
       const options = _claudeModelOptionsFor(r.claude_model).filter((o) =>
-        _baseId(o.value) === _baseId(r.claude_model) || !groups.has(_baseId(o.value)));
+        o.value === r.claude_model || !groups.has(o.value));
       setupSelectInput(document.getElementById(`parity_claude_${i}`), options, (v) => {
         const old = r.claude_model;
         _parityRows.forEach((row) => { if (row.claude_model === old) row.claude_model = v; });
@@ -4723,8 +4723,8 @@ async function loadParityGrid() {
 
 // Strip a trailing date stamp, matching the server's base_id() — so a saved
 // dated id (claude-fable-5-1-20260101) and its undated default are treated as
-// the same family head when seeding a new row (otherwise Save would 400 on the
-// server's duplicate-base check).
+// the same family head when seeding a new row. Existing dated and undated
+// spellings remain separate editable groups.
 function _baseId(id) { return (id || '').replace(/-(\d{8}|\d{4}-\d{2}-\d{2})$/, ''); }
 
 // Claude models the catalogue knows that the saved list doesn't offer. Model

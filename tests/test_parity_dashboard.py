@@ -44,6 +44,21 @@ const api = async (path, options) => {
     checks = r'''
 (async () => {
   _parityMeta.claude_efforts = ['low', 'medium', 'high', 'xhigh', 'max'];
+  _parityRows = [
+    {claude_model: 'claude-mythos-5-1', model: 'gpt-6-astra', effort: 'xhigh'},
+    {claude_model: 'claude-mythos-5-1-20261001', model: 'gpt-6-luna', effort: 'low'},
+    {claude_model: 'claude-opus-5-5', model: 'gpt-6-astra', effort: 'xhigh'},
+    {claude_model: 'claude-opus-5-5-20260101', model: 'gpt-5.6-terra', effort: 'low'},
+  ];
+  renderParityRows();
+  for (let i = 0; i < 4; i++) {
+    assert.ok(document.getElementById('parityRows').innerHTML.includes(`id="parity_claude_${i}"`));
+  }
+  onAddEffortOverride(1);
+  assert.equal(_parityRows[2].claude_model, 'claude-mythos-5-1-20261001');
+  onDeleteParityRow(1);
+  assert.equal(_parityRows[0].claude_model, 'claude-mythos-5-1');
+  assert.equal(_parityRows.length, 3);
   _parityRows = [{claude_model: 'claude-fable-5-1', source_effort: '*', model: 'base', effort: 'follow'},
                  {claude_model: 'claude-sonnet-5', source_effort: '*', model: 'base', effort: 'low'}];
   onAddEffortOverride(0);

@@ -1198,3 +1198,54 @@ def test_capacity_guard_maps_requested_effort_override(pool_env):
             "output_config": {"effort": "low"}}
     guard = gateway_module._request_guard(json.dumps(body).encode(), body, pool)
     assert guard.windows["c"].model == "gpt-5.6-luna"
+
+
+@pytest.mark.parametrize("spent_model, effort, expected", [
+    ("gpt-6-astra", "max", "a"),
+    ("gpt-6-astra", "low", "c"),
+    ("gpt-6-astra", None, "c"),
+    ("gpt-5.6-sol", "max", "c"),
+    ("gpt-5.6-sol", "low", "a"),
+    ("gpt-5.6-sol", None, "a"),
+])
+@pytest.mark.parametrize("branch", [False, True])
+@pytest.mark.parametrize("dated", [False, True])
+def test_fable_spent_uses_request_effort(pool_env, monkeypatch, spent_model, effort, expected, branch, dated):
+    from claude_unlimited.observation import ModelWindow
+    from claude_unlimited.upstream import UpstreamResponse
+    rows = [
+        {"claude_model": "claude-fable-5-1", "model": "gpt-5.6-sol", "effort": "high"},
+        {"claude_model": "claude-fable-5-1", "source_effort": "max",
+         "model": "gpt-6-astra", "effort": "high"},
+    ]
+    requested = "claude-fable-5-1"
+    if dated:
+        requested += "-20261001"
+        rows = [dict(r, claude_model=requested) for r in rows]
+        # The undated group maps to the opposite model, so a union of base
+        # spellings would block both efforts despite one target having room.
+        rows = [
+            {"claude_model": "claude-fable-5-1", "model": "gpt-6-astra", "effort": "high"},
+            {"claude_model": "claude-fable-5-1", "source_effort": "max",
+             "model": "gpt-5.6-sol", "effort": "high"},
+        ] + rows
+    save_pool(Pool(profiles=[_codex_profile(leave_on_fable_limit=True),
+                            Profile(id="a", name="A", kind="oauth", priority=2, automatic=True)],
+                   settings=Settings(model_parity=rows)))
+    monkeypatch.setattr(gateway_module.openai_bridge, "run", lambda *a, **kw:
+        OpenAIBridgeResult(status=200, headers={}, body_chunks=iter([])))
+    gw = Gateway(transport=lambda req: UpstreamResponse(
+        status=200, headers={}, body_chunks=iter([]), connection=None))
+    gw.runtime_snapshot()
+    gw._runtime["c"].model_usage = tuple(
+        ModelWindow(name=m, percent=100 if m == spent_model else 10, resets_at=None, active=True)
+        for m in ("gpt-5.6-sol", "gpt-6-astra"))
+    body = {"model": requested, "messages": []}
+    if effort is not None:
+        body["output_config"] = {"effort": effort}
+    headers = {"x-claude-code-session-id": "test-session"}
+    if branch:
+        headers["x-claude-code-agent-id"] = "test-branch"
+    result = gw.handle("POST", "/v1/messages", headers, json.dumps(body).encode(), distribute=branch)
+    assert result.profile_id == expected
+    list(result.body_chunks or [])

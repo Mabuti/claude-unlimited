@@ -90,7 +90,7 @@ def test_a_duplicate_claude_model_in_the_list_is_rejected():
     with pytest.raises(ValueError, match="duplicate"):
         _validated_model_parity([
             {"claude_model": "claude-opus-5"},
-            {"claude_model": "claude-opus-5-20260101"},  # same base id
+            {"claude_model": "claude-opus-5", "source_effort": "*"},
         ])
 
 

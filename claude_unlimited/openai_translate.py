@@ -325,6 +325,15 @@ def _warn_tool_arguments(block: _ToolBlock, reason: str) -> None:
           f"events={','.join(sorted(block.events))}", file=sys.stderr, flush=True)
 
 
+def _warn_tool_arguments_rate_limited(block: _ToolBlock, reason: str) -> None:
+    global _missing_arguments_warning_at
+    with _arguments_warning_lock:
+        now = time.monotonic()
+        if now - _missing_arguments_warning_at >= 60:
+            _missing_arguments_warning_at = now
+            _warn_tool_arguments(block, reason)
+
+
 @dataclass
 class TranslatedUsage:
     input_tokens: int = 0
@@ -360,6 +369,7 @@ class ResponseTranslator:
     _pending_text_block: bool = False
     _text_block_index: Optional[int] = None
     _tool_blocks: dict[int, _ToolBlock] = field(default_factory=dict)
+    _closed_tool_item_ids: set[str] = field(default_factory=set)
     # What this response produced that a later request must be able to match:
     # the reasoning items to replay, and the anchors they belong to.
     reasoning_items: list = field(default_factory=list)
@@ -495,12 +505,22 @@ class ResponseTranslator:
         })
 
     def _tool_block(self, event: dict) -> Optional[_ToolBlock]:
-        item_id = event.get("item_id") or (event.get("item") or {}).get("id")
+        item_id = event.get("item_id")
+        if item_id is None:
+            item_id = (event.get("item") or {}).get("id")
         output_index = event.get("output_index")
         if item_id is not None:
+            if item_id in self._closed_tool_item_ids:
+                _warn_tool_arguments_rate_limited(
+                    _ToolBlock(-1, "", item_id, output_index, events={event["type"]}),
+                    "ignoring tool arguments for a closed item")
+                return None
             for block in self._tool_blocks.values():
                 if block.item_id == item_id:
                     return block
+            # An explicit identity is authoritative, including an unknown one.
+            # The provider may reuse output_index after closing a call.
+            return None
         if output_index is not None:
             for block in self._tool_blocks.values():
                 if block.output_index == output_index:
@@ -540,13 +560,10 @@ class ResponseTranslator:
             _warn_tool_arguments(block, "tool arguments differ; keeping emitted arguments")
 
     def _close_tool_block(self, block: _ToolBlock) -> Iterator[bytes]:
-        global _missing_arguments_warning_at
         if not block.arguments:
-            with _arguments_warning_lock:
-                now = time.monotonic()
-                if now - _missing_arguments_warning_at >= 60:
-                    _missing_arguments_warning_at = now
-                    _warn_tool_arguments(block, "tool call closed with no arguments")
+            _warn_tool_arguments_rate_limited(block, "tool call closed with no arguments")
+        if block.item_id is not None:
+            self._closed_tool_item_ids.add(block.item_id)
         del self._tool_blocks[block.index]
         self._stop_reason = "tool_use"
         yield self._sse("content_block_stop", {

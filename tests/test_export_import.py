@@ -895,3 +895,38 @@ def test_effort_parity_settings_round_trip(env):
     update_settings(model_parity=[])
     ei.apply_import(ei.import_bundle(bundle), import_profiles=False, import_settings=True)
     assert load_pool().settings.model_parity == rows
+
+
+@pytest.mark.parametrize("settings", [
+    {"model_parity": [{"claude_model": "claude-fable-5", "source_effort": "max"}]},
+    {"language": "not-a-language"},
+    {"context_1m": "invalid"},
+    {"codex_spend_credits": "yes"},
+])
+def test_invalid_settings_import_writes_nothing(env, monkeypatch, settings):
+    from unittest.mock import Mock
+    writes = Mock()
+    monkeypatch.setattr(ei, "save_pool", writes.save_pool)
+    monkeypatch.setattr(env, "set_token", writes.set_token)
+    monkeypatch.setattr(ei.activity_module, "record", writes.record)
+    parsed = ei.ParsedBundle(profiles=[{"name": "Imported", "kind": "api", "credential": "fixture"}],
+                             settings=settings, activity=None)
+    with pytest.raises(ValueError):
+        ei.apply_import(parsed, import_profiles=True, import_settings=True)
+    assert writes.mock_calls == []
+
+
+@pytest.mark.parametrize("shape", ["dict", "list"])
+def test_legacy_spellings_export_import_round_trip(env, shape):
+    from claude_unlimited.config import update_settings
+    rows = {"claude-mythos-5-1": {"model": "gpt-6-astra", "effort": "xhigh"},
+            "claude-mythos-5-1-20261001": {"model": "gpt-6-luna", "effort": "low"},
+            "claude-opus-5-5": {"model": "gpt-6-astra", "effort": "xhigh"},
+            "claude-opus-5-5-20260101": {"effort": "low"}}
+    if shape == "list":
+        rows = [dict(claude_model=k, **v) for k, v in rows.items()]
+    update_settings(model_parity=rows)
+    bundle = ei.build_export_bundle(include_profiles=False, include_settings=True, include_activity=False)
+    update_settings(model_parity=[])
+    ei.apply_import(ei.import_bundle(bundle), import_profiles=False, import_settings=True)
+    assert load_pool().settings.model_parity == rows

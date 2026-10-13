@@ -17,7 +17,7 @@ def row(claude_model="claude-fable-5-1", **fields):
     ([row(source_effort="low")], "base row"),
     ([row(), row(source_effort="*")], "duplicate"),
     ([row(), row(source_effort="low"), row(source_effort="low")], "duplicate"),
-    ([row(), row("claude-fable-5-1-20261001", source_effort="max")], "spellings"),
+    ([row(), row("claude-fable-5-1-20261001", source_effort="max")], "base row"),
     ([row(), row(source_effort="none")], "source_effort"),
     ([row(source_effort=None)], "source_effort"),
     ([row(source_effort="")], "source_effort"),
@@ -37,9 +37,9 @@ def test_mixed_groups_allow_interleaved_overrides_before_base():
     assert config._validated_model_parity(rows) == rows
 
 
-def test_legacy_dict_rejects_duplicate_base_spellings():
-    with pytest.raises(ValueError, match="duplicate"):
-        config._validated_model_parity({"claude-fable-5": {}, "claude-fable-5-20261001": {}})
+def test_legacy_dict_accepts_distinct_exact_spellings():
+    raw = {"claude-fable-5": {"effort": "high"}, "claude-fable-5-20261001": {"effort": "low"}}
+    assert config._validated_model_parity(raw) == raw
 
 
 @pytest.mark.parametrize("requested", ["claude-fable-5-1", "claude-fable-5-1-20261001", "claude-fable-6"])
@@ -157,3 +157,46 @@ def test_profile_window_summary_includes_override_targets():
     profile = config.Profile(id="test", name="Test", kind="codex")
     rows = [row(model="gpt-6-astra"), row(source_effort="low", model="gpt-5.6-luna")]
     assert set(models.codex_profile_windows(profile, rows)["models"]) >= {"gpt-6-astra", "gpt-5.6-luna"}
+
+
+@pytest.mark.parametrize("effort", EFFORTS)
+@pytest.mark.parametrize("shape", ["dict", "list"])
+@pytest.mark.parametrize("stem, date, overlay", [
+    ("claude-mythos-5-1", "20261001", {"model": "gpt-6-luna", "effort": "low"}),
+    ("claude-opus-5-5", "20260101", {"effort": "low"}),
+])
+def test_legacy_spellings_pin_ad6ef5f_results(effort, shape, stem, date, overlay):
+    dated = f"{stem}-{date}"
+    raw = {stem: {"model": "gpt-6-astra", "effort": "xhigh"}, dated: overlay}
+    if shape == "list":
+        raw = [dict(claude_model=k, **v) for k, v in raw.items()]
+    # Pinned from ad6ef5f: the legacy dict overlays curated default rows
+    # by base id, whereas a list preserves each spelling's separate row.
+    if stem == "claude-opus-5-5" and shape == "dict":
+        expected_base = expected_dated = ("gpt-6-astra", "low")
+    else:
+        expected_base = ("gpt-6-astra", "xhigh")
+        expected_dated = ("gpt-6-luna" if "mythos" in stem else "gpt-5.6-terra", "low")
+    for requested, expected in [(stem, expected_base), (dated, expected_dated),
+                                (stem + "-20261201", expected_base)]:
+        assert models.map_model(requested, parity=raw, requested_effort=effort) == models.OpenAIModelTarget(*expected)
+    validated = config._validated_model_parity(raw)
+    config.update_settings(model_parity=validated)
+    assert config.load_pool().settings.model_parity == raw
+
+
+@pytest.mark.parametrize("effort", EFFORTS)
+def test_dated_and_undated_groups_keep_their_own_effort_overrides(effort):
+    base, dated = "claude-fable-5-1", "claude-fable-5-1-20261001"
+    rows = [row(base, model="base", claude_effort="medium"),
+            row(dated, model="dated", claude_effort="low"),
+            row(base, source_effort="max", model="base-max", claude_effort="high"),
+            row(dated, source_effort="max", model="dated-max", claude_effort="max")]
+    assert config._validated_model_parity(rows) == rows
+    for model, target, injection in [(base, "base", "medium"), (dated, "dated", "low")]:
+        if effort == "max":
+            target += "-max"
+            injection = "high" if model == base else "max"
+        assert models.map_model(model, parity=rows, requested_effort=effort).model == target
+        assert models.claude_effort_for(model, rows, requested_effort=effort) == injection
+    assert len(models.parity_grid(rows)) == 12

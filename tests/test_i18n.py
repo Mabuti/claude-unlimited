@@ -63,3 +63,16 @@ def test_locale_display_names_has_entry_per_locale():
     names = i18n.locale_display_names()
     assert names["en"] == "English"
     assert names["es"] == "Español"
+
+
+@pytest.mark.parametrize("locale", ["de", "es", "ro"])
+def test_effort_parity_strings_are_translated(locale):
+    keys = ["col_claude_model", "col_claude_effort", "col_source_effort", "col_codex_model",
+            "any", "follow", "leave_requested", "add_override", "effective_mapping", "grid_desc",
+            "absent", "matched_row", "notes", "note_follows", "note_override", "note_clamped",
+            "note_unsupported", "grid_failed"]
+    keys = ["settings.parity." + key for key in keys] + ["help.routing.parity_note"]
+    english, translated = i18n._read_locale_file("en"), i18n._read_locale_file(locale)
+    for key in keys:
+        assert translated[key] != english[key], key
+        assert ("{effort}" in translated[key]) == ("{effort}" in english[key])

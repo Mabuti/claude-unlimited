@@ -250,6 +250,24 @@ def apply_import(
     if conflict_strategy not in ("keep_existing", "use_imported"):
         raise ExportImportError(f"Unknown conflict_strategy {conflict_strategy!r}.")
 
+    incoming = None
+    if import_settings and parsed.settings:
+        from .config import Settings, validated_settings_changes
+
+        # Validate all settings before any profile or credential writes.
+        # A bundle is a file from somewhere else, and settings carry
+        # decisions with real consequences — model_parity
+        # picks which model every codex request runs on, which is what Codex
+        # quota is spent on (docs/adr/0007). Importing that unchecked would let
+        # a bundle silently change someone's spending.
+        # _MACHINE_LOCAL_SETTINGS are dropped rather than rejected: a bundle
+        # written by hand, or by a build that still exported them, must still
+        # import its other settings instead of 400-ing on a key the user never
+        # chose to send.
+        incoming = {k: v for k, v in parsed.settings.items()
+                    if k in Settings.__dataclass_fields__ and k not in _MACHINE_LOCAL_SETTINGS}
+        incoming = validated_settings_changes(incoming)
+
     result = {
         "profiles_added": 0, "profiles_updated": 0, "profiles_skipped": 0,
         # Distinct from profiles_skipped (conflict_strategy="keep_existing",
@@ -448,22 +466,7 @@ def apply_import(
                 save_pool(pool)
             result["profiles_added"] += 1
 
-    if import_settings and parsed.settings:
-        from .config import Settings, validated_settings_changes
-
-        # Validated, not trusted. A bundle is a file from somewhere else, and
-        # settings now carry decisions with real consequences — model_parity
-        # picks which model every codex request runs on, which is what Codex
-        # quota is spent on (docs/adr/0007). Importing that unchecked would let
-        # a bundle silently change someone's spending.
-        # _MACHINE_LOCAL_SETTINGS are dropped rather than rejected: a bundle
-        # written by hand, or by a build that still exported them, must still
-        # import its other settings instead of 400-ing on a key the user never
-        # chose to send.
-        incoming = {k: v for k, v in parsed.settings.items()
-                    if k in Settings.__dataclass_fields__ and k not in _MACHINE_LOCAL_SETTINGS}
-        incoming = validated_settings_changes(incoming)
-
+    if incoming is not None:
         with CONFIG_LOCK:
             pool = load_pool()
             # Merged onto the current settings, not built fresh from the

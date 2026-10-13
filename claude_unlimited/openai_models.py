@@ -355,7 +355,7 @@ def requested_effort(body: Optional[dict]) -> Optional[str]:
 def _parity_groups(rows: list[dict]) -> list[list[dict]]:
     groups: dict[str, list[dict]] = {}
     for row in rows:
-        groups.setdefault(base_id(row["claude_model"]), []).append(row)
+        groups.setdefault(row["claude_model"], []).append(row)
     return list(groups.values())
 
 

@@ -951,7 +951,9 @@ class BranchPin:
     parent_agent_id: Optional[str] = None
 
 
-def _blocked_models_for(profile: Profile, model_usage, settings, now: datetime) -> frozenset:
+def _blocked_models_for(profile: Profile, model_usage, settings, now: datetime,
+                        requested_effort: Optional[str] = None,
+                        requested_model: Optional[str] = None) -> frozenset:
     """Which Claude models this codex Profile cannot serve right now.
 
     OpenAI reports availability keyed by the GPT model id (`gpt-6-astra`),
@@ -959,11 +961,13 @@ def _blocked_models_for(profile: Profile, model_usage, settings, now: datetime) 
     the parity list and the model catalogue — file I/O — so it happens here,
     where both are already in hand, and router.py gets a plain set.
 
-    Only the models the pool actually advertises are resolved: the in-force
-    parity rows ARE the set Claude Code's picker offers for a codex-served
-    session, so they are the ids that can arrive. A model outside that set
-    falls through as unblocked, which is the safe direction — the provider's
-    own error is better than idling an account on a guess.
+    Profile-only snapshots resolve the advertised parity rows. A Fable
+    request resolves its actual id instead, so dated spellings and family
+    fallbacks use the same target as the bridge.
+
+    Blocking follows the request's own mapped model at its requested effort,
+    never the union of all effort overrides. Profile-only snapshots have no
+    request effort and use the ABSENT mapping; routing recomputes per request.
 
     Returns an empty set for anything that is not a codex Profile, and for a
     codex Profile whose backend reported nothing."""
@@ -990,8 +994,13 @@ def _blocked_models_for(profile: Profile, model_usage, settings, now: datetime) 
         rows = openai_models.normalize_parity(getattr(settings, "model_parity", None))
     except Exception:
         return frozenset()   # a broken parity list must not block every model
-    for row in rows:
-        claude_model = row.get("claude_model")
+    claude_models = dict.fromkeys(row.get("claude_model") for row in rows)
+    if requested_model and openai_models.bucket_matches(requested_model, "fable"):
+        # Exact dated spellings can have different targets. A Fable request
+        # is blocked only if its own mapped model is spent. For other turns,
+        # the profile-level "leave on Fable limit" rule still checks Fable.
+        claude_models = [requested_model]
+    for claude_model in claude_models:
         if not isinstance(claude_model, str) or not claude_model:
             continue
         try:
@@ -999,7 +1008,7 @@ def _blocked_models_for(profile: Profile, model_usage, settings, now: datetime) 
                 claude_model,
                 override_model=profile.codex_model,
                 override_reasoning_effort=profile.codex_reasoning_effort,
-                parity=rows, requested_effort=None)
+                parity=rows, requested_effort=requested_effort)
         except Exception:
             continue
         if target.model and target.model.strip().lower() in unavailable:
@@ -1362,7 +1371,8 @@ class Gateway:
         self._persisted_profiles: dict = persisted["profiles"]
         self._current_profile_id = persisted["current_profile_id"]
 
-    def _sync_snapshot(self, pool: Pool) -> PoolSnapshot:
+    def _sync_snapshot(self, pool: Pool, requested_effort: Optional[str] = None,
+                       requested_model: Optional[str] = None) -> PoolSnapshot:
         """Folds the persisted Pool (source of truth for config: priority,
         threshold, enabled, automatic) into the live runtime state (source of
         truth for observed state: ELIGIBLE/DRAINING/etc), adding new Profiles
@@ -1427,7 +1437,8 @@ class Gateway:
                     credential_seen=p.credential_updated_at,
                     may_spend_credits=_may_spend_credits(p, pool.settings),
                     blocked_models=_blocked_models_for(
-                        p, restored.get("model_usage", ()), pool.settings, now_utc),
+                        p, restored.get("model_usage", ()), pool.settings, now_utc,
+                        requested_effort, requested_model),
                     leave_on_fable_limit=_leave_on_fable_limit(p, pool.settings),
                     **restored,
                 )
@@ -1542,7 +1553,8 @@ class Gateway:
                     # constructor is the trap that has already dropped
                     # model_usage and the credit balance.
                     blocked_models=_blocked_models_for(
-                        p, rt.model_usage, pool.settings, datetime.now(timezone.utc)),
+                        p, rt.model_usage, pool.settings, datetime.now(timezone.utc),
+                        requested_effort, requested_model),
                     # Configuration, re-read every tick like priority and
                     # switch_threshold: flipping the Profile's switch or the
                     # global override must apply to the next request. Same
@@ -1621,11 +1633,12 @@ class Gateway:
         app_pinned = self._app_pinned(headers)
         pool_now = load_pool()
         branch_modes = app_pinned or self._branch_modes_apply(pool_now, distribute, is_subagent)
-        # ONE parse of the body per request, and only for branch
-        # identification: routing no longer looks at the requested model (a
-        # spent Fable week moves the whole session, whatever the model), so a
-        # pool with no per-branch mode parses nothing.
-        parsed_request = _parsed_request(body) if branch_modes else None
+        # The request effort also selects Codex parity overrides for the
+        # Fable-spent check, whether or not branch pinning is enabled.
+        needs_effort = any(p.kind == "codex" and _leave_on_fable_limit(p, pool_now.settings)
+                           for p in pool_now.profiles)
+        parsed_request = _parsed_request(body) if branch_modes or needs_effort else None
+        request_effort = openai_models.requested_effort(parsed_request)
         branch = project_attribution.branch_key(headers, body, parsed_request) if branch_modes else None
         # The capacity guard (docs/adr/0009), once per request and only for a
         # real turn: the same bytes go out on every rotation attempt, and the
@@ -1656,7 +1669,7 @@ class Gateway:
             held_to = forced_profile_id
             with self._lock:
                 pool = load_pool()
-                snapshot = self._sync_snapshot(pool)
+                snapshot = self._sync_snapshot(pool, request_effort, _requested_model(parsed_request))
                 pre_recovery_states = {rt.profile_id: rt.state for rt in snapshot.profiles}
                 snapshot = recover_expired_cooldowns(snapshot, now)
                 self._runtime = {rt.profile_id: rt for rt in snapshot.profiles}
