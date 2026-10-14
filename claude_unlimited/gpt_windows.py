@@ -32,6 +32,8 @@ from typing import Optional
 # Changing a row is a spending decision.
 CODEX_BACKEND_WINDOWS: dict[str, tuple[int, int]] = {
     "gpt-6-astra": (272_000, 872_000),      # cache 2026-09-21, visibility list
+    "gpt-6-sol": (272_000, 872_000),        # cache 2026-10-14, visibility list
+    "gpt-6-luna": (272_000, 872_000),       # cache 2026-10-14, visibility list
     "gpt-5.6-sol": (272_000, 872_000),      # cache 2026-09-21, visibility list
     "gpt-5.6-terra": (272_000, 872_000),    # cache 2026-09-21, visibility list
     "gpt-5.6-luna": (272_000, 872_000),     # cache 2026-09-21, visibility list
