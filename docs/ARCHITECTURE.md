@@ -419,17 +419,48 @@ only. A client that disconnects mid-stream simply gets no usage record.
 
 Claude Code asks for a Claude model; something has to choose which GPT model answers and
 how hard it reasons. `openai_models.py` owns that mapping and Settings → Models parity
-edits it. A Profile with its own override ignores the list.
+edits it. Per-profile overrides take precedence for the fields they set.
 
 The parity is an **explicit ordered list** (`Settings.model_parity`) of rows
-`{claude_model, model, effort, claude_effort}`; the saved list IS what a codex Profile
-advertises at `GET /v1/models` and therefore what `/model` offers. Empty means the default
-four (fable/opus/sonnet/haiku family heads). A legacy sparse-dict config is migrated to the
-list at read time by `openai_models.normalize_parity` (no on-load rewrite; the file keeps
-its old shape until the next save). `claude_effort` is injected as `output_config.effort`
-onto oauth/api-served `/v1/messages` requests, gated per model by
-`openai_models.apply_claude_effort` so an unsupported model (Haiku, Sonnet ≤4.5) is never
-sent a value that would 400. Dropdown order is the catalogue rank (cost/generation desc).
+`{claude_model, source_effort, model, effort, claude_effort}`. Each exact Claude id
+has one base row (`source_effort: "*"`, or omitted) and optional effort overrides
+(`low`, `medium`, `high`, `xhigh`, `max`). Validation requires a base and unique
+source efforts per group, and caps the list at 64 rows.
+
+Matching selects an exact Claude id first, then a dated/undated base id, then the
+first matching family group in saved order. Within that group an explicit requested
+effort selects its override, otherwise the base row wins. Absent effort selects the
+base row. Codex `effort: "follow"` copies the requested level name; when none is sent,
+it uses the curated effort below. A fixed row effort ignores the requested level.
+Per-profile Codex model and effort overrides take precedence independently.
+Unmatched model ids use curated fallback; unknown families use Terra / medium.
+
+| Claude family | Curated Codex model | Curated effort |
+|---|---|---|
+| Fable | `gpt-5.6-sol` | medium |
+| Opus | `gpt-5.6-terra` | high |
+| Sonnet | `gpt-5.6-terra` | medium |
+| Haiku | `gpt-5.6-luna` | low |
+
+Existing files with absent parity, `{}`, or `[]` resolve to concrete curated rows
+at read time, with no rewrite and no following of incoming effort. Legacy sparse
+dicts overlay those concrete defaults; explicit saved rows preserve their behavior.
+Only first creation of a missing `config.json` seeds an explicit follow default list.
+Reset confirms all changed/disappearing Claude ids and writes that explicit follow
+list, never an empty list. `default_parity_rows()` supplies fresh/Reset defaults;
+`normalize_parity()` supplies legacy read semantics.
+
+Only base rows are advertised at `GET /v1/models` and supply Claude Code's `/model`
+picker labels. Overrides are per-level routing, not additional models. Claude Code
+can relabel its four standard tiers; extra Claude models are usable by id but may
+not appear in its picker. The read-only Effective mapping grid resolves each saved
+model × absent/explicit effort, shows Any or the override level, and includes Claude
+clamping/suppression, before per-profile overrides and backend retries. Follow sends
+the same level first; the bridge steps down only after a backend 400 rejection.
+
+`claude_effort` is injected as `output_config.effort` onto oauth/api-served requests,
+gated by `openai_models.apply_claude_effort` so unsupported models (Haiku, Sonnet ≤4.5)
+receive no injection. Dropdown order is catalogue rank (cost/generation descending).
 
 Codex quota is spent on reasoning tokens produced × model tier, not on context size — see
 [ADR 0007](adr/0007-codex-quota-is-driven-by-reasoning-not-context.md).

@@ -966,7 +966,9 @@ def _blocked_models_for(profile: Profile, model_usage, settings, now: datetime,
     fallbacks use the same target as the bridge.
 
     Blocking follows the request's own mapped model at its requested effort,
-    never the union of all effort overrides. Profile-only snapshots have no
+    never the union of all effort overrides. Other groups (including Fable
+    on non-Fable requests) use their base row with no requested effort.
+    Profile-only snapshots have no
     request effort and use the ABSENT mapping; routing recomputes per request.
 
     Returns an empty set for anything that is not a codex Profile, and for a
@@ -994,6 +996,9 @@ def _blocked_models_for(profile: Profile, model_usage, settings, now: datetime,
         rows = openai_models.normalize_parity(getattr(settings, "model_parity", None))
     except Exception:
         return frozenset()   # a broken parity list must not block every model
+    requested_row = (openai_models._match_row(rows, requested_model, requested_effort)
+                     if requested_model else None)
+    requested_group = requested_row["claude_model"] if requested_row else None
     claude_models = dict.fromkeys(row.get("claude_model") for row in rows)
     if requested_model and openai_models.bucket_matches(requested_model, "fable"):
         # Exact dated spellings can have different targets. A Fable request
@@ -1008,7 +1013,8 @@ def _blocked_models_for(profile: Profile, model_usage, settings, now: datetime,
                 claude_model,
                 override_model=profile.codex_model,
                 override_reasoning_effort=profile.codex_reasoning_effort,
-                parity=rows, requested_effort=requested_effort)
+                parity=rows, requested_effort=(requested_effort
+                    if claude_model in (requested_model, requested_group) else None))
         except Exception:
             continue
         if target.model and target.model.strip().lower() in unavailable:

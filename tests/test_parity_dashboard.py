@@ -43,29 +43,36 @@ function element(tag = 'div') {
   return node;
 }
 for (const id of ['parityRows', 'parityGridRows', 'parityAddBtn', 'modelParitySection',
-                  'parityNewBanner', 'parityNewBannerSub']) elements.set(id, element(id === 'parityAddBtn' ? 'button' : 'div'));
+                  'parityNewBanner', 'parityNewBannerSub', 'parityAddMissingBtn']) elements.set(id, element(['parityAddBtn', 'parityAddMissingBtn'].includes(id) ? 'button' : 'div'));
 const document = { getElementById: id => elements.get(id) || null };
 const esc = (v) => String(v).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;');
-const t = (key) => key;
+const t = (key) => key === 'settings.parity.reset_confirm' ? 'Changed: {changed}\nRemoved: {removed}' : key;
 const setupSelectInput = (element, options, callback) => {
   assert.ok(element, 'cannot initialize a missing selector');
   callbacks.set(element, { options, callback });
 };
-const showToast = () => {};
+let toasts = [];
+const showToast = (...args) => { toasts.push(args); };
+let confirmed = false;
+let confirmation = null;
+const window = { confirm: message => { confirmation = message; return confirmed; } };
 const refreshCodexSelectOptions = () => {};
 let _selectableModels = ['base', 'override'];
 let _reasoningEfforts = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
 let _codexMappingRows = null;
 let calls = [];
+let patches = [];
 const api = async (path, options) => {
   calls.push(path);
-  if (path === '/api/settings') { assert.equal(JSON.parse(options.body).model_parity[1].source_effort, 'max'); return {}; }
+  if (path === '/api/settings') { patches.push(JSON.parse(options.body)); return {}; }
   if (path === '/api/codex/model-map') return {
     mapping: [{claude_model: 'claude-fable-5-1', source_effort: '*', openai_model: 'base', reasoning_effort: 'follow'}],
     claude_efforts: ['low', 'medium', 'high', 'xhigh', 'max']
   };
   return { grid: [{claude_model: '<model>', requested_effort: null, row_index: 0,
-                   model: 'base', effort: 'high', claude_effort: null, note: 'follows'}] };
+                   source_effort: '*', model: 'base', effort: 'high', claude_effort: null, note: 'follows'},
+                  {claude_model: '<model>', requested_effort: 'high', row_index: 9, source_effort: 'high',
+                   model: 'override', effort: 'high', claude_effort: null, note: 'override'}] };
 };
 '''
     result = subprocess.run(["node", "-"], input=harness + source[start:end] + checks,
@@ -116,9 +123,13 @@ def test_effort_editor_groups_and_grid():
   onAddEffortOverride(0);
   _parityRows[1].source_effort = 'max';
   await saveModelParity();
+  assert.equal(patches[0].model_parity[1].source_effort, 'max');
   assert.deepEqual(calls, ['/api/settings', '/api/codex/model-map', '/api/model-parity/grid']);
   assert.ok(document.getElementById('parityGridRows').innerHTML.includes('&lt;model>'));
   assert.ok(document.getElementById('parityGridRows').innerHTML.includes('settings.parity.leave_requested'));
+  assert.ok(document.getElementById('parityGridRows').innerHTML.includes('<td>settings.parity.any</td>'));
+  assert.ok(document.getElementById('parityGridRows').innerHTML.includes('<td>settings.parity.note_override: high</td>'));
+  assert.ok(!document.getElementById('parityGridRows').innerHTML.includes('<td>10</td>'));
 })().catch(e => { console.error(e); process.exitCode = 1; });
 '''
     _run_editor(checks)
@@ -153,3 +164,90 @@ renderParityRows();
 onDeleteParityRow(1);
 assert.deepEqual(_parityRows.map(r => r.claude_model), ['claude-one', '']);
 """)
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='node unavailable')
+@pytest.mark.parametrize('action', ['onAddParityRow()', 'onAddMissingParityRows()', 'onAddEffortOverride(0)'])
+def test_all_add_paths_cap_at_64_and_reenable_after_delete(action):
+    _run_editor(r'''
+_parityRows = Array.from({length: 63}, (_, i) => ({claude_model: `claude-test-${i}`, model: 'base', effort: 'follow'}));
+_parityMeta.claude_efforts = ['low', 'medium', 'high', 'xhigh', 'max'];
+_parityMeta.claude_selectable = [{id: 'claude-new'}, {id: 'claude-another'}];
+_parityUnmapped = [{claude_model: 'claude-new', would_map_to: 'base'}, {claude_model: 'claude-another', would_map_to: 'base'}];
+renderParityRows();
+assert.equal(document.getElementById('parityAddBtn').disabled, false);
+''' + action + r''';
+assert.equal(_parityRows.length, 64);
+assert.equal(_nextParitySeed(), null);
+for (const id of ['parityAddBtn', 'parityAddMissingBtn']) {
+  assert.equal(document.getElementById(id).disabled, true);
+  assert.equal(document.getElementById(id).title, 'settings.parity.row_limit');
+}
+const overrideButtons = [...document.getElementById('parityRows').innerHTML.matchAll(/<button class="btn parity-override"[^>]+>/g)];
+assert.ok(overrideButtons.length);
+assert.ok(overrideButtons.every(m => m[0].includes('disabled') && m[0].includes('title="settings.parity.row_limit"')));
+onAddParityRow();
+onAddMissingParityRows();
+onAddEffortOverride(0);
+assert.equal(_parityRows.length, 64);
+assert.ok(_parityUnmapped.length, 'bulk overflow candidates must remain available');
+onDeleteParityRow(63);
+assert.equal(_parityRows.length, 63);
+assert.equal(document.getElementById('parityAddBtn').disabled, false);
+assert.equal(document.getElementById('parityAddMissingBtn').disabled, false);
+onAddMissingParityRows();
+assert.equal(_parityRows.length, 64);
+''')
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='node unavailable')
+def test_reset_lists_changed_and_removed_ids_cancel_preserves_everything():
+    _run_editor(r'''
+(async () => {
+  _parityMeta.defaults = [
+    {claude_model: 'claude-fable-5-1', model: 'base', effort: 'follow'},
+    {claude_model: 'claude-opus-5-5', model: 'base', effort: 'follow'},
+    {claude_model: 'claude-sonnet-5', model: 'base', effort: 'follow'},
+    {claude_model: 'claude-haiku-4-5', model: 'base', effort: 'follow'},
+  ];
+  _parityRows = [
+    {claude_model: 'claude-fable-5-1', model: 'base', effort: 'medium'},
+    {claude_model: 'claude-opus-5-5', model: 'override', effort: 'follow'},
+    {claude_model: 'claude-sonnet-5', model: 'base', effort: 'follow'},
+    {claude_model: 'claude-sonnet-5', source_effort: 'high', model: 'override', effort: 'follow'},
+    {claude_model: 'claude-haiku-4-5', model: 'base', effort: 'follow'},
+    {claude_model: 'claude-mythos-5-1', model: 'override', effort: 'high'},
+  ];
+  _paritySavedRows = [{claude_model: 'claude-saved-deleted', model: 'base', effort: 'low'}];
+  const before = JSON.stringify(_parityRows);
+  const saved = JSON.stringify(_paritySavedRows);
+  const defaults = JSON.stringify(_parityMeta.defaults);
+  await resetModelParity();
+  assert.equal(calls.length, 0);
+  assert.equal(JSON.stringify(_parityRows), before);
+  assert.equal(JSON.stringify(_paritySavedRows), saved);
+  assert.equal(confirmation, 'Changed: claude-fable-5-1, claude-opus-5-5, claude-sonnet-5\nRemoved: claude-saved-deleted, claude-mythos-5-1');
+  confirmed = true;
+  await resetModelParity();
+  assert.equal(patches.length, 1);
+  assert.equal(JSON.stringify(patches[0].model_parity), defaults);
+  assert.ok(patches[0].model_parity.every(r => r.effort === 'follow'));
+  assert.equal(toasts.filter(t => t[0] === 'error').length, 0);
+})().catch(e => { console.error(e); process.exitCode = 1; });
+''')
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='node unavailable')
+def test_reset_warns_about_restored_models_and_claude_effort_changes():
+    _run_editor(r'''
+(async () => {
+  _parityMeta.defaults = [
+    {claude_model: 'claude-existing', model: 'base', effort: 'follow'},
+    {claude_model: 'claude-restored', model: 'base', effort: 'follow'},
+  ];
+  _parityRows = [{claude_model: 'claude-existing', model: 'base', effort: 'follow', claude_effort: 'high'}];
+  await resetModelParity();
+  assert.equal(confirmation, 'Changed: claude-existing, claude-restored\nRemoved: settings.parity.no_changes');
+  assert.equal(calls.length, 0);
+})().catch(e => { console.error(e); process.exitCode = 1; });
+''')

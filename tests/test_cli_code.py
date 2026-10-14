@@ -25,7 +25,7 @@ def test_codex_pinned_session_relabels_the_model_picker(monkeypatch):
     # ...while the visible label names BOTH the Claude tier and the backing GPT.
     assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5 | GPT-5.6 Terra"
     desc = os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION"]
-    assert "Codex" in desc and "follows Claude Code" in desc, desc
+    assert "Codex" in desc and "Codex effort per parity table" in desc, desc
 
 
 def test_non_codex_session_leaves_the_model_picker_alone(monkeypatch):
@@ -87,7 +87,7 @@ def test_rotated_mixed_pool_uses_provider_neutral_labels(monkeypatch):
     assert all("GPT" in l for l in labels), labels  # both providers named
     # Every description must state the reasoning level that tier maps to.
     for tier in ("FABLE", "OPUS", "SONNET", "HAIKU"):
-        assert "reasoning: follows Claude Code" in os.environ[f"ANTHROPIC_DEFAULT_{tier}_MODEL_DESCRIPTION"]
+        assert "Codex effort per parity table" in os.environ[f"ANTHROPIC_DEFAULT_{tier}_MODEL_DESCRIPTION"]
     # ...and the id still has to be one map_model() understands.
     assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5[1m]"
 

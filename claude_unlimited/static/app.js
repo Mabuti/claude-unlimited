@@ -4587,6 +4587,8 @@ function updateCodexModelHelp(prefix) {
 // editable and rows can be added/removed. The row set and the dropdown option
 // lists still come from /api/codex/model-map, never hardcoded here.
 let _parityRows = [];   // working list: {claude_model, source_effort, model, effort, claude_effort}
+const _PARITY_ROW_LIMIT = 64;
+let _paritySavedRows = [];
 let _parityMeta = { defaults: [], claude_selectable: [], claude_efforts: [] };
 
 function _claudeModelOptionsFor(current) {
@@ -4614,7 +4616,7 @@ function _claudeEffortOptions() {
           ..._parityMeta.claude_efforts.map((e) => ({ value: e, label: e }))];
 }
 
-// The whole list, in visual order — the saved list IS the advertised set.
+// The whole list, in visual order; only base rows are advertised as models.
 function collectParity() {
   return _parityRows
     .filter((r) => r.claude_model)
@@ -4653,7 +4655,7 @@ function renderParityRows() {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6M14 11v6"/></svg>
         </button></td>
       </tr>`;
-    }).join('') + (base === undefined ? '' : `<tr><td colspan="7"><button class="btn parity-override" data-row="${base}" ${indices.length >= 6 || _parityRows.length >= 64 ? 'disabled' : ''}>${esc(t('settings.parity.add_override'))}</button></td></tr>`);
+    }).join('') + (base === undefined ? '' : `<tr><td colspan="7"><button class="btn parity-override" data-row="${base}" ${indices.length >= 6 || _parityRows.length >= _PARITY_ROW_LIMIT ? 'disabled' : ''} title="${esc(_parityRows.length >= _PARITY_ROW_LIMIT ? t('settings.parity.row_limit') : indices.length >= 6 ? t('settings.parity.overrides_full') : '')}">${esc(t('settings.parity.add_override'))}</button></td></tr>`);
   }).join('');
   _parityRows.forEach((r, i) => {
     if ((r.source_effort || '*') === '*') {
@@ -4682,14 +4684,18 @@ function renderParityRows() {
   });
   const add = document.getElementById('parityAddBtn');
   add.disabled = !_nextParitySeed();
-  add.title = add.disabled ? `${t('settings.parity.add_row')}: ${t('stat.no_active')}` : '';
+  add.title = _parityRows.length >= _PARITY_ROW_LIMIT ? t('settings.parity.row_limit')
+    : add.disabled ? `${t('settings.parity.add_row')}: ${t('stat.no_active')}` : '';
+  const missing = document.getElementById('parityAddMissingBtn');
+  missing.disabled = _parityRows.length >= _PARITY_ROW_LIMIT;
+  missing.title = missing.disabled ? t('settings.parity.row_limit') : '';
 }
 
 function onAddEffortOverride(i) {
   const base = _parityRows[i];
   const used = new Set(_parityRows.filter((r) => r.claude_model === base.claude_model).map((r) => r.source_effort));
   const effort = _parityMeta.claude_efforts.find((e) => !used.has(e));
-  if (!effort || _parityRows.length >= 64) return;
+  if (!effort || _parityRows.length >= _PARITY_ROW_LIMIT) return;
   _parityRows.splice(i + 1, 0, { ...base, source_effort: effort });
   renderParityRows();
 }
@@ -4717,7 +4723,8 @@ async function loadParityGrid() {
       <td>${esc(r.claude_model)}</td><td>${esc(r.requested_effort || t('settings.parity.absent'))}</td>
       <td>→</td><td>${esc(r.model)}</td><td>${esc(codexEffortLabel(r.effort))}</td>
       <td>${esc(r.claude_effort || t('settings.parity.leave_requested'))}</td>
-      <td>${r.row_index + 1}</td><td>${esc(noteLabel(r.note))}</td>
+      <td>${esc((r.source_effort || '*') === '*' ? t('settings.parity.any')
+        : `${t('settings.parity.note_override')}: ${r.source_effort}`)}</td><td>${esc(noteLabel(r.note))}</td>
     </tr>`).join('');
   } catch (e) {
     body.innerHTML = `<tr><td colspan="8">${esc(t('settings.parity.grid_failed'))}</td></tr>`;
@@ -4752,16 +4759,19 @@ function onAddMissingParityRows() {
   // adding a model is a spending decision, so the user still presses Save.
   const used = new Set(_parityRows.map((r) => _baseId(r.claude_model)));
   for (const m of _parityUnmapped) {
+    if (_parityRows.length >= _PARITY_ROW_LIMIT) break;
     if (used.has(_baseId(m.claude_model))) continue;
     _parityRows.push({ claude_model: m.claude_model, model: m.would_map_to,
                        source_effort: '*', effort: 'follow', claude_effort: null });
+    used.add(_baseId(m.claude_model));
   }
-  _parityUnmapped = [];
+  _parityUnmapped = _parityUnmapped.filter((m) => !used.has(_baseId(m.claude_model)));
   renderParityBanner();
   renderParityRows();
 }
 
 function _nextParitySeed() {
+  if (_parityRows.length >= _PARITY_ROW_LIMIT) return null;
   const used = new Set(_parityRows.map((r) => _baseId(r.claude_model)));
   let seed = (_parityMeta.defaults || []).find((d) => !used.has(_baseId(d.claude_model)));
   if (!seed) {
@@ -4803,6 +4813,7 @@ async function loadModelParity() {
     claude_model: r.claude_model, source_effort: r.source_effort || '*', model: r.openai_model,
     effort: r.reasoning_effort, claude_effort: r.claude_effort || null,
   }));
+  _paritySavedRows = _parityRows.map((r) => ({ ...r }));
   _parityUnmapped = data.unmapped || [];
   _codexMappingRows = null;
   refreshCodexSelectOptions();
@@ -4824,8 +4835,28 @@ async function saveModelParity() {
 
 async function resetModelParity() {
   try {
-    // [] means "the default rows" — never "advertise nothing".
-    await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ model_parity: [] }) });
+    const defaults = _parityMeta.defaults.map((r) => ({ ...r }));
+    const byId = new Map(defaults.map((r) => [r.claude_model, r]));
+    const changed = new Set();
+    const removed = new Set();
+    // Include persisted and staged rows: Reset discards both.
+    for (const row of [..._paritySavedRows, ..._parityRows]) {
+      const target = byId.get(row.claude_model);
+      if (!target) removed.add(row.claude_model);
+      else if ((row.source_effort || '*') !== '*' || row.model !== target.model
+          || row.effort !== target.effort || (row.claude_effort || null) !== (target.claude_effort || null)) {
+        changed.add(row.claude_model);
+      }
+    }
+    const currentIds = new Set(_parityRows.map((r) => r.claude_model));
+    for (const row of defaults) {
+      if (!currentIds.has(row.claude_model)) changed.add(row.claude_model);
+    }
+    const message = t('settings.parity.reset_confirm')
+      .replace('{changed}', [...changed].join(', ') || t('settings.parity.no_changes'))
+      .replace('{removed}', [...removed].join(', ') || t('settings.parity.no_changes'));
+    if (!window.confirm(message)) return;
+    await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ model_parity: defaults }) });
     showToast('success', t('toast.parity_reset'), '');
     await loadModelParity();
   } catch (e) {

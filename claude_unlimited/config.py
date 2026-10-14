@@ -290,7 +290,7 @@ class Settings:
     # The editable model-parity list: an ORDERED list of rows
     # [{"claude_model", "source_effort"?, "model"?, "effort"?, "claude_effort"?}, ...].
     # Distinct model ids are what Claude Code's /model picker offers for Codex-served
-    # sessions. Empty ([] or {}) means "the default rows" (the 4 family heads),
+    # sessions. Empty ([] or {}) means the legacy concrete curated rows (4 family heads),
     # never "advertise nothing". A legacy sparse dict {claude_id: {...}} is
     # still accepted and migrated at read time by openai_models.normalize_parity
     # — the config file keeps its old shape until the user's next save writes
@@ -405,7 +405,8 @@ def normalize_forced_subagents(profiles: List[Profile]) -> List[Profile]:
 def load_pool() -> Pool:
     ensure_app_dir()
     if not CONFIG_FILE.exists():
-        return Pool(profiles=[])
+        from .openai_models import default_parity_rows
+        return Pool(profiles=[], settings=Settings(model_parity=default_parity_rows()))
     data = json.loads(CONFIG_FILE.read_text())
     profiles = [
         Profile(
@@ -525,6 +526,12 @@ def save_pool(pool: Pool) -> None:
         "shared_claude_dir": pool.shared_claude_dir,
         "settings": asdict(pool.settings),
     }
+    if not CONFIG_FILE.exists() and not pool.settings.model_parity:
+        # Only first creation opts into follow. Existing empty configs retain
+        # concrete curated efforts, including after unrelated settings saves.
+        from .openai_models import default_parity_rows
+        pool.settings.model_parity = default_parity_rows()
+        payload["settings"]["model_parity"] = pool.settings.model_parity
     tmp = CONFIG_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, indent=2) + "\n")
     try:
@@ -617,7 +624,7 @@ def _validated_model_parity(raw):
         source_effort?, claude_effort?}, ...] — order is preserved;
       * the legacy sparse dict {claude_id: {model?, effort?, claude_effort?}}.
     openai_models.normalize_parity() turns either into the in-force row list at
-    read time, and the empty case ([]/{}) means "the default rows"."""
+    read time, and the empty case ([]/{}) means concrete legacy curated rows."""
     from .openai_models import CLAUDE_REASONING_EFFORTS
 
     if isinstance(raw, list):

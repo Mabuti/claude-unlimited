@@ -98,10 +98,10 @@ def test_grid_order_indices_follow_clamping_and_suppression():
     assert len(grid) == 12
     assert [r["requested_effort"] for r in grid[:6]] == list(EFFORTS)
     assert grid[0] == {"claude_model": "claude-opus-4-6", "requested_effort": None,
-                       "row_index": 2, "model": "gpt-5.6-terra", "effort": "high",
+                       "row_index": 2, "source_effort": "*", "model": "gpt-5.6-terra", "effort": "high",
                        "claude_effort": None, "note": "follows"}
     assert grid[5] == {"claude_model": "claude-opus-4-6", "requested_effort": "max",
-                       "row_index": 0, "model": "custom", "effort": "max",
+                       "row_index": 0, "source_effort": "max", "model": "custom", "effort": "max",
                        "claude_effort": "high", "note": "override; follows; clamped to high"}
     assert grid[6]["claude_effort"] is None
     assert grid[6]["note"] == "not supported by this model"
@@ -125,7 +125,7 @@ def test_models_listing_dedupes_and_uses_base_label_even_when_override_first():
 def test_defaults_follow_but_missing_saved_effort_is_concrete():
     assert all(r["effort"] == "follow" for r in models.default_parity_rows())
     for raw in (None, {}, []):
-        assert all(r["effort"] == "follow" for r in models.normalize_parity(raw))
+        assert [r["effort"] for r in models.normalize_parity(raw)] == ["medium", "high", "medium", "low"]
     for raw in ([row()], {"claude-fable-5-1": {"model": "legacy"}}):
         assert models.map_model("claude-fable-5-1", parity=raw, requested_effort="max").reasoning_effort == "medium"
     assert models.map_model("claude-sonnet-5", parity={"claude-fable-5-1": {"model": "legacy"}},
@@ -216,3 +216,77 @@ def test_whitespace_duplicate_keys_pin_ad6ef5f_results(shape):
     target = [r for r in models.normalize_parity(cleaned) if r["claude_model"] == "claude-opus-5"]
     assert target == [{"claude_model": "claude-opus-5", "model": "gpt-5.6-terra",
                        "effort": "low", "claude_effort": None}]
+
+
+# Executed against ad6ef5f without a loaded catalogue: all empty shapes yield
+# these exact rows; every incoming effort keeps each concrete target unchanged.
+LEGACY_EMPTY_ROWS = [
+    row('claude-fable-5', model='gpt-5.6-sol', effort='medium', claude_effort=None),
+    row('claude-opus-5-5', model='gpt-5.6-terra', effort='high', claude_effort=None),
+    row('claude-sonnet-5', model='gpt-5.6-terra', effort='medium', claude_effort=None),
+    row('claude-haiku-4-5-20251001', model='gpt-5.6-luna', effort='low', claude_effort=None),
+]
+
+
+@pytest.mark.parametrize('shape', ['absent', {}, []])
+@pytest.mark.parametrize('effort', EFFORTS)
+def test_legacy_empty_configs_pin_ad6ef5f_without_writes(shape, effort, monkeypatch):
+    monkeypatch.setattr(models.model_catalogue, 'current', lambda: None)
+    settings = {} if shape == 'absent' else {'model_parity': shape}
+    original = json.dumps({'settings': settings})
+    config.CONFIG_FILE.write_text(original)
+    before = config.CONFIG_FILE.stat().st_mtime_ns
+    pool = config.load_pool()
+    assert models.normalize_parity(pool.settings.model_parity) == LEGACY_EMPTY_ROWS
+    for legacy in LEGACY_EMPTY_ROWS:
+        for model_id in (legacy['claude_model'], legacy['claude_model'] + '-20261001'):
+            assert models.map_model(model_id, parity=pool.settings.model_parity,
+                                    requested_effort=effort) == models.OpenAIModelTarget(
+                                        legacy['model'], legacy['effort'])
+    assert config.CONFIG_FILE.read_text() == original
+    assert config.CONFIG_FILE.stat().st_mtime_ns == before
+    config.update_settings(language='de')
+    assert models.normalize_parity(config.load_pool().settings.model_parity) == LEGACY_EMPTY_ROWS
+
+
+@pytest.mark.parametrize('load_first', [True, False])
+def test_first_config_creation_writes_explicit_follow_rows(load_first):
+    assert not config.CONFIG_FILE.exists()
+    pool = config.load_pool() if load_first else config.Pool()
+    config.save_pool(pool)
+    stored = json.loads(config.CONFIG_FILE.read_text())['settings']['model_parity']
+    assert stored == models.default_parity_rows()
+    assert len(stored) == 4
+    config.save_pool(pool)
+    assert config.load_pool().settings.model_parity == stored
+    assert all(r['effort'] == 'follow' for r in stored)
+    assert models.map_model('claude-fable-5-1', parity=config.load_pool().settings.model_parity,
+                            requested_effort='max').reasoning_effort == 'max'
+
+
+def test_explicit_reset_defaults_persist_and_follow_all_levels():
+    config.CONFIG_FILE.write_text(json.dumps({'settings': {'model_parity': LEGACY_ROWS}}))
+    config.update_settings(model_parity=models.default_parity_rows())
+    stored = config.load_pool().settings.model_parity
+    assert models.normalize_parity(stored) == models.default_parity_rows()
+    for effort in models.CLAUDE_REASONING_EFFORTS:
+        for r in stored:
+            assert models.map_model(r['claude_model'], parity=stored,
+                                    requested_effort=effort).reasoning_effort == effort
+
+
+def test_server_accepts_64_rows_and_rejects_65():
+    rows = [row(f'claude-test-{i}', effort='follow') for i in range(65)]
+    assert len(config._validated_model_parity(rows[:64])) == 64
+    with pytest.raises(ValueError, match='too many'):
+        config._validated_model_parity(rows)
+
+
+def test_offline_picker_models_match_curated_targets_and_effort_is_neutral():
+    from claude_unlimited import cli
+    for labels in (cli._CODEX_MODEL_LABELS, cli._MIXED_MODEL_LABELS):
+        for tier, (name, description) in labels.items():
+            target = models._curated_fallback(cli._MODEL_TIER_IDS[tier], None)
+            assert models._OPENAI_DISPLAY_NAMES[target.model] in name
+            assert 'Codex effort per parity table' in description
+            assert 'follows Claude Code' not in description

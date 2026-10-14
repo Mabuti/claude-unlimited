@@ -382,22 +382,41 @@ Claude Code asks for a Claude model. When the request lands on a Codex account, 
 has to decide which GPT model actually answers — and how hard it thinks. That's the
 **parity list** in **Settings → Models parity**, and it's yours to edit:
 
-| Claude model | Claude effort | Runs as (Codex) | Codex effort |
-|---|---|---|---|
-| Claude Fable 5.1 | Automatic | `gpt-5.6-sol` | medium |
-| Claude Opus 5.5 | Automatic | `gpt-5.6-terra` | high |
-| Claude Sonnet 5 | Automatic | `gpt-5.6-terra` | medium |
-| Claude Haiku 4.5 | Automatic | `gpt-5.6-luna` | low |
+Each model has one base **Any** row (`source_effort: "*"`, also the default when
+omitted). Optional override rows use `source_effort: low|medium|high|xhigh|max`
+to choose a different Codex target or effort for that requested level. A row stores
+`{claude_model, source_effort, model, effort, claude_effort}`. Codex `effort` can be a
+fixed level or **Follow Claude Code (same level)** (`follow`). Follow copies an explicit
+requested level. When effort is absent, it uses this concrete curated table:
 
-- **It's an editable list.** It starts with those four. Add a row with **+ Add model**,
-  remove one with the red 🗑, and **Save**. **Reset to defaults** brings the four back.
-- **The list is your model picker.** Whatever you save is exactly what `/model` offers in a
-  Codex-served `cu code` session — nothing more, nothing less. Restart the session to pick
-  up changes (the picker is read once at launch).
-- **Both sides have an effort dial.** *Codex effort* governs a request served by a Codex
-  account; *Claude effort* is applied when a Claude account serves it (`output_config.effort`
-  — leave it **Automatic** to keep Claude Code's own choice). Haiku-class and older Sonnet
-  models don't accept it, so it's simply ignored there.
+| Claude family | Default Codex target | Curated effort when absent |
+|---|---|---|
+| Fable | `gpt-5.6-sol` | medium |
+| Opus | `gpt-5.6-terra` | high |
+| Sonnet | `gpt-5.6-terra` | medium |
+| Haiku | `gpt-5.6-luna` | low |
+
+- **Matching:** exact Claude id → dated/undated base id → first matching family group.
+  Within that group, an exact requested-effort override wins; otherwise its Any row wins.
+  Absent effort uses the Any row. An unmatched model uses the curated fallback (unknown
+  families use `gpt-5.6-terra` / medium). Per-profile Codex model and effort overrides win.
+- **Fresh installs and Reset use Follow.** First creation of `config.json` writes explicit
+  follow default rows for the four family heads. Existing files with absent `model_parity`,
+  `{}`, or `[]` retain the old concrete curated efforts for every requested level, resolved
+  at read time without writing. Existing explicit rows retain their behavior.
+  **Reset to defaults** confirms changed and disappearing model IDs, then writes the
+  explicit follow list, replacing saved rows and unsaved edits; it never writes `[]`.
+- **Edit up to 64 rows.** Add models or per-effort overrides, then **Save**. Removing a base
+  row also removes its overrides. The read-only **Effective mapping** grid shows each
+  saved model × requested effort, matched rule, resolved target and effort, and Claude
+  clamping/suppression before profile overrides or backend retries.
+- **Only base rows supply `/model` picker labels.** Effort overrides route individual levels,
+  not extra models. Claude Code can relabel its four standard tiers; extra Claude models
+  remain usable by id but may not appear in the picker. Restart `cu code` to refresh it.
+- **Claude effort** controls Claude-served requests (`output_config.effort`); **Leave as
+  requested** preserves Claude Code's choice. Unsupported models suppress injection and
+  supported models clamp where needed. Codex follow sends the same level first; only a
+  backend 400 rejection makes the bridge step down to a supported level.
 - **Nothing maps to `gpt-6-astra` out of the box.** Claude Code picks Fable on its own for
   ordinary work, so making Fable the flagship's row meant spending top-tier Codex quota you
   never asked for. It's still in the dropdown — one edit away — just not a default.

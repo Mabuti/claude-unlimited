@@ -1249,3 +1249,54 @@ def test_fable_spent_uses_request_effort(pool_env, monkeypatch, spent_model, eff
     result = gw.handle("POST", "/v1/messages", headers, json.dumps(body).encode(), distribute=branch)
     assert result.profile_id == expected
     list(result.body_chunks or [])
+
+
+@pytest.mark.parametrize('requested', ['claude-opus-5-5', 'claude-sonnet-5', 'claude-fable-5-1'])
+@pytest.mark.parametrize('spent', ['gpt-6-astra', 'gpt-5.6-sol'])
+def test_fable_spent_effort_does_not_leak_from_other_models(pool_env, monkeypatch, requested, spent):
+    from datetime import datetime, timezone
+    from claude_unlimited.observation import ModelWindow
+    from claude_unlimited.router import must_leave
+    from claude_unlimited.upstream import UpstreamResponse
+
+    rows = [
+        {'claude_model': 'claude-fable-5-1', 'model': 'gpt-5.6-sol', 'effort': 'follow'},
+        {'claude_model': 'claude-fable-5-1', 'source_effort': 'max', 'model': 'gpt-6-astra', 'effort': 'follow'},
+        {'claude_model': 'claude-opus-5-5', 'model': 'gpt-5.6-terra', 'effort': 'follow'},
+        {'claude_model': 'claude-sonnet-5', 'model': 'gpt-5.6-terra', 'effort': 'follow'},
+    ]
+    profile = _codex_profile(leave_on_fable_limit=True)
+    settings = Settings(model_parity=rows)
+    windows = tuple(ModelWindow(name=m, percent=100 if m == spent else 10, resets_at=None, active=True)
+                    for m in ('gpt-5.6-sol', 'gpt-6-astra'))
+    should_leave = spent == ('gpt-6-astra' if 'fable' in requested else 'gpt-5.6-sol')
+    blocked = gateway_module._blocked_models_for(profile, windows, settings, datetime.now(timezone.utc),
+                                                  requested_model=requested, requested_effort='max')
+    assert ('claude-fable-5-1' in blocked) is should_leave
+
+    save_pool(Pool(profiles=[profile, Profile(id='a', name='A', kind='oauth', priority=2, automatic=True)],
+                   settings=settings))
+    monkeypatch.setattr(gateway_module.openai_bridge, 'run', lambda *a, **kw:
+        OpenAIBridgeResult(status=200, headers={}, body_chunks=iter([])))
+    gw = Gateway(transport=lambda req: UpstreamResponse(
+        status=200, headers={}, body_chunks=iter([]), connection=None))
+    gw.runtime_snapshot()
+    gw._runtime['c'].model_usage = windows
+    gw._runtime['c'].blocked_models = blocked
+    assert must_leave(gw._runtime['c'], datetime.now(timezone.utc)) is should_leave
+    result = gw.handle('POST', '/v1/messages', {}, json.dumps({
+        'model': requested, 'messages': [], 'output_config': {'effort': 'max'}}).encode())
+    assert result.profile_id == ('a' if should_leave else 'c')
+    list(result.body_chunks or [])
+
+
+@pytest.mark.parametrize('requested', ['claude-opus-5-5', 'claude-opus-5-5-20261001', 'claude-opus-6'])
+def test_blocked_effort_applies_to_only_requested_group(pool_env, requested):
+    from datetime import datetime, timezone
+    rows = [r for model in ('claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5') for r in (
+        {'claude_model': model, 'model': 'gpt-5.6-sol'},
+        {'claude_model': model, 'source_effort': 'max', 'model': 'gpt-6-astra'},
+    )]
+    blocked = gateway_module._blocked_models_for(_codex_profile(), _unavailable('gpt-6-astra'),
+        Settings(model_parity=rows), datetime.now(timezone.utc), requested_model=requested, requested_effort='max')
+    assert blocked == {'claude-opus-5-5'}

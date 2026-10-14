@@ -131,7 +131,7 @@ def test_advertised_models_are_exactly_the_saved_rows():
     assert ids == ["claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"]
     assert "claude-zenith-6" not in ids and "claude-nova-4" not in ids
     labels = dict(ads)
-    assert labels["claude-fable-5"] == "Claude Fable 5 | GPT-5.6 Sol · follows Claude Code"
+    assert labels["claude-fable-5"] == "Claude Fable 5 | GPT-5.6 Sol · medium"
 
 
 def test_advertised_models_reflect_a_saved_list_with_claude_effort():

@@ -680,7 +680,8 @@
   #parityAddBtn { background: var(--good-soft); color: var(--good); border-color: var(--good);
     font-family: inherit; font-weight: 600; transition: background .12s, color .12s; }
   #parityAddBtn:hover:not(:disabled) { background: var(--good); color: #05130B; }
-  #parityAddBtn:disabled { opacity: .45; cursor: not-allowed; }
+  #parityAddMissingBtn { background: transparent; font-family: inherit; }
+  #parityAddBtn:disabled, #parityAddMissingBtn:disabled, .parity-override:disabled { opacity: .45; cursor: not-allowed; }
 
   .field-group { display: flex; flex-direction: column; gap: 7px; }
   .field-label { font-size: var(--fs-micro); font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-faint); }
@@ -1590,9 +1591,9 @@
           <span class="banner-text" data-i18n="settings.parity.new_title">New Claude models aren't in your list</span>
           <span class="banner-sub" id="parityNewBannerSub"></span>
           <div class="banner-spacer"></div>
-          <div class="banner-btn" id="parityAddMissingBtn" data-i18n="settings.parity.add_missing">Add them</div>
+          <button type="button" class="banner-btn" id="parityAddMissingBtn" data-i18n="settings.parity.add_missing">Add them</button>
         </div>
-        <div class="field-sub" data-i18n="settings.parity.desc">The models listed here are exactly what Claude Code's model picker offers for Codex-served sessions. Each row maps a Claude model to a Codex model and reasoning effort; the Claude effort applies when a Claude account serves the request.</div>
+        <div class="field-sub" data-i18n="settings.parity.desc">Any is the base row; add effort overrides for specific requested levels. Only base (Any) rows appear in Claude Code’s /model picker for Codex-served sessions; effort-override rows route individual levels, not extra models. Claude effort applies when a Claude account serves the request.</div>
         <table class="model-map-table" id="parityTable">
           <thead><tr>
             <th data-i18n="settings.parity.col_claude_model">When Claude Code asks for</th>
@@ -1610,7 +1611,7 @@
         </div>
         <details id="parityGrid">
           <summary data-i18n="settings.parity.effective_mapping">Effective mapping</summary>
-          <p class="field-sub" data-i18n="settings.parity.grid_desc">Saved mappings before account overrides or backend retries. Save changes to refresh this grid.</p>
+          <p class="field-sub" data-i18n="settings.parity.grid_desc">Saved mappings before account overrides or backend retries. Save changes to refresh this grid. Follow copies the same level; only a backend 400 rejection triggers the bridge to step down to a supported level.</p>
           <div style="overflow-x:auto"><table class="model-map-table">
             <thead><tr>
               <th data-i18n="settings.parity.col_claude_model">When Claude Code asks for</th>
@@ -1626,7 +1627,7 @@
           </table></div>
         </details>
         <div class="field-sub" data-i18n="settings.parity.cost_note">Higher tiers and higher effort cost more of a Codex plan's quota.</div>
-        <div class="field-sub" data-i18n="settings.parity.picker_note">Claude Code's picker can relabel at most the four standard tiers (Fable, Opus, Sonnet, Haiku); extra rows are served and usable by id, but may not appear there. Restart your <code>cu code</code> session to refresh the picker.</div>
+        <div class="field-sub" data-i18n="settings.parity.picker_note">Only base (Any) rows supply Claude Code’s /model picker labels. The picker can relabel at most the four standard tiers (Fable, Opus, Sonnet, Haiku); extra Claude models are served and usable by id, but may not appear there. Effort overrides are per-level routing, not extra models. Restart your <code>cu code</code> session to refresh the picker.</div>
         <div class="field-row">
           <div class="field-text"></div>
           <div class="btn primary" id="paritySaveBtn" data-i18n="settings.parity.save">Save</div>
@@ -2112,7 +2113,7 @@
         <div class="field-sub" data-i18n="help.routing.context1m_note">Context size: several Claude models hold a million tokens, but Claude Code drops to 200K whenever it is pointed at anything other than Anthropic's own address — including this daemon. For a Claude or Anthropic-API account that caution is unnecessary, so cu code asks for the full window back. A ChatGPT/Codex account in the rotation no longer costs you the window: the daemon sizes every turn and keeps any that would overflow a GPT model's ~272K window on a Claude account; when no account can hold it, Claude Code is asked to compact. Settings → 1M context window.</div>
         <div class="field-sub" data-i18n="help.routing.model_limit_note">A plan can limit one model on its own weekly clock — you can run out of Fable while the account's own windows still look healthy. Each profile has a switch, "Leave this profile when its Fable limit is spent", off by default. With it on, the moment that account's Fable weekly limit is spent the whole session moves to another account — every model, not just Fable requests — and rotation skips the account until the limit resets or a fresh usage read shows room; it is never marked exhausted. With it off, the account keeps serving and only Fable requests get the provider's limit error. Settings → Session routing → "Switch every profile when its Fable limit is spent" turns it on for every profile at once. ChatGPT accounts are covered through the model mapping: OpenAI only reports whether a model is usable, so a ChatGPT account counts as spent when the GPT model Fable maps to is unavailable. A --profile pin and Take over are honoured regardless, with one Activity line saying the limit is spent; a pinned branch moves for good once another account can take it, and if no account can, the session stays put and you get the provider's own error. A ChatGPT account that has bought credits can be set to keep serving past that spent point instead of rotating away — Settings → ChatGPT credits, off by default since it then bills per request.</div>
         <div class="field-sub" data-i18n="help.routing.return_note">After a switch the pool stays on the new account for as long as it works, even once your first-choice account refills — moving back would throw away a warm prompt cache and could move an agent mid-task. Settings → Session routing → "Go back to your first-choice account when it's free" changes that, and only ever acts after ten minutes with nothing sent.</div>
-        <div class="field-sub" data-i18n="help.routing.parity_note">Settings → Models parity maps each Claude model to a Codex model and effort. Any is the base row; add effort overrides for specific requested levels. Follow Claude Code uses the requested level, or the curated default when no effort is sent. Leave as requested keeps Claude-side effort unchanged. Effective mapping shows every saved model and effort combination, including Claude effort clamping or suppression. Per-profile Codex overrides still take precedence. Deleting a base row also removes its effort overrides.</div>
+        <div class="field-sub" data-i18n="help.routing.parity_note">Settings → Models parity maps each Claude model to a Codex model and effort. Any is the base row; add effort overrides for specific requested levels. Follow Claude Code uses the requested level, or the curated default when no effort is sent. Leave as requested keeps Claude-side effort unchanged. Effective mapping shows every saved model and effort combination, including Claude effort clamping or suppression. Per-profile Codex overrides still take precedence. Deleting a base row also removes its effort overrides. Only base (Any) rows supply /model picker labels; effort overrides route individual levels, not extra models. Extra Claude models remain usable by id but may not appear in the picker. Reset asks for confirmation and writes explicit Follow Claude Code default rows; legacy empty settings retain concrete curated efforts. The editor allows at most 64 rows.</div>
       </div>
     </div>
 

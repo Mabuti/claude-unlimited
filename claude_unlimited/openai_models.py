@@ -13,7 +13,8 @@ request (docs/adr/0007). `gpt-6-astra` is the flagship, and NO tier maps to it
 by default: Claude Code picks Fable on its own for ordinary work, so mapping
 Fable to the flagship meant a user who never chose the expensive model still
 had their Codex quota spent at the top tier. Fable therefore lands on
-`gpt-5.6-sol` at medium effort, and astra stays one explicit edit away in the
+`gpt-5.6-sol` with medium as its curated absent-effort fallback; fresh/Reset
+rows follow explicit requested effort. Astra stays one explicit edit away in the
 parity table for anyone who wants it.
 Raising a row here raises what a session costs, so treat it as a spending
 decision — which is exactly why a catalogue refresh NEVER changes what a
@@ -247,7 +248,9 @@ def _curated_fallback(requested_claude_model: Optional[str],
 def default_parity_rows(catalogue: Optional[Catalogue] = None) -> list[dict]:
     """The parity list a fresh install (or a Reset) starts from: one row per
     family in _DEFAULT_FAMILIES, each the highest-ranked model of that family
-    with its curated Codex target. With the vendored catalogue this is exactly
+    with its curated Codex target and explicit follow effort. Legacy empty
+    settings instead use concrete curated efforts in normalize_parity().
+    With the vendored catalogue this is exactly
     claude-fable-5-1 / claude-opus-5-5 / claude-sonnet-5 / claude-haiku-4-5 —
     the same ids cli.py's _MODEL_TIER_IDS use, so the /model picker relabels
     the native tiers instead of duplicating them. No catalogue -> one
@@ -294,11 +297,12 @@ def normalize_parity(raw, catalogue: Optional[Catalogue] = None) -> list[dict]:
       * a non-empty legacy sparse dict {claude_id: {model,effort}} -> the
         default rows with those overlays applied (matched by base id), plus a
         row appended for any dict key outside the defaults;
-      * {} / [] / None -> the default rows (never "advertise nothing", which
+      * {} / [] / None -> concrete legacy curated rows (never "advertise nothing", which
         would give Claude Code an empty /v1/models).
     """
     cat = _catalogue_or_current(catalogue)
-    defaults = default_parity_rows(cat)
+    defaults = [dict(row, effort=_curated_fallback(row["claude_model"], cat).reasoning_effort)
+                for row in default_parity_rows(cat)]
     if isinstance(raw, list):
         rows: list[dict] = []
         for entry in raw:
@@ -319,8 +323,7 @@ def normalize_parity(raw, catalogue: Optional[Catalogue] = None) -> list[dict]:
     if isinstance(raw, dict) and raw:
         # Legacy sparse maps keep concrete curated efforts, even on rows
         # without an overlay. Only a reset opts them into follow.
-        rows = [dict(row, effort=_curated_fallback(row["claude_model"], cat).reasoning_effort)
-                for row in defaults]
+        rows = [dict(row) for row in defaults]
         by_base = {base_id(row["claude_model"]): row for row in rows}
         for claude_id, overlay in raw.items():
             if not isinstance(overlay, dict):
@@ -444,7 +447,8 @@ def parity_grid(rows, catalogue: Optional[Catalogue] = None) -> list[dict]:
                 elif applied != row["claude_effort"]:
                     notes.append(f"clamped to {applied}")
             grid.append({"claude_model": model, "requested_effort": effort,
-                         "row_index": indices[id(row)], "model": target.model,
+                         "row_index": indices[id(row)], "source_effort": row.get("source_effort", "*"),
+                         "model": target.model,
                          "effort": target.reasoning_effort, "claude_effort": applied,
                          "note": "; ".join(notes)})
     return grid

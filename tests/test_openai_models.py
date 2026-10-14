@@ -103,7 +103,7 @@ def test_automatic_mapping_matches_the_real_map():
     for row in rows:
         target = _MODEL_MAP[row["claude_model"]]
         assert row["openai_model"] == target.model
-        assert row["reasoning_effort"] == "follow"
+        assert row["reasoning_effort"] == target.reasoning_effort
         assert row["default_effort"] == target.reasoning_effort
         assert row["claude_label"]  # never blank, or the table renders empty cells
 
