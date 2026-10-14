@@ -4716,13 +4716,15 @@ async function loadParityGrid() {
     const data = await api('/api/model-parity/grid');
     const noteLabel = (note) => note.split('; ').filter(Boolean).map((part) => {
       if (part.startsWith('clamped to ')) return t('settings.parity.note_clamped').replace('{effort}', part.slice(11));
-      const keys = { follows: 'note_follows', override: 'note_override', 'not supported by this model': 'note_unsupported' };
+      const keys = { follows: 'note_follows', override: 'note_override', 'not supported by this model': 'note_unsupported', 'no base row (fallback)': 'note_no_base' };
       return keys[part] ? t(`settings.parity.${keys[part]}`) : part;
     }).join('; ');
     body.innerHTML = data.grid.map((r) => `<tr>
       <td>${esc(r.claude_model)}</td><td>${esc(r.requested_effort || t('settings.parity.absent'))}</td>
       <td>→</td><td>${esc(r.model)}</td><td>${esc(codexEffortLabel(r.effort))}</td>
-      <td>${esc(r.claude_effort || t('settings.parity.leave_requested'))}</td>
+      <td>${r.configured_claude_effort && !r.claude_effort
+        ? `<s>${esc(r.configured_claude_effort)}</s> ${esc(t('settings.parity.not_injected'))}`
+        : esc(r.claude_effort || t('settings.parity.leave_requested'))}</td>
       <td>${esc((r.source_effort || '*') === '*' ? t('settings.parity.any')
         : `${t('settings.parity.note_override')}: ${r.source_effort}`)}</td><td>${esc(noteLabel(r.note))}</td>
     </tr>`).join('');
@@ -4852,9 +4854,16 @@ async function resetModelParity() {
     for (const row of defaults) {
       if (!currentIds.has(row.claude_model)) changed.add(row.claude_model);
     }
+    const describe = (row) => `${row.model}/${codexEffortLabel(row.effort)}`;
+    const before = (id) => [...new Set([..._paritySavedRows, ..._parityRows]
+      .filter((r) => r.claude_model === id)
+      .map((r) => `${r.source_effort || '*'}: ${describe(r)}`))].join(', ')
+      || t('settings.parity.not_present');
     const message = t('settings.parity.reset_confirm')
-      .replace('{changed}', [...changed].join(', ') || t('settings.parity.no_changes'))
-      .replace('{removed}', [...removed].join(', ') || t('settings.parity.no_changes'));
+      .replace('{changed}', [...changed].map((id) => `${id}: ${before(id)} → ${describe(byId.get(id))}`)
+        .join('\n') || t('settings.parity.no_changes'))
+      .replace('{removed}', [...removed].map((id) => `${id}: ${before(id)}`)
+        .join('\n') || t('settings.parity.no_changes'));
     if (!window.confirm(message)) return;
     await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ model_parity: defaults }) });
     showToast('success', t('toast.parity_reset'), '');

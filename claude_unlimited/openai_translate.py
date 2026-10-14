@@ -552,6 +552,9 @@ class ResponseTranslator:
         })
 
     def _tool_input_fallback(self, block: _ToolBlock, arguments: Optional[str]) -> Iterator[bytes]:
+        # Some backends send arguments ONLY on response.function_call_arguments.done
+        # / response.output_item.done. Without this fallback tool_use.input stays
+        # {}, so Claude Code rejects and retries the call.
         if arguments is None:
             return
         if not block.arguments:

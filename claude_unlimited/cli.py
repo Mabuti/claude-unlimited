@@ -646,32 +646,20 @@ def _tier_live_label(live: dict, tier_id: str, family: str):
             return value
     return None
 
-# OFFLINE FALLBACK ONLY. The live labels are derived per launch from the
-# daemon's own parity map (_fetch_parity_labels -> GET /v1/models), so they
-# always name the model that will really serve and never go stale. These
-# literals are used only when that fetch fails, and are deliberately in the
-# same `<Claude tier> | <GPT model>` shape the live path produces so the
-# picker reads identically either way.
-#
-# Pinned to a codex Profile: every request this session makes is served by
-# OpenAI, so name the real backing model outright.
+# Offline labels cannot know the saved parity or effective account overrides.
+# Keep both model and effort neutral until GET /v1/models succeeds.
 _CODEX_MODEL_LABELS = {
-    "FABLE": ("Fable 5.1 | GPT-5.6 Sol", "Served by Codex · Codex effort per parity table"),
-    "OPUS": ("Opus 5.5 | GPT-5.6 Terra", "1M context · Served by Codex · Codex effort per parity table"),
-    "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "1M context · Served by Codex · Codex effort per parity table"),
-    "HAIKU": ("Haiku 4.5 | GPT-5.6 Luna", "Served by Codex · Codex effort per parity table"),
+    "FABLE": ("Fable 5.1", "Served by Codex · mapping unavailable"),
+    "OPUS": ("Opus 5.5", "1M context · Served by Codex · mapping unavailable"),
+    "SONNET": ("Sonnet 5", "1M context · Served by Codex · mapping unavailable"),
+    "HAIKU": ("Haiku 4.5", "Served by Codex · mapping unavailable"),
 }
 
-# Rotated across a pool that mixes providers: which provider serves a given
-# request is decided per request and shifts as quotas move, while the picker
-# is read once at launch and never updated. Naming BOTH models a tier maps
-# to stays accurate whichever one serves, and still says what is being
-# picked; a provider-neutral tier word would name no model at all.
 _MIXED_MODEL_LABELS = {
-    "FABLE": ("Fable 5.1 | GPT-5.6 Sol", "Whichever account is active · Codex effort per parity table"),
-    "OPUS": ("Opus 5.5 | GPT-5.6 Terra", "1M context · Whichever account is active · Codex effort per parity table"),
-    "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "1M context · Whichever account is active · Codex effort per parity table"),
-    "HAIKU": ("Haiku 4.5 | GPT-5.6 Luna", "Whichever account is active · Codex effort per parity table"),
+    "FABLE": ("Fable 5.1", "Whichever account is active · mapping unavailable"),
+    "OPUS": ("Opus 5.5", "1M context · Whichever account is active · mapping unavailable"),
+    "SONNET": ("Sonnet 5", "1M context · Whichever account is active · mapping unavailable"),
+    "HAIKU": ("Haiku 4.5", "Whichever account is active · mapping unavailable"),
 }
 
 

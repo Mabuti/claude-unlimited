@@ -72,7 +72,7 @@ const api = async (path, options) => {
   return { grid: [{claude_model: '<model>', requested_effort: null, row_index: 0,
                    source_effort: '*', model: 'base', effort: 'high', claude_effort: null, note: 'follows'},
                   {claude_model: '<model>', requested_effort: 'high', row_index: 9, source_effort: 'high',
-                   model: 'override', effort: 'high', claude_effort: null, note: 'override'}] };
+                   model: 'override', effort: 'high', claude_effort: null, configured_claude_effort: 'max', note: 'override; not supported by this model'}] };
 };
 '''
     result = subprocess.run(["node", "-"], input=harness + source[start:end] + checks,
@@ -226,7 +226,7 @@ def test_reset_lists_changed_and_removed_ids_cancel_preserves_everything():
   assert.equal(calls.length, 0);
   assert.equal(JSON.stringify(_parityRows), before);
   assert.equal(JSON.stringify(_paritySavedRows), saved);
-  assert.equal(confirmation, 'Changed: claude-fable-5-1, claude-opus-5-5, claude-sonnet-5\nRemoved: claude-saved-deleted, claude-mythos-5-1');
+  assert.equal(confirmation, 'Changed: claude-fable-5-1: *: base/medium → base/settings.parity.follow\nclaude-opus-5-5: *: override/settings.parity.follow → base/settings.parity.follow\nclaude-sonnet-5: *: base/settings.parity.follow, high: override/settings.parity.follow → base/settings.parity.follow\nRemoved: claude-saved-deleted: *: base/low\nclaude-mythos-5-1: *: override/high');
   confirmed = true;
   await resetModelParity();
   assert.equal(patches.length, 1);
@@ -247,7 +247,19 @@ def test_reset_warns_about_restored_models_and_claude_effort_changes():
   ];
   _parityRows = [{claude_model: 'claude-existing', model: 'base', effort: 'follow', claude_effort: 'high'}];
   await resetModelParity();
-  assert.equal(confirmation, 'Changed: claude-existing, claude-restored\nRemoved: settings.parity.no_changes');
+  assert.equal(confirmation, 'Changed: claude-existing: *: base/settings.parity.follow → base/settings.parity.follow\nclaude-restored: settings.parity.not_present → base/settings.parity.follow\nRemoved: settings.parity.no_changes');
   assert.equal(calls.length, 0);
+})().catch(e => { console.error(e); process.exitCode = 1; });
+''')
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node unavailable")
+def test_grid_distinguishes_suppressed_claude_effort_from_unset():
+    _run_editor(r'''
+(async () => {
+  await loadParityGrid();
+  const html = elements.get('parityGridRows').innerHTML;
+  assert.ok(html.includes('<td>settings.parity.leave_requested</td>'));
+  assert.ok(html.includes('<td><s>max</s> settings.parity.not_injected</td>'));
 })().catch(e => { console.error(e); process.exitCode = 1; });
 ''')

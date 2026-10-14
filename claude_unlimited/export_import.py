@@ -251,7 +251,7 @@ def apply_import(
         raise ExportImportError(f"Unknown conflict_strategy {conflict_strategy!r}.")
 
     incoming = None
-    if import_settings and parsed.settings:
+    if import_settings and parsed.settings is not None:
         from .config import Settings, validated_settings_changes
 
         # Validate all settings before any profile or credential writes.
@@ -266,6 +266,11 @@ def apply_import(
         # chose to send.
         incoming = {k: v for k, v in parsed.settings.items()
                     if k in Settings.__dataclass_fields__ and k not in _MACHINE_LOCAL_SETTINGS}
+        # Empty/missing parity in an imported settings payload is a legacy
+        # decision, even if load_pool() just seeded fresh-install follow rows.
+        if "model_parity" not in incoming or incoming["model_parity"] in ({}, []):
+            from .openai_models import normalize_parity
+            incoming["model_parity"] = normalize_parity(None)
         incoming = validated_settings_changes(incoming)
 
     result = {

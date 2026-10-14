@@ -1814,7 +1814,7 @@ class Gateway:
             # else falls through and relays upstream exactly as before, so
             # a Claude Profile keeps serving Anthropic's own live list.
             if method == "GET" and path.startswith("/v1/models"):
-                listing = connectors.models_listing(profile.kind, pool.settings.model_parity)
+                listing = connectors.models_listing(profile.kind, pool.settings.model_parity, profile=profile)
                 if listing is not None:
                     return self._models_listing_response(profile, path, listing)
 

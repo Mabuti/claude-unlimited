@@ -22,10 +22,10 @@ def test_codex_pinned_session_relabels_the_model_picker(monkeypatch):
     assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5[1m]"
     assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1"
     assert os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-haiku-4-5"
-    # ...while the visible label names BOTH the Claude tier and the backing GPT.
-    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5 | GPT-5.6 Terra"
+    # Offline labels keep the Claude tier without guessing the backing model.
+    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5"
     desc = os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION"]
-    assert "Codex" in desc and "Codex effort per parity table" in desc, desc
+    assert "Codex" in desc and "mapping unavailable" in desc, desc
 
 
 def test_non_codex_session_leaves_the_model_picker_alone(monkeypatch):
@@ -79,15 +79,14 @@ def test_rotated_mixed_pool_uses_provider_neutral_labels(monkeypatch):
 
     cli._apply_model_labels(None, [_p("oauth", "a"), _p("codex", "c")])
 
-    # Names BOTH the Claude tier and the GPT model it maps to: accurate whoever
-    # serves, and still says what is being picked.
-    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5 | GPT-5.6 Terra"
+    # Offline names identify tiers without guessing the active mapping.
+    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5"
     labels = [os.environ[f"ANTHROPIC_DEFAULT_{t}_MODEL_NAME"] for t in ("FABLE", "OPUS", "SONNET", "HAIKU")]
     assert len(set(labels)) == len(labels), labels  # every entry distinguishable
-    assert all("GPT" in l for l in labels), labels  # both providers named
-    # Every description must state the reasoning level that tier maps to.
+    assert all("GPT" not in label for label in labels), labels
+    # Offline descriptions must not promise an unknown reasoning level.
     for tier in ("FABLE", "OPUS", "SONNET", "HAIKU"):
-        assert "Codex effort per parity table" in os.environ[f"ANTHROPIC_DEFAULT_{tier}_MODEL_DESCRIPTION"]
+        assert "mapping unavailable" in os.environ[f"ANTHROPIC_DEFAULT_{tier}_MODEL_DESCRIPTION"]
     # ...and the id still has to be one map_model() understands.
     assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5[1m]"
 
@@ -113,7 +112,7 @@ def test_codex_labels_come_from_the_live_parity_map_when_reachable(monkeypatch):
         Profile(id="c", name="Codex", kind="codex", priority=1, automatic=True, enabled=True),
         [], host="127.0.0.1", port=4317, token="tok")
 
-    # Live value, not the module literal (which says GPT-5.6 Terra for FABLE).
+    # Live value includes the backing model; offline labels stay neutral.
     assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "Fable 5.1 | GPT-6 Astra"
     assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1"
     desc = os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION"]
@@ -122,7 +121,7 @@ def test_codex_labels_come_from_the_live_parity_map_when_reachable(monkeypatch):
 
 def test_parity_label_fetch_failure_falls_back_to_the_literals(monkeypatch):
     """A daemon that can't be reached must never leave the picker unlabelled —
-    the offline literals stand in, in the same `<Claude> | <GPT>` shape."""
+    neutral offline tier names stand in without guessing model or effort."""
     from claude_unlimited import cli
     from claude_unlimited.config import Profile
     import os
@@ -132,7 +131,7 @@ def test_parity_label_fetch_failure_falls_back_to_the_literals(monkeypatch):
     cli._apply_model_labels(
         Profile(id="c", name="Codex", kind="codex", priority=1, automatic=True, enabled=True),
         [], host="127.0.0.1", port=4317, token="tok")
-    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5 | GPT-5.6 Terra"
+    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5"
 
 
 def test_rotated_all_claude_pool_keeps_native_labels(monkeypatch):

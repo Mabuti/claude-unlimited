@@ -19,12 +19,14 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 
-def _codex_models(parity: Optional[dict] = None) -> list[tuple[str, str]]:
+def _codex_models(parity=None, *, profile=None) -> list[tuple[str, str]]:
     # Imported lazily so this registry stays a plain declaration that any
     # module can read without pulling in a connector's implementation.
     from . import openai_models
 
-    return openai_models.advertised_models(parity)
+    return openai_models.advertised_models(
+        parity, override_model=getattr(profile, "codex_model", None),
+        override_reasoning_effort=getattr(profile, "codex_reasoning_effort", None))
 
 
 @dataclass(frozen=True)
@@ -40,7 +42,7 @@ class ConnectorSpec:
     # Anthropic-compatible backends: oauth, api). A callable returns
     # (model_id, display_name) pairs the daemon answers with locally, for a
     # kind whose backend speaks a different protocol.
-    models_provider: Optional[Callable[[], list[tuple[str, str]]]] = None
+    models_provider: Optional[Callable[..., list[tuple[str, str]]]] = None
 
 
 CONNECTORS: dict[str, ConnectorSpec] = {
@@ -70,7 +72,7 @@ CONNECTORS: dict[str, ConnectorSpec] = {
 }
 
 
-def models_listing(kind: str, parity: Optional[dict] = None) -> Optional[list[tuple[str, str]]]:
+def models_listing(kind: str, parity=None, *, profile=None) -> Optional[list[tuple[str, str]]]:
     """(model_id, display_name) pairs this kind answers GET /v1/models with,
     or None when it should be relayed to the real upstream instead.
 
@@ -78,7 +80,7 @@ def models_listing(kind: str, parity: Optional[dict] = None) -> Optional[list[tu
     offer" is answered by the registry rather than an `if p.kind ==` chain at
     the call site."""
     provider = get(kind).models_provider
-    return provider(parity) if provider is not None else None
+    return provider(parity, profile=profile) if provider is not None else None
 
 
 def get(kind: str) -> ConnectorSpec:

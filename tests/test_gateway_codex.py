@@ -1300,3 +1300,38 @@ def test_blocked_effort_applies_to_only_requested_group(pool_env, requested):
     blocked = gateway_module._blocked_models_for(_codex_profile(), _unavailable('gpt-6-astra'),
         Settings(model_parity=rows), datetime.now(timezone.utc), requested_model=requested, requested_effort='max')
     assert blocked == {'claude-opus-5-5'}
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("model_pin,effort_pin", [
+    (None, None), ("gpt-6-astra", None), (None, "low"), ("gpt-6-astra", "low"),
+])
+@pytest.mark.parametrize("row_effort", ["follow", "high"])
+def test_model_listing_and_picker_honor_independent_profile_pins(
+        pool_env, monkeypatch, pinned, model_pin, effort_pin, row_effort):
+    import io
+    import os
+    from claude_unlimited import cli, openai_models
+
+    profile = _codex_profile(codex_model=model_pin, codex_reasoning_effort=effort_pin)
+    rows = [{"claude_model": "claude-sonnet-5", "model": "gpt-5.6-terra", "effort": row_effort}]
+    save_pool(Pool(profiles=[profile], settings=Settings(model_parity=rows)))
+    gw = Gateway(transport=lambda req: pytest.fail("models listing must stay local"))
+    result = gw.handle("GET", "/v1/models", {}, b"", forced_profile_id=profile.id if pinned else None)
+    assert result.status == 200
+    body = b"".join(result.body_chunks)
+    entry = json.loads(body)["data"][0]
+    target = openai_models.map_model("claude-sonnet-5", parity=rows,
+                                    override_model=model_pin, override_reasoning_effort=effort_pin)
+    expected_effort = "follows Claude Code" if row_effort == "follow" and effort_pin is None else target.reasoning_effort
+    expected_name = f"Claude Sonnet 5 | {openai_models._OPENAI_DISPLAY_NAMES[target.model]}"
+    assert entry["display_name"] == f"{expected_name} · {expected_effort}"
+
+    # Exercise CLI parsing of the actual gateway response, with no network.
+    monkeypatch.setattr(cli.urllib.request, "urlopen", lambda *a, **kw: io.BytesIO(body))
+    for tier in cli._MODEL_TIER_IDS:
+        for suffix in ("", "_NAME", "_DESCRIPTION"):
+            monkeypatch.delenv(f"ANTHROPIC_DEFAULT_{tier}_MODEL{suffix}", raising=False)
+    cli._apply_model_labels(profile if pinned else None, [profile], host="localhost", port=1234, token="fixture")
+    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == expected_name
+    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION"].endswith(f"reasoning: {expected_effort}")

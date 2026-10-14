@@ -1593,7 +1593,7 @@
           <div class="banner-spacer"></div>
           <button type="button" class="banner-btn" id="parityAddMissingBtn" data-i18n="settings.parity.add_missing">Add them</button>
         </div>
-        <div class="field-sub" data-i18n="settings.parity.desc">Any is the base row; add effort overrides for specific requested levels. Only base (Any) rows appear in Claude Code’s /model picker for Codex-served sessions; effort-override rows route individual levels, not extra models. Claude effort applies when a Claude account serves the request.</div>
+        <div class="field-sub" data-i18n="settings.parity.desc">Any is the base row; add effort overrides for specific requested levels. Only base (Any) rows appear in Claude Code’s /model picker for Codex-served sessions; effort-override rows route individual levels, not extra models. Claude effort applies when a Claude account serves the request. Follow uses the same level when Claude Code sends one; otherwise the curated effort for that model. Saved fixed efforts stay fixed until Reset.</div>
         <table class="model-map-table" id="parityTable">
           <thead><tr>
             <th data-i18n="settings.parity.col_claude_model">When Claude Code asks for</th>
@@ -1611,7 +1611,7 @@
         </div>
         <details id="parityGrid">
           <summary data-i18n="settings.parity.effective_mapping">Effective mapping</summary>
-          <p class="field-sub" data-i18n="settings.parity.grid_desc">Saved mappings before account overrides or backend retries. Save changes to refresh this grid. Follow copies the same level; only a backend 400 rejection triggers the bridge to step down to a supported level.</p>
+          <p class="field-sub" data-i18n="settings.parity.grid_desc">Saved mappings before account overrides or backend retries. Save changes to refresh this grid. Only a backend 400 rejection triggers the bridge to step down to a supported level. Follow uses the same level when Claude Code sends one; otherwise the curated effort for that model. Saved fixed efforts stay fixed until Reset.</p>
           <div style="overflow-x:auto"><table class="model-map-table">
             <thead><tr>
               <th data-i18n="settings.parity.col_claude_model">When Claude Code asks for</th>
@@ -2505,7 +2505,7 @@
               <span class="select-value"></span>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
             </div>
-            <div class="field-help" data-i18n="modal.add_profile.codex_reasoning_help">Leave on Automatic to use the mapping's own default per model</div>
+            <div class="field-help" data-i18n="modal.add_profile.codex_reasoning_help">Model and effort pins are separate. Effort Automatic uses the matched parity row, including follow and effort overrides.</div>
           </div>
         </div>
 
@@ -2834,7 +2834,7 @@
               <span class="select-value"></span>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
             </div>
-            <div class="field-help" data-i18n="modal.add_profile.codex_reasoning_help">Leave on Automatic to use the mapping's own default per model</div>
+            <div class="field-help" data-i18n="modal.add_profile.codex_reasoning_help">Model and effort pins are separate. Effort Automatic uses the matched parity row, including follow and effort overrides.</div>
           </div>
         </div>
         <div class="mapping-block">

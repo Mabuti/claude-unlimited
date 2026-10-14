@@ -432,9 +432,10 @@ produces zero reasoning tokens. Good for mechanical work, worse for anything tha
 thinking through. That's measured behaviour, not a guess — see
 [`docs/adr/0007-codex-quota-is-driven-by-reasoning-not-context.md`](docs/adr/0007-codex-quota-is-driven-by-reasoning-not-context.md).
 
-The list applies to Codex profiles left on **Automatic**. A profile with its own model
-override keeps using that instead, so you can pin one account to a specific model and let
-the rest follow the list.
+Model and effort pins are separate. A profile’s model pin replaces only the mapped
+model; its effort pin replaces only the mapped effort. Effort **Automatic** uses the
+matched parity row, including Follow Claude Code and effort overrides. You can pin
+one account’s model while letting its effort follow the list.
 
 > **Picker limitation:** Claude Code's `/model` picker can relabel at most its four standard
 > tiers (Fable, Opus, Sonnet, Haiku). Extra rows you add are still served and usable by id

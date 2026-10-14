@@ -526,12 +526,6 @@ def save_pool(pool: Pool) -> None:
         "shared_claude_dir": pool.shared_claude_dir,
         "settings": asdict(pool.settings),
     }
-    if not CONFIG_FILE.exists() and not pool.settings.model_parity:
-        # Only first creation opts into follow. Existing empty configs retain
-        # concrete curated efforts, including after unrelated settings saves.
-        from .openai_models import default_parity_rows
-        pool.settings.model_parity = default_parity_rows()
-        payload["settings"]["model_parity"] = pool.settings.model_parity
     tmp = CONFIG_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, indent=2) + "\n")
     try:

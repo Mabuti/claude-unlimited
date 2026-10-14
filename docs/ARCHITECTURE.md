@@ -445,10 +445,13 @@ Unmatched model ids use curated fallback; unknown families use Terra / medium.
 Existing files with absent parity, `{}`, or `[]` resolve to concrete curated rows
 at read time, with no rewrite and no following of incoming effort. Legacy sparse
 dicts overlay those concrete defaults; explicit saved rows preserve their behavior.
-Only first creation of a missing `config.json` seeds an explicit follow default list.
-Reset confirms all changed/disappearing Claude ids and writes that explicit follow
-list, never an empty list. `default_parity_rows()` supplies fresh/Reset defaults;
-`normalize_parity()` supplies legacy read semantics.
+Loading a missing `config.json` seeds an explicit follow default list. Saving never
+converts empty parity into follow. Importing a settings payload with missing or empty
+parity materializes concrete legacy curated rows, including on a fresh install.
+Reset confirms all changed/disappearing Claude ids with their old/new Codex models
+and efforts, then writes the explicit follow list, never an empty list.
+`default_parity_rows()` supplies fresh/Reset defaults; `normalize_parity()` supplies
+legacy read semantics.
 
 Only base rows are advertised at `GET /v1/models` and supply Claude Code's `/model`
 picker labels. Overrides are per-level routing, not additional models. Claude Code

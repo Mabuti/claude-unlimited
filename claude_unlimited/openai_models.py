@@ -435,11 +435,13 @@ def parity_grid(rows, catalogue: Optional[Catalogue] = None) -> list[dict]:
         for effort in (None, *CLAUDE_REASONING_EFFORTS):
             row = _match_row(rows, model, effort)
             target = map_model(model, parity=rows, catalogue=cat, requested_effort=effort)
+            matched = row
+            row = row or {}
             applied = apply_claude_effort(model, row.get("claude_effort"))
-            notes = []
+            notes = [] if matched is not None else ["no base row (fallback)"]
             if row.get("source_effort", "*") != "*":
                 notes.append("override")
-            if row["effort"] == "follow":
+            if row.get("effort") == "follow":
                 notes.append("follows")
             if row.get("claude_effort"):
                 if applied is None:
@@ -447,9 +449,11 @@ def parity_grid(rows, catalogue: Optional[Catalogue] = None) -> list[dict]:
                 elif applied != row["claude_effort"]:
                     notes.append(f"clamped to {applied}")
             grid.append({"claude_model": model, "requested_effort": effort,
-                         "row_index": indices[id(row)], "source_effort": row.get("source_effort", "*"),
+                         "row_index": indices[id(matched)] if matched is not None else None,
+                         "source_effort": row.get("source_effort", "*") if matched is not None else None,
                          "model": target.model,
                          "effort": target.reasoning_effort, "claude_effort": applied,
+                         "configured_claude_effort": row.get("claude_effort"),
                          "note": "; ".join(notes)})
     return grid
 
@@ -685,7 +689,9 @@ def unmapped_claude_models(parity=None,
 
 
 def advertised_models(parity=None,
-                      catalogue: Optional[Catalogue] = None) -> list[tuple[str, str]]:
+                      catalogue: Optional[Catalogue] = None, *,
+                      override_model: Optional[str] = None,
+                      override_reasoning_effort: Optional[str] = None) -> list[tuple[str, str]]:
     """(model_id, display_name) pairs for the Anthropic-shaped /v1/models
     listing a codex Profile answers with — exactly the SAVED parity rows, in
     order. This is what the user's `/model` picker offers for Codex-served
@@ -700,14 +706,18 @@ def advertised_models(parity=None,
     out: list[tuple[str, str]] = []
     for group in _parity_groups(normalize_parity(parity, cat)):
         claude_id = group[0]["claude_model"]
-        row = _match_row(group, claude_id)
+        row = _match_row(group, claude_id) or {}
+        target = map_model(claude_id, parity=parity, catalogue=cat,
+                           override_model=override_model,
+                           override_reasoning_effort=override_reasoning_effort)
         claude_label = _claude_label(claude_id, cat)
-        backing = _openai_label(row["model"], cat)
+        backing = _openai_label(target.model, cat)
         applied = apply_claude_effort(claude_id, row.get("claude_effort"))
         lead = f"{claude_label} (effort {applied})" if applied else claude_label
         # `<claude> | <openai> · <codex effort>` — codex effort stays the LAST
         # ` · ` segment so cli.py's _fetch_parity_labels keeps parsing it out.
-        effort = "follows Claude Code" if row["effort"] == "follow" else row["effort"]
+        effort = ("follows Claude Code" if row.get("effort") == "follow"
+                  and override_reasoning_effort is None else target.reasoning_effort)
         out.append((claude_id, f"{lead} | {backing} · {effort}"))
     return out
 

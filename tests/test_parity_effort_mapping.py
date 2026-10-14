@@ -99,11 +99,12 @@ def test_grid_order_indices_follow_clamping_and_suppression():
     assert [r["requested_effort"] for r in grid[:6]] == list(EFFORTS)
     assert grid[0] == {"claude_model": "claude-opus-4-6", "requested_effort": None,
                        "row_index": 2, "source_effort": "*", "model": "gpt-5.6-terra", "effort": "high",
-                       "claude_effort": None, "note": "follows"}
+                       "claude_effort": None, "configured_claude_effort": None, "note": "follows"}
     assert grid[5] == {"claude_model": "claude-opus-4-6", "requested_effort": "max",
                        "row_index": 0, "source_effort": "max", "model": "custom", "effort": "max",
-                       "claude_effort": "high", "note": "override; follows; clamped to high"}
+                       "claude_effort": "high", "configured_claude_effort": "xhigh", "note": "override; follows; clamped to high"}
     assert grid[6]["claude_effort"] is None
+    assert grid[6]["configured_claude_effort"] == "high"
     assert grid[6]["note"] == "not supported by this model"
     assert grid[6]["row_index"] == 1
     for cell in grid:
@@ -249,10 +250,9 @@ def test_legacy_empty_configs_pin_ad6ef5f_without_writes(shape, effort, monkeypa
     assert models.normalize_parity(config.load_pool().settings.model_parity) == LEGACY_EMPTY_ROWS
 
 
-@pytest.mark.parametrize('load_first', [True, False])
-def test_first_config_creation_writes_explicit_follow_rows(load_first):
+def test_first_config_creation_writes_explicit_follow_rows():
     assert not config.CONFIG_FILE.exists()
-    pool = config.load_pool() if load_first else config.Pool()
+    pool = config.load_pool()
     config.save_pool(pool)
     stored = json.loads(config.CONFIG_FILE.read_text())['settings']['model_parity']
     assert stored == models.default_parity_rows()
@@ -282,11 +282,54 @@ def test_server_accepts_64_rows_and_rejects_65():
         config._validated_model_parity(rows)
 
 
-def test_offline_picker_models_match_curated_targets_and_effort_is_neutral():
+def test_offline_picker_model_and_effort_are_neutral():
     from claude_unlimited import cli
     for labels in (cli._CODEX_MODEL_LABELS, cli._MIXED_MODEL_LABELS):
         for tier, (name, description) in labels.items():
-            target = models._curated_fallback(cli._MODEL_TIER_IDS[tier], None)
-            assert models._OPENAI_DISPLAY_NAMES[target.model] in name
-            assert 'Codex effort per parity table' in description
+            assert "GPT" not in name
+            assert "mapping unavailable" in description
             assert 'follows Claude Code' not in description
+
+
+@pytest.mark.parametrize("shape", ["absent", {}, []])
+@pytest.mark.parametrize("effort", EFFORTS)
+def test_import_legacy_settings_into_fresh_install_pins_ad6ef5f(shape, effort, monkeypatch):
+    from claude_unlimited import export_import as ei
+    monkeypatch.setattr(models.model_catalogue, "current", lambda: None)
+    monkeypatch.setattr(ei.activity_module, "record", lambda *a, **kw: None)
+    assert not config.CONFIG_FILE.exists()
+    settings = {} if shape == "absent" else {"model_parity": shape}
+    bundle = json.dumps({"bundle_version": ei.BUNDLE_VERSION, "encrypted": False,
+                         "data": {"settings": settings}}).encode()
+    parsed = ei.import_bundle(bundle)
+    result = ei.apply_import(parsed, import_profiles=False, import_settings=True)
+    assert result["settings_applied"] is True
+    stored = json.loads(config.CONFIG_FILE.read_text())["settings"]["model_parity"]
+    assert models.normalize_parity(stored) == LEGACY_EMPTY_ROWS
+    assert isinstance(stored, list) and len(stored) == 4
+    for legacy in LEGACY_EMPTY_ROWS:
+        assert models.map_model(legacy["claude_model"], parity=stored,
+                                requested_effort=effort) == models.OpenAIModelTarget(
+                                    legacy["model"], legacy["effort"])
+
+
+@pytest.mark.parametrize("shape", [{}, []])
+def test_saving_legacy_empty_pool_to_missing_file_does_not_opt_into_follow(shape):
+    config.save_pool(config.Pool(settings=config.Settings(model_parity=shape)))
+    assert config.load_pool().settings.model_parity == {}
+    assert models.normalize_parity(config.load_pool().settings.model_parity) == LEGACY_EMPTY_ROWS
+
+
+def test_grid_missing_base_uses_curated_fallback():
+    rows = [row("claude-sonnet-5", source_effort="high", model="custom", effort="max")]
+    config.CONFIG_FILE.write_text(json.dumps({"settings": {"model_parity": rows}}))
+    grid = models.parity_grid(config.load_pool().settings.model_parity)
+    for cell in grid:
+        if cell["requested_effort"] == "high":
+            assert (cell["model"], cell["effort"], cell["row_index"]) == ("custom", "max", 0)
+            assert cell["note"] == "override"
+        else:
+            assert (cell["model"], cell["effort"]) == ("gpt-5.6-terra", "medium")
+            assert cell["note"] == "no base row (fallback)"
+            assert cell["row_index"] is None
+            assert cell["source_effort"] is None
