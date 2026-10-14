@@ -1,5 +1,6 @@
 """Run the parity editor's state transitions with a minimal DOM, offline."""
 from pathlib import Path
+import json
 import re
 import shutil
 import subprocess
@@ -42,11 +43,16 @@ function element(tag = 'div') {
   });
   return node;
 }
-for (const id of ['parityRows', 'parityGridRows', 'parityAddBtn', 'modelParitySection',
+for (const id of ['parityRows', 'parityGridRows', 'parityCuratedRows', 'parityAddBtn', 'modelParitySection',
                   'parityNewBanner', 'parityNewBannerSub', 'parityAddMissingBtn']) elements.set(id, element(['parityAddBtn', 'parityAddMissingBtn'].includes(id) ? 'button' : 'div'));
 const document = { getElementById: id => elements.get(id) || null };
 const esc = (v) => String(v).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;');
-const t = (key) => key === 'settings.parity.reset_confirm' ? 'Changed: {changed}\nRemoved: {removed}' : key;
+let _strings = {};
+const t = (key) => _strings[key] || (key === 'settings.parity.reset_confirm' ? 'Changed: {changed}\nRemoved: {removed}' : key);
+const applyTranslations = () => {};
+const renderNotifList = () => {};
+const renderLauncherRows = () => {};
+const updateCodexModelHelp = () => {};
 const setupSelectInput = (element, options, callback) => {
   assert.ok(element, 'cannot initialize a missing selector');
   callbacks.set(element, { options, callback });
@@ -64,6 +70,7 @@ let calls = [];
 let patches = [];
 const api = async (path, options) => {
   calls.push(path);
+  if (path.startsWith('/api/locales/')) return {strings: locales[path.split('/').pop()]};
   if (path === '/api/settings') { patches.push(JSON.parse(options.body)); return {}; }
   if (path === '/api/codex/model-map') return {
     mapping: [{claude_model: 'claude-fable-5-1', source_effort: '*', openai_model: 'base', reasoning_effort: 'follow'}],
@@ -75,7 +82,12 @@ const api = async (path, options) => {
                    model: 'override', effort: 'high', claude_effort: null, configured_claude_effort: 'max', note: 'override; not supported by this model'}] };
 };
 '''
-    result = subprocess.run(["node", "-"], input=harness + source[start:end] + checks,
+    lang_start = source.index("async function setLanguage(")
+    lang_end = source.index("\n}\n", lang_start) + 3
+    locales = {p.stem: json.loads(p.read_text()) for p in
+               (Path(__file__).parents[1] / "claude_unlimited/locales").glob("*.json")}
+    harness += "\nconst locales = " + json.dumps(locales) + ";\n"
+    result = subprocess.run(["node", "-"], input=harness + source[lang_start:lang_end] + source[start:end] + checks,
                             text=True, capture_output=True)
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -262,4 +274,57 @@ def test_grid_distinguishes_suppressed_claude_effort_from_unset():
   assert.ok(html.includes('<td>settings.parity.leave_requested</td>'));
   assert.ok(html.includes('<td><s>max</s> settings.parity.not_injected</td>'));
 })().catch(e => { console.error(e); process.exitCode = 1; });
+''')
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='node unavailable')
+def test_locale_switch_rerenders_cached_grid_without_losing_edits_or_refetching():
+    _run_editor(r'''
+(async () => {
+  await loadParityGrid();
+  _parityGridData.push({..._parityGridData[0], effort: 'none', note: 'clamped to high; no base row (fallback)'});
+  _parityRows = [{claude_model: 'unsaved', model: 'custom', effort: 'max'}];
+  const edits = JSON.stringify(_parityRows);
+  for (const lang of ['en', 'de', 'es', 'ro']) {
+    await setLanguage(lang, {persist: false});
+    const html = document.getElementById('parityGridRows').innerHTML;
+    for (const key of ['absent', 'leave_requested', 'any', 'note_override', 'note_follows',
+                       'not_injected', 'note_unsupported', 'note_no_base', 'effort_none']) {
+      assert.ok(html.includes(esc(locales[lang][`settings.parity.${key}`])), `${lang}: ${key}`);
+    }
+    assert.ok(html.includes(esc(locales[lang]['settings.parity.note_clamped'].replace('{effort}', 'high'))));
+    assert.equal(JSON.stringify(_parityRows), edits);
+  }
+  assert.equal(calls.filter(path => path === '/api/model-parity/grid').length, 1);
+  assert.equal(patches.length, 0);
+  _parityGridData = null;
+  _parityGridFailed = true;
+  await setLanguage('de', {persist: false});
+  assert.ok(document.getElementById('parityGridRows').innerHTML.includes(locales.de['settings.parity.grid_failed']));
+  elements.delete('parityGridRows');
+  await setLanguage('en', {persist: false}); // Safe before the grid exists.
+})().catch(e => {console.error(e); process.exitCode = 1;});
+''')
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='node unavailable')
+def test_curated_reference_uses_api_values_and_fixed_hint_tracks_selection():
+    _run_editor(r'''
+_parityMeta.curated_defaults = [{claude_model: 'claude-fable-5-1', model: '<reference-from-api>', effort: 'medium'}];
+renderParityCuratedDefaults();
+assert.ok(document.getElementById('parityCuratedRows').innerHTML.includes('&lt;reference-from-api>'));
+assert.ok(document.getElementById('parityCuratedRows').innerHTML.includes('<td>Fable</td>'));
+_parityRows = [{claude_model: 'claude-fable-5-1', model: 'base', effort: 'follow'}];
+for (const lang of ['en', 'de', 'es', 'ro']) {
+  _strings = locales[lang];
+  renderParityRows();
+  const follow = _codexEffortOptions()[0];
+  assert.equal(follow.label, locales[lang]['settings.parity.follow']);
+  assert.equal(follow.title, locales[lang]['settings.parity.follow_hint']);
+  assert.ok(!document.getElementById('parityRows').innerHTML.includes(locales[lang]['settings.parity.fixed_hint']));
+  callbacks.get(document.getElementById('parity_effort_0')).callback('high');
+  assert.ok(document.getElementById('parityRows').innerHTML.includes(locales[lang]['settings.parity.fixed_hint']));
+  callbacks.get(document.getElementById('parity_effort_0')).callback('follow');
+  assert.ok(!document.getElementById('parityRows').innerHTML.includes(locales[lang]['settings.parity.fixed_hint']));
+}
 ''')

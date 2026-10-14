@@ -290,9 +290,9 @@ def test_normalize_parity_migrates_a_legacy_dict_to_the_default_rows_plus_extras
     assert by_id["claude-zenith-6"]["model"] == "gpt-5.6-sol"
 
 
-def test_normalize_parity_empty_shapes_yield_the_defaults():
+def test_normalize_parity_empty_shapes_keep_legacy_catalogue_heads():
     cat = make_catalogue()
-    defaults = [r["claude_model"] for r in default_parity_rows(cat)]
+    defaults = ["claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"]
     for empty in (None, {}, []):
         assert [r["claude_model"] for r in normalize_parity(empty, cat)] == defaults
 
@@ -304,13 +304,13 @@ def test_normalize_parity_fills_missing_fields_in_a_list_row():
                      "effort": "high", "claude_effort": None}]
 
 
-def test_default_rows_pick_the_newest_version_of_each_family_not_the_priciest():
+def test_legacy_rows_pick_the_newest_version_of_each_family_not_the_priciest():
     # LiteLLM sometimes prices an older point release above the flagship; the
-    # default parity row for a family must still be the newest version.
+    # legacy parity row for a family must still be the newest version.
     cat = make_catalogue(extra={
         "claude-sonnet-4-6": entry("anthropic", 3e-05),  # priced ABOVE sonnet-5 (1e-05)
     })
-    heads = {r["claude_model"] for r in default_parity_rows(cat)}
+    heads = {r["claude_model"] for r in normalize_parity(None, cat)}
     assert "claude-sonnet-5" in heads       # newest wins
     assert "claude-sonnet-4-6" not in heads  # not the prilier older one
 

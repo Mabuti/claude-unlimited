@@ -405,9 +405,9 @@ not copy it to the Claude side or inject a Claude effort.
   that catalogue with no recognized base or family. Per-profile Codex overrides win.
 - **First launch with no config → Follow; Reset → Follow; import never writes Follow defaults.**
   First launch with no `config.json` seeds explicit
-  follow default rows for the four family heads: `claude-fable-5-1`, `claude-opus-5-5`,
-  `claude-sonnet-5`, and `claude-haiku-4-5` in the bundled catalogue, also used when no
-  live catalogue is loaded. Follow rows match via base id or family: for example,
+  follow default rows for the four native tiers: `claude-fable-5-1`, `claude-opus-5-5`,
+  `claude-sonnet-5`, and `claude-haiku-4-5`, even when catalogue filtering removes
+  a tier or no live catalogue is loaded. Follow rows match via base id or family: for example,
   `claude-fable-5-1-20260101` matches the `claude-fable-5-1` Follow row through its
   base id and follows incoming effort. Two curated cases differ: **a Follow row with
   no effort sent** uses the model's curated effort; **no matching row at all**, such

@@ -4,7 +4,7 @@ Model NAMES come from model_catalogue.current()
 when the daemon has initialized it (LiteLLM via GitHub's API, with disk
 cache and a vendored snapshot behind it); the literals below survive as the
 legacy fallback when no catalogue is loaded, and as the CURATED tier decisions.
-Fresh/Reset defaults read the vendored snapshot if no catalogue is loaded.
+Fresh/Reset defaults always include Claude Code's four native tier ids.
 
 The tiering is best-effort, matched by price/role parity between the Codex
 model catalog and Anthropic's published pricing; neither vendor documents an
@@ -31,7 +31,6 @@ so legacy reads that never initialize run entirely on the literals.
 
 from __future__ import annotations
 
-import json
 import re
 
 from dataclasses import dataclass
@@ -247,22 +246,30 @@ def _curated_fallback(requested_claude_model: Optional[str],
     return _DEFAULT_TARGET
 
 
+CLAUDE_TIER_IDS = {
+    "FABLE": "claude-fable-5-1",
+    "OPUS": "claude-opus-5-5",
+    "SONNET": "claude-sonnet-5",
+    "HAIKU": "claude-haiku-4-5",
+}
+
+
+def curated_tier_rows() -> list[dict]:
+    """Native picker ids with curated targets, independent of catalogue expiry."""
+    return [{"claude_model": CLAUDE_TIER_IDS[family.removeprefix("claude-").upper()],
+             "model": target.model, "effort": target.reasoning_effort,
+             "claude_effort": None}
+            for family, target in _FAMILY_FALLBACKS]
+
+
 def default_parity_rows(catalogue: Optional[Catalogue] = None) -> list[dict]:
-    """The parity list a fresh install (or a Reset) starts from: one row per
-    family in _DEFAULT_FAMILIES, each the highest-ranked model of that family
-    with its curated Codex target and explicit follow effort. Legacy empty
-    settings instead use concrete curated efforts in normalize_parity().
-    With the vendored catalogue this is exactly
-    claude-fable-5-1 / claude-opus-5-5 / claude-sonnet-5 / claude-haiku-4-5 —
-    the same ids cli.py's _MODEL_TIER_IDS use, so the /model picker relabels
-    the native tiers instead of duplicating them. Before catalogue startup,
-    read only the vendored snapshot, without initializing shared state or
-    reading the app cache. Unavailable snapshot -> legacy literal ids."""
-    cat = _catalogue_or_current(catalogue)
-    if cat is None:
-        cat = model_catalogue.load(source=lambda: json.loads(
-            model_catalogue._VENDORED_FILE.read_text(encoding="utf-8")))
-    return [dict(row, effort="follow") for row in _curated_parity_rows(cat)]
+    """Fresh/Reset rows always match the four native Claude Code picker ids.
+
+    Catalogue filtering must not remove a tier or change its curated target.
+    Keep the optional catalogue argument for callers; legacy normalization
+    continues to use the catalogue independently.
+    """
+    return [dict(row, effort="follow") for row in curated_tier_rows()]
 
 
 def _curated_parity_rows(cat: Optional[Catalogue]) -> list[dict]:

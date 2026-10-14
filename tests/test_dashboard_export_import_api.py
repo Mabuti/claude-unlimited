@@ -144,3 +144,46 @@ def test_import_preview_wrong_passphrase(running_server):
                                 {"bundle": json.dumps(bundle), "passphrase": "wrong-pass"}, headers)
     assert status == 401
     assert payload["error"] == "wrong_passphrase"
+
+
+@pytest.mark.parametrize('change', ['changed', 'same', 'omitted', 'disabled', 'invalid'])
+def test_import_invalidates_both_substitution_caches_only_when_parity_changes(running_server, monkeypatch, change):
+    from claude_unlimited import config, openai_bridge as bridge
+    base, csrf = running_server
+    initial = [{'claude_model': 'claude-fable-5-1', 'model': 'gpt-5.6-terra', 'effort': 'high'}]
+    desired = [{'claude_model': 'claude-fable-5-1', 'model': 'gpt-5.6-sol', 'effort': 'max'}]
+    config.update_settings(model_parity=initial)
+    model_cache = {'gpt-5.6-sol': 'gpt-5.6-terra'}
+    effort_cache = {('fixture.invalid', 'gpt-5.6-sol', 'max'): 'high'}
+    monkeypatch.setattr(bridge, '_MODEL_SUBSTITUTIONS', model_cache.copy())
+    monkeypatch.setattr(bridge, '_EFFORT_SUBSTITUTIONS', effort_cache.copy())
+    settings = {'model_parity': desired}
+    if change == 'same':
+        settings['model_parity'] = initial
+    elif change == 'omitted':
+        settings = {'language': 'de'}
+    elif change == 'invalid':
+        settings['model_parity'] = [{'claude_model': 'claude-fable-5-1', 'source_effort': 'max'}]
+    bundle = json.dumps({'bundle_version': export_import.BUNDLE_VERSION, 'encrypted': False,
+                         'data': {'settings': settings}})
+    status, _ = _request(f'{base}/api/import/apply', 'POST',
+                         {'bundle': bundle, 'import_settings': change != 'disabled'},
+                         {'X-CSRF-Token': csrf})
+    assert status == (400 if change == 'invalid' else 200)
+    assert config.load_pool().settings.model_parity == (desired if change == 'changed' else initial)
+    assert bridge._MODEL_SUBSTITUTIONS == ({} if change == 'changed' else model_cache)
+    assert bridge._EFFORT_SUBSTITUTIONS == ({} if change == 'changed' else effort_cache)
+
+
+def test_model_map_serves_curated_reference_even_with_custom_saved_rows(running_server):
+    from claude_unlimited import config
+    base, _ = running_server
+    config.update_settings(model_parity=[{'claude_model': 'claude-custom', 'model': 'custom', 'effort': 'max'}])
+    status, data = _request(f'{base}/api/codex/model-map')
+    assert status == 200
+    assert [(r['claude_model'], r['model'], r['effort']) for r in data['curated_defaults']] == [
+        ('claude-fable-5-1', 'gpt-5.6-sol', 'medium'),
+        ('claude-opus-5-5', 'gpt-5.6-terra', 'high'),
+        ('claude-sonnet-5', 'gpt-5.6-terra', 'medium'),
+        ('claude-haiku-4-5', 'gpt-5.6-luna', 'low'),
+    ]

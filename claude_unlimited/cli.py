@@ -40,6 +40,7 @@ from . import updater
 from . import profiles as profile_repo
 from .config import CLAUDE_ACCOUNTS_DIR, CODEX_ACCOUNTS_DIR, DEFAULT_SWITCH_THRESHOLD, ensure_app_dir, load_pool, launch_argv, resolve_port
 from .daemon import DEFAULT_PORT, LOOPBACK_HOST, run_foreground
+from .openai_models import CLAUDE_TIER_IDS
 from .router import APPROACHING_THRESHOLD_BAND
 
 # The escalation ladder for stopping a process. SIGKILL is Unix-only — even
@@ -612,12 +613,8 @@ def _prompt_profile_choice(profiles: list, live: Optional[list] = None):
 # opus->claude-opus-5-5, sonnet->claude-sonnet-5, haiku->claude-haiku-4-5. This
 # is upstream-coupled — see the "Claude Code upstream watch" note; a Claude
 # Code release that moves a tier default can reintroduce the duplicate.
-_MODEL_TIER_IDS = {
-    "FABLE": "claude-fable-5-1",
-    "OPUS": "claude-opus-5-5[1m]",
-    "SONNET": "claude-sonnet-5[1m]",
-    "HAIKU": "claude-haiku-4-5",
-}
+_MODEL_TIER_IDS = {tier: model + ("[1m]" if tier in ("OPUS", "SONNET") else "")
+                   for tier, model in CLAUDE_TIER_IDS.items()}
 
 # Each tier's family prefix — a saved parity row is matched to a tier by family
 # (not exact id), so a row saved with a dated or point-release id still labels

@@ -449,10 +449,11 @@ at read time, with no rewrite and no following of incoming effort: one fixed eff
 per family head. Legacy sparse dicts overlay those concrete defaults; explicit saved
 rows preserve their behavior.
 First launch with no config → Follow; Reset → Follow; import never writes Follow
-defaults. Loading a missing `config.json` seeds an explicit follow default list. With the bundled
-catalogue its four ids are `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5`, and
-`claude-haiku-4-5`; fresh/Reset seeding reads this snapshot when no live catalogue is
-loaded. Follow rows match via base id or family: `claude-fable-5-1-20260101` matches
+defaults. Loading a missing `config.json` seeds an explicit follow default list.
+Its four native tier ids are `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5`, and
+`claude-haiku-4-5`, shared with the CLI picker. Catalogue expiry or missing families
+cannot remove a fresh/Reset tier. Follow rows match via base id or family:
+`claude-fable-5-1-20260101` matches
 the `claude-fable-5-1` Follow row through its base id and follows incoming effort.
 The two curated cases are distinct: a Follow row with no effort sent uses the model's
 curated effort; no matching row at all, such as `claude-mythos-5-1`, uses a fixed
@@ -461,7 +462,9 @@ Saving never converts empty parity into follow. Importing missing, `null`, `{}`,
 `[]` parity on a new machine materializes concrete legacy curated rows. Explicit
 empty/null parity does the same on an existing config. An import without the key leaves
 the parity table alone in an existing config. Config existence is checked before
-profile imports, which can create the file.
+profile imports, which can create the file. Profiles-only imports also seed concrete
+legacy rows before their first save on a fresh machine, even when settings are skipped.
+A successful import that changes parity clears both learned model and effort substitutions.
 Reset confirms all changed/disappearing Claude ids with their old/new Codex models
 and efforts, including Claude effort or Leave as requested, then writes the explicit
 follow list, never an empty list.

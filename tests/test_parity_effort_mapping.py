@@ -396,3 +396,77 @@ def test_grid_missing_base_uses_curated_fallback():
             assert cell["note"] == "no base row (fallback)"
             assert cell["row_index"] is None
             assert cell["source_effort"] is None
+
+
+@pytest.mark.parametrize('day', ['2026-10-14', '2026-10-16'])
+@pytest.mark.parametrize('loaded', [False, True])
+@pytest.mark.parametrize('action', ['fresh', 'reset'])
+def test_native_tier_seeds_survive_catalogue_deprecation(day, loaded, action, monkeypatch):
+    from datetime import date
+    from claude_unlimited import cli, model_catalogue as catalogue
+
+    class Today(date):
+        @classmethod
+        def today(cls):
+            return cls.fromisoformat(day)
+
+    monkeypatch.setattr(catalogue, 'date', Today)
+    cat = catalogue.parse(json.loads(catalogue._VENDORED_FILE.read_text()), today=Today.today())
+    monkeypatch.setattr(catalogue, 'current', lambda: cat if loaded else None)
+    if day == '2026-10-16':
+        assert not any('haiku' in m.id for m in cat.anthropic)
+    if action == 'fresh':
+        assert not config.CONFIG_FILE.exists()
+        config.save_pool(config.load_pool())
+    else:
+        config.CONFIG_FILE.write_text(json.dumps({'settings': {'model_parity': LEGACY_ROWS}}))
+        config.update_settings(model_parity=models.default_parity_rows())
+    saved = config.load_pool().settings.model_parity
+    assert [r['claude_model'] for r in saved] == [v.removesuffix('[1m]') for v in cli._MODEL_TIER_IDS.values()]
+    assert [r['claude_model'] for r in saved] == DOCUMENTED_DEFAULT_IDS
+    assert [r['model'] for r in saved] == ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-terra', 'gpt-5.6-luna']
+    assert all(r['effort'] == 'follow' for r in saved)
+    assert models.default_parity_rows(cat) == models.normalize_parity(saved, cat)
+
+
+@pytest.mark.parametrize('day', ['2026-10-14', '2026-10-16'])
+@pytest.mark.parametrize('loaded', [False, True])
+def test_legacy_empty_rows_still_pin_ad6ef5f_across_deprecation(day, loaded, monkeypatch):
+    from datetime import date
+    from claude_unlimited import model_catalogue as catalogue
+    cat = catalogue.parse(json.loads(catalogue._VENDORED_FILE.read_text()), today=date.fromisoformat(day))
+    monkeypatch.setattr(catalogue, 'current', lambda: cat if loaded else None)
+    expected = LEGACY_EMPTY_ROWS
+    if loaded:
+        expected = [dict(r, claude_model=model) for r, model in zip(LEGACY_EMPTY_ROWS, DOCUMENTED_DEFAULT_IDS)]
+        if day == '2026-10-16':
+            expected = expected[:3]
+    assert models.normalize_parity(None) == expected
+
+
+@pytest.mark.parametrize('settings, import_settings', [(None, True), ({'model_parity': LEGACY_ROWS}, False)])
+@pytest.mark.parametrize('existing', [None, {}, LEGACY_ROWS])
+def test_profiles_only_import_never_seeds_follow(settings, import_settings, existing, monkeypatch):
+    from claude_unlimited import export_import as ei
+    monkeypatch.setattr(models.model_catalogue, 'current', lambda: None)
+    monkeypatch.setattr(ei.activity_module, 'record', lambda *a, **kw: None)
+    monkeypatch.setattr(ei.secret_store, 'set_token', lambda *a: None)
+    if existing is not None:
+        config.CONFIG_FILE.write_text(json.dumps({'settings': {'model_parity': existing}}))
+    saved_tables = []
+    save = ei.save_pool
+
+    def capture(pool):
+        saved_tables.append(pool.settings.model_parity)
+        save(pool)
+
+    monkeypatch.setattr(ei, 'save_pool', capture)
+    parsed = ei.ParsedBundle(
+        profiles=[{'name': 'Fixture', 'kind': 'api', 'credential': 'fixture'}],
+        settings=settings, activity=None)
+    result = ei.apply_import(parsed, import_profiles=True, import_settings=import_settings)
+    assert result['profiles_added'] == 1
+    assert result['settings_applied'] is False
+    expected = LEGACY_EMPTY_ROWS if existing is None else existing
+    assert saved_tables == [expected]
+    assert config.load_pool().settings.model_parity == expected

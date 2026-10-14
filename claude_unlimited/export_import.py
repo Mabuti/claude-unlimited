@@ -250,13 +250,11 @@ def apply_import(
     if conflict_strategy not in ("keep_existing", "use_imported"):
         raise ExportImportError(f"Unknown conflict_strategy {conflict_strategy!r}.")
 
+    from .config import CONFIG_FILE, Settings, validated_settings_changes
+
+    config_existed = CONFIG_FILE.exists()
     incoming = None
     if import_settings and parsed.settings is not None:
-        from .config import CONFIG_FILE, Settings, validated_settings_changes
-
-        # Profile imports below can create this file before settings are merged.
-        config_existed = CONFIG_FILE.exists()
-
         # Validate all settings before any profile or credential writes.
         # A bundle is a file from somewhere else, and settings carry
         # decisions with real consequences — model_parity
@@ -276,6 +274,22 @@ def apply_import(
             from .openai_models import normalize_parity
             incoming["model_parity"] = normalize_parity(None)
         incoming = validated_settings_changes(incoming)
+
+    parity_changed = False
+
+    def load_import_pool():
+        # Called under CONFIG_LOCK before each save. Profile-only imports
+        # must not persist load_pool()'s fresh-launch Follow defaults either.
+        nonlocal parity_changed
+        missing = not CONFIG_FILE.exists()
+        pool = load_pool()
+        if missing:
+            from .openai_models import normalize_parity
+            parity = (incoming["model_parity"] if incoming and "model_parity" in incoming
+                      else normalize_parity(None))
+            pool.settings = replace(pool.settings, model_parity=parity)
+            parity_changed = True
+        return pool
 
     result = {
         "profiles_added": 0, "profiles_updated": 0, "profiles_skipped": 0,
@@ -421,7 +435,7 @@ def apply_import(
                 # just the stored token.
                 secret_store.set_token(existing.id, item["credential"])
                 with CONFIG_LOCK:
-                    pool = load_pool()
+                    pool = load_import_pool()
                     updated = replace(
                         existing, name=item["name"], base_url=item.get("base_url"),
                         auth_mode=item.get("auth_mode", "api_key"), priority=item.get("priority", 1),
@@ -465,7 +479,7 @@ def apply_import(
             )
             secret_store.set_token(new_profile.id, item["credential"])
             with CONFIG_LOCK:
-                pool = load_pool()
+                pool = load_import_pool()
                 pool.profiles.append(new_profile)
                 # A bundle can bring a forced-subagent Profile into a pool
                 # that already has one; the holder already routing (earlier
@@ -477,7 +491,7 @@ def apply_import(
 
     if incoming is not None:
         with CONFIG_LOCK:
-            pool = load_pool()
+            pool = load_import_pool()
             # Merged onto the current settings, not built fresh from the
             # bundle. Settings(**incoming) reverted every field the bundle did
             # not mention back to its dataclass default — and a bundle exported
@@ -486,9 +500,15 @@ def apply_import(
             # notification preferences of whoever imported it. This is also
             # what update_settings() does, and the two should not disagree
             # about what writing settings means.
+            previous_parity = pool.settings.model_parity
             pool.settings = replace(pool.settings, **incoming)
             save_pool(pool)
+            parity_changed |= pool.settings.model_parity != previous_parity
         result["settings_applied"] = True
+
+    if parity_changed:
+        from .openai_bridge import forget_model_substitutions
+        forget_model_substitutions()
 
     activity_module.record("config", "Imported an export bundle", meta=str(result))
     return result

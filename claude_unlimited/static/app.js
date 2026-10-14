@@ -197,6 +197,8 @@ async function setLanguage(code, { persist } = { persist: true }) {
   applyTranslations();
   renderNotifList();
   renderLauncherRows();
+  renderParityRows();
+  renderParityGrid();
   const updateModeSelect = document.getElementById('updateModeSelect');
   if (updateModeSelect && updateModeSelect._cuRenderValue) {
     updateModeSelect._cuOptions = UPDATE_MODE_OPTIONS();
@@ -2854,7 +2856,7 @@ function closeAllSelectPops() {
 }
 
 function setupSelectInput(el, options, onChange) {
-  // options: [{value, label}]. Reads/writes el.dataset.value; the caller owns
+  // options: [{value, label, title?}]. Reads/writes el.dataset.value; the caller owns
   // persistence via onChange. Reads el._cuOptions rather than the `options`
   // parameter so a later reassignment (e.g. re-translated labels after a
   // language change) is honored instead of closing over a stale array.
@@ -2876,7 +2878,7 @@ function setupSelectInput(el, options, onChange) {
     el.classList.add('open');
     const pop = document.createElement('div');
     pop.className = 'select-pop';
-    pop.innerHTML = el._cuOptions.map((o) => `<div class="select-pop-item ${o.value === el.dataset.value ? 'sel' : ''}" data-value="${esc(o.value)}">${esc(o.label)}</div>`).join('');
+    pop.innerHTML = el._cuOptions.map((o) => `<div class="select-pop-item ${o.value === el.dataset.value ? 'sel' : ''}" data-value="${esc(o.value)}"${o.title ? ` title="${esc(o.title)}"` : ''}>${esc(o.label)}</div>`).join('');
     // Appended to <body> as position:fixed rather than nested inside `el`:
     // a trigger inside an overflow:hidden card (.section, .table) would
     // otherwise have its popup clipped by that ancestor.
@@ -4589,7 +4591,9 @@ function updateCodexModelHelp(prefix) {
 let _parityRows = [];   // working list: {claude_model, source_effort, model, effort, claude_effort}
 const _PARITY_ROW_LIMIT = 64;
 let _paritySavedRows = [];
-let _parityMeta = { defaults: [], claude_selectable: [], claude_efforts: [] };
+let _parityMeta = { defaults: [], curated_defaults: [], claude_selectable: [], claude_efforts: [] };
+let _parityGridData = null;
+let _parityGridFailed = false;
 
 function _claudeModelOptionsFor(current) {
   const opts = _parityMeta.claude_selectable.map((m) => ({ value: m.id, label: m.label }));
@@ -4602,7 +4606,7 @@ function _codexModelOptionsFor(current) {
   return opts;
 }
 function _codexEffortOptions() {
-  return [{ value: 'follow', label: t('settings.parity.follow') },
+  return [{ value: 'follow', label: t('settings.parity.follow'), title: t('settings.parity.follow_hint') },
           ..._reasoningEfforts.map((e) => ({ value: e, label: codexEffortLabel(e) }))];
 }
 
@@ -4632,7 +4636,7 @@ const _CHEVRON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" str
 function renderParityRows() {
   const body = document.getElementById('parityRows');
   if (!body) return;
-  const sel = (id, val) => `<div class="select-input" id="${id}" data-value="${esc(val || '')}"><span class="select-value"></span>${_CHEVRON}</div>`;
+  const sel = (id, val, title = '') => `<div class="select-input" id="${id}" data-value="${esc(val || '')}"${title ? ` title="${esc(title)}"` : ''}><span class="select-value"></span>${_CHEVRON}</div>`;
   const groups = new Map();
   _parityRows.forEach((r, i) => {
     const key = r.claude_model || i;
@@ -4649,7 +4653,7 @@ function renderParityRows() {
         <td>${i === base ? esc(t('settings.parity.any')) : sel(`parity_source_${i}`, r.source_effort)}</td>
         <td aria-hidden="true">→</td>
         <td>${sel(`parity_model_${i}`, r.model)}</td>
-        <td>${sel(`parity_effort_${i}`, r.effort)}</td>
+        <td>${sel(`parity_effort_${i}`, r.effort, r.effort === 'follow' ? t('settings.parity.follow_hint') : '')}${r.effort && r.effort !== 'follow' ? `<small class="field-sub" style="display:block">${esc(t('settings.parity.fixed_hint'))}</small>` : ''}</td>
         <td>${sel(`parity_ceffort_${i}`, r.claude_effort || '')}</td>
         <td><button class="parity-del" data-row="${i}" title="${esc(t('settings.parity.delete_row'))}" aria-label="${esc(t('settings.parity.delete_row'))}">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6M14 11v6"/></svg>
@@ -4674,7 +4678,7 @@ function renderParityRows() {
     }
     setupSelectInput(document.getElementById(`parity_ceffort_${i}`), _claudeEffortOptions(), (v) => { r.claude_effort = v || null; });
     setupSelectInput(document.getElementById(`parity_model_${i}`), _codexModelOptionsFor(r.model), (v) => { r.model = v; });
-    setupSelectInput(document.getElementById(`parity_effort_${i}`), _codexEffortOptions(), (v) => { r.effort = v; });
+    setupSelectInput(document.getElementById(`parity_effort_${i}`), _codexEffortOptions(), (v) => { r.effort = v; renderParityRows(); });
   });
   body.querySelectorAll('.parity-del').forEach((btn) => {
     btn.addEventListener('click', () => onDeleteParityRow(Number(btn.dataset.row)));
@@ -4709,28 +4713,52 @@ function onDeleteParityRow(i) {
   renderParityRows();
 }
 
+function renderParityGrid() {
+  const body = document.getElementById('parityGridRows');
+  if (!body) return;
+  if (_parityGridFailed) {
+    body.innerHTML = `<tr><td colspan="8">${esc(t('settings.parity.grid_failed'))}</td></tr>`;
+    return;
+  }
+  if (_parityGridData === null) return;
+  const noteLabel = (note) => note.split('; ').filter(Boolean).map((part) => {
+    if (part.startsWith('clamped to ')) return t('settings.parity.note_clamped').replace('{effort}', part.slice(11));
+    const keys = { follows: 'note_follows', override: 'note_override', 'not supported by this model': 'note_unsupported', 'no base row (fallback)': 'note_no_base' };
+    return keys[part] ? t(`settings.parity.${keys[part]}`) : part;
+  }).join('; ');
+  body.innerHTML = _parityGridData.map((r) => `<tr>
+    <td>${esc(r.claude_model)}</td><td>${esc(r.requested_effort || t('settings.parity.absent'))}</td>
+    <td>→</td><td>${esc(r.model)}</td><td>${esc(codexEffortLabel(r.effort))}</td>
+    <td>${r.configured_claude_effort && !r.claude_effort
+      ? `<s>${esc(r.configured_claude_effort)}</s> ${esc(t('settings.parity.not_injected'))}`
+      : esc(r.claude_effort || t('settings.parity.leave_requested'))}</td>
+    <td>${esc((r.source_effort || '*') === '*' ? t('settings.parity.any')
+      : `${t('settings.parity.note_override')}: ${r.source_effort}`)}</td><td>${esc(noteLabel(r.note))}</td>
+  </tr>`).join('');
+}
+
 async function loadParityGrid() {
   const body = document.getElementById('parityGridRows');
+  if (!body) return;
   body.innerHTML = '';
+  _parityGridData = null;
+  _parityGridFailed = false;
   try {
     const data = await api('/api/model-parity/grid');
-    const noteLabel = (note) => note.split('; ').filter(Boolean).map((part) => {
-      if (part.startsWith('clamped to ')) return t('settings.parity.note_clamped').replace('{effort}', part.slice(11));
-      const keys = { follows: 'note_follows', override: 'note_override', 'not supported by this model': 'note_unsupported', 'no base row (fallback)': 'note_no_base' };
-      return keys[part] ? t(`settings.parity.${keys[part]}`) : part;
-    }).join('; ');
-    body.innerHTML = data.grid.map((r) => `<tr>
-      <td>${esc(r.claude_model)}</td><td>${esc(r.requested_effort || t('settings.parity.absent'))}</td>
-      <td>→</td><td>${esc(r.model)}</td><td>${esc(codexEffortLabel(r.effort))}</td>
-      <td>${r.configured_claude_effort && !r.claude_effort
-        ? `<s>${esc(r.configured_claude_effort)}</s> ${esc(t('settings.parity.not_injected'))}`
-        : esc(r.claude_effort || t('settings.parity.leave_requested'))}</td>
-      <td>${esc((r.source_effort || '*') === '*' ? t('settings.parity.any')
-        : `${t('settings.parity.note_override')}: ${r.source_effort}`)}</td><td>${esc(noteLabel(r.note))}</td>
-    </tr>`).join('');
+    _parityGridData = data.grid;
   } catch (e) {
-    body.innerHTML = `<tr><td colspan="8">${esc(t('settings.parity.grid_failed'))}</td></tr>`;
+    _parityGridFailed = true;
   }
+  renderParityGrid();
+}
+
+function renderParityCuratedDefaults() {
+  const body = document.getElementById('parityCuratedRows');
+  if (!body) return;
+  body.innerHTML = _parityMeta.curated_defaults.map((r) => {
+    const family = r.claude_model.split('-')[1];
+    return `<tr><td>${esc(family[0].toUpperCase() + family.slice(1))}</td><td>${esc(r.model)}</td><td>${esc(r.effort)}</td></tr>`;
+  }).join('');
 }
 
 // Strip a trailing date stamp, matching the server's base_id() — so a saved
@@ -4808,6 +4836,7 @@ async function loadModelParity() {
   _reasoningEfforts = data.reasoning_efforts || _reasoningEfforts;
   _parityMeta = {
     defaults: data.defaults || [],
+    curated_defaults: data.curated_defaults || [],
     claude_selectable: data.claude_selectable_models || [],
     claude_efforts: data.claude_efforts || [],
   };
@@ -4820,6 +4849,7 @@ async function loadModelParity() {
   _codexMappingRows = null;
   refreshCodexSelectOptions();
   section.style.display = '';
+  renderParityCuratedDefaults();
   renderParityRows();
   renderParityBanner();
   await loadParityGrid();

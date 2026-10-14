@@ -782,6 +782,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 "reasoning_efforts": list(openai_models.VALID_REASONING_EFFORTS),     # Codex side
                 "claude_efforts": list(openai_models.CLAUDE_REASONING_EFFORTS),       # Claude side
                 "defaults": openai_models.default_parity_rows(),  # for [+] prefill / Reset preview
+                "curated_defaults": openai_models.curated_tier_rows(),  # absent-effort reference
                 # Claude models the catalogue knows but the saved list does
                 # not offer — the "a new model shipped, decide what it costs
                 # you" signal the Dashboard raises a banner for.
