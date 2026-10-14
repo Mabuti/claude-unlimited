@@ -654,15 +654,11 @@ def _validated_model_parity(raw):
     if len(raw) > 64:
         raise ValueError("model_parity has too many entries")
     cleaned: dict = {}
-    seen_ids: set = set()
     for claude_id, row in raw.items():
         if not isinstance(claude_id, str) or not claude_id.strip():
             raise ValueError("model_parity keys must be non-empty model ids")
         if not isinstance(row, dict):
             raise ValueError(f"model_parity[{claude_id}] must be an object")
-        if claude_id.strip() in seen_ids:
-            raise ValueError(f"model_parity has a duplicate Claude model: {claude_id}")
-        seen_ids.add(claude_id.strip())
         entry = _validated_model_row_fields(f"model_parity[{claude_id}]", row, {})
         if entry:
             cleaned[claude_id.strip()] = entry

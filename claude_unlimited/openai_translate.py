@@ -520,6 +520,9 @@ class ResponseTranslator:
                     return block
             # An explicit identity is authoritative, including an unknown one.
             # The provider may reuse output_index after closing a call.
+            _warn_tool_arguments_rate_limited(
+                _ToolBlock(-1, "", item_id, output_index, events={event["type"]}),
+                "ignoring tool arguments for an unknown item")
             return None
         if output_index is not None:
             for block in self._tool_blocks.values():

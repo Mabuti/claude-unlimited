@@ -4633,7 +4633,7 @@ function renderParityRows() {
   const sel = (id, val) => `<div class="select-input" id="${id}" data-value="${esc(val || '')}"><span class="select-value"></span>${_CHEVRON}</div>`;
   const groups = new Map();
   _parityRows.forEach((r, i) => {
-    const key = r.claude_model;
+    const key = r.claude_model || i;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(i);
   });
@@ -4661,7 +4661,7 @@ function renderParityRows() {
         o.value === r.claude_model || !groups.has(o.value));
       setupSelectInput(document.getElementById(`parity_claude_${i}`), options, (v) => {
         const old = r.claude_model;
-        _parityRows.forEach((row) => { if (row.claude_model === old) row.claude_model = v; });
+        _parityRows.forEach((row) => { if (row === r || (old && row.claude_model === old)) row.claude_model = v; });
         renderParityRows();
       });
     } else {
@@ -4680,6 +4680,9 @@ function renderParityRows() {
   body.querySelectorAll('.parity-override').forEach((btn) => {
     btn.addEventListener('click', () => onAddEffortOverride(Number(btn.dataset.row)));
   });
+  const add = document.getElementById('parityAddBtn');
+  add.disabled = !_nextParitySeed();
+  add.title = add.disabled ? `${t('settings.parity.add_row')}: ${t('stat.no_active')}` : '';
 }
 
 function onAddEffortOverride(i) {
@@ -4694,7 +4697,7 @@ function onAddEffortOverride(i) {
 function onDeleteParityRow(i) {
   const row = _parityRows[i];
   const remaining = _parityRows.filter((r, j) => (row.source_effort || '*') === '*'
-    ? r.claude_model !== row.claude_model : j !== i);
+    && row.claude_model ? r.claude_model !== row.claude_model : j !== i);
   if (!remaining.length) { showToast('error', t('settings.parity.last_row'), ''); return; }
   _parityRows = remaining;
   renderParityRows();
@@ -4758,14 +4761,21 @@ function onAddMissingParityRows() {
   renderParityRows();
 }
 
-function onAddParityRow() {
+function _nextParitySeed() {
   const used = new Set(_parityRows.map((r) => _baseId(r.claude_model)));
   let seed = (_parityMeta.defaults || []).find((d) => !used.has(_baseId(d.claude_model)));
   if (!seed) {
     const claude = _parityMeta.claude_selectable.find((m) => !used.has(_baseId(m.id)));
-    seed = { claude_model: claude ? claude.id : '', model: (_selectableModels[0] || ''),
+    if (!claude) return null;
+    seed = { claude_model: claude.id, model: (_selectableModels[0] || ''),
              effort: 'follow', claude_effort: null };
   }
+  return seed;
+}
+
+function onAddParityRow() {
+  const seed = _nextParitySeed();
+  if (!seed) return;
   _parityRows.push({ claude_model: seed.claude_model, source_effort: '*', model: seed.model,
                      effort: seed.effort, claude_effort: seed.claude_effort || null });
   renderParityRows();

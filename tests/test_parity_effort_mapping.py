@@ -200,3 +200,19 @@ def test_dated_and_undated_groups_keep_their_own_effort_overrides(effort):
         assert models.map_model(model, parity=rows, requested_effort=effort).model == target
         assert models.claude_effort_for(model, rows, requested_effort=effort) == injection
     assert len(models.parity_grid(rows)) == 12
+
+
+@pytest.mark.parametrize("shape", ["dict", "list"])
+def test_whitespace_duplicate_keys_pin_ad6ef5f_results(shape):
+    raw = {"claude-opus-5": {"effort": "high"}, " claude-opus-5 ": {"effort": "low"}}
+    # Executed against ad6ef5f: dict strips keys with last non-empty entry
+    # winning; the equivalent list rejects duplicate Claude models.
+    if shape == "list":
+        with pytest.raises(ValueError, match="duplicate Claude model"):
+            config._validated_model_parity([dict(claude_model=k, **v) for k, v in raw.items()])
+        return
+    cleaned = config._validated_model_parity(raw)
+    assert cleaned == {"claude-opus-5": {"effort": "low"}}
+    target = [r for r in models.normalize_parity(cleaned) if r["claude_model"] == "claude-opus-5"]
+    assert target == [{"claude_model": "claude-opus-5", "model": "gpt-5.6-terra",
+                       "effort": "low", "claude_effort": None}]

@@ -643,7 +643,8 @@ def test_tool_arguments_reasoning_done_does_not_close_tool_call():
 
 
 @pytest.mark.parametrize("late_id", ["fc_0", "unknown"])
-def test_late_done_never_uses_reused_output_index(late_id):
+def test_late_done_never_uses_reused_output_index(late_id, monkeypatch, capsys):
+    monkeypatch.setattr(openai_translate, "_missing_arguments_warning_at", float("-inf"))
     first, second = '{"skill":"first"}', '{"skill":"second"}'
     added = _tool_item_event("added", number=1)
     added["output_index"] = 0
@@ -655,22 +656,28 @@ def test_late_done_never_uses_reused_output_index(late_id):
          "output_index": 0, "arguments": first},
         _argument_event("done", number=1, text=second), closed,
     ])
+    warning = capsys.readouterr().err
+    reason = "a closed" if late_id == "fc_0" else "an unknown"
+    assert f"ignoring tool arguments for {reason} item" in warning
+    assert first not in warning and second not in warning
     assert _tool_arguments(out) == {0: [first], 1: [second]}
     message = openai_translate.assemble_message_from_sse(iter(_sse(out)))
     assert [b["input"] for b in message["content"]] == [{"skill": "first"}, {"skill": "second"}]
 
 
-def test_closed_item_warning_is_rate_limited_without_argument_values(monkeypatch, capsys):
+@pytest.mark.parametrize("late_id, reason", [("fc_0", "a closed"), ("unknown", "an unknown")])
+def test_closed_or_unknown_item_warning_is_rate_limited_without_argument_values(late_id, reason, monkeypatch, capsys):
     now = [100.0]
     monkeypatch.setattr(openai_translate.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(openai_translate, "_missing_arguments_warning_at", float("-inf"))
     events = [_tool_item_event("added"), _tool_item_event("done", arguments='{}'),
               _argument_event("done", text='{"private":"must not be logged"}')]
+    events[-1]["item_id"] = late_id
     for _ in range(2):
         _tool_stream(events)
     warning = capsys.readouterr().err
     assert warning.count("WARNING") == 1
-    assert "closed item" in warning
+    assert f"ignoring tool arguments for {reason} item" in warning
     assert "private" not in warning and "must not be logged" not in warning
     now[0] += 60
     _tool_stream(events)

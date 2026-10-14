@@ -6,8 +6,7 @@ import subprocess
 import pytest
 
 
-@pytest.mark.skipif(not shutil.which("node"), reason="node unavailable")
-def test_effort_editor_groups_and_grid():
+def _run_editor(checks):
     source = (Path(__file__).parents[1] / "claude_unlimited/static/app.js").read_text()
     start = source.index("let _parityRows =")
     end = source.index("async function resetModelParity()", start)
@@ -17,13 +16,31 @@ def test_effort_editor_groups_and_grid():
 const assert = require('node:assert/strict');
 const elements = new Map();
 const callbacks = new Map();
-const document = { getElementById(id) {
-  if (!elements.has(id)) elements.set(id, { innerHTML: '', style: {}, querySelectorAll: () => [] });
-  return elements.get(id);
-}};
+function element() {
+  return { style: {}, dataset: {}, disabled: false, title: '', children: [],
+    querySelectorAll: () => [],
+    get innerHTML() { return this.html || ''; },
+    set innerHTML(html) {
+      this.children.forEach(id => elements.delete(id));
+      this.children = [];
+      this.html = html;
+      for (const match of html.matchAll(/\bid="([^"]+)"/g)) {
+        assert.ok(!elements.has(match[1]), `duplicate element: ${match[1]}`);
+        elements.set(match[1], element());
+        this.children.push(match[1]);
+      }
+    }
+  };
+}
+for (const id of ['parityRows', 'parityGridRows', 'parityAddBtn', 'modelParitySection',
+                  'parityNewBanner', 'parityNewBannerSub']) elements.set(id, element());
+const document = { getElementById: id => elements.get(id) || null };
 const esc = (v) => String(v).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;');
 const t = (key) => key;
-const setupSelectInput = (element, options, callback) => callbacks.set(element, { options, callback });
+const setupSelectInput = (element, options, callback) => {
+  assert.ok(element, 'cannot initialize a missing selector');
+  callbacks.set(element, { options, callback });
+};
 const showToast = () => {};
 const refreshCodexSelectOptions = () => {};
 let _selectableModels = ['base', 'override'];
@@ -41,6 +58,13 @@ const api = async (path, options) => {
                    model: 'base', effort: 'high', claude_effort: null, note: 'follows'}] };
 };
 '''
+    result = subprocess.run(["node", "-"], input=harness + source[start:end] + checks,
+                            text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node unavailable")
+def test_effort_editor_groups_and_grid():
     checks = r'''
 (async () => {
   _parityMeta.claude_efforts = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -87,6 +111,35 @@ const api = async (path, options) => {
   assert.ok(document.getElementById('parityGridRows').innerHTML.includes('settings.parity.leave_requested'));
 })().catch(e => { console.error(e); process.exitCode = 1; });
 '''
-    result = subprocess.run(["node", "-"], input=harness + source[start:end] + checks,
-                            text=True, capture_output=True)
-    assert result.returncode == 0, result.stdout + result.stderr
+    _run_editor(checks)
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node unavailable")
+def test_two_adds_at_catalogue_exhaustion_and_independent_blank_rows():
+    _run_editor(r"""
+_parityMeta.claude_selectable = [{id: 'claude-one', label: 'One'}, {id: 'claude-two', label: 'Two'}];
+_parityRows = [{claude_model: 'claude-one', model: 'base', effort: 'low'}];
+renderParityRows();
+const add = document.getElementById('parityAddBtn');
+assert.equal(add.disabled, false);
+onAddParityRow();
+onAddParityRow();
+assert.deepEqual(_parityRows.map(r => r.claude_model), ['claude-one', 'claude-two']);
+assert.equal(add.disabled, true);
+assert.ok(add.title);
+onDeleteParityRow(1);
+assert.equal(add.disabled, false);
+assert.equal(add.title, '');
+onAddParityRow();
+assert.equal(_parityRows.length, 2);
+_parityRows = [{claude_model: '', model: 'base'}, {claude_model: '', model: 'base'}];
+renderParityRows();
+assert.ok(document.getElementById('parity_claude_0'));
+assert.ok(document.getElementById('parity_claude_1'));
+callbacks.get(document.getElementById('parity_claude_0')).callback('claude-one');
+assert.deepEqual(_parityRows.map(r => r.claude_model), ['claude-one', '']);
+_parityRows.push({claude_model: '', model: 'base'});
+renderParityRows();
+onDeleteParityRow(1);
+assert.deepEqual(_parityRows.map(r => r.claude_model), ['claude-one', '']);
+""")
