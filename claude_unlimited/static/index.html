@@ -678,8 +678,9 @@
   .stats-empty { color: var(--text-faint); font-size: var(--fs-body); padding: 26px 0; text-align: center; }
   .parity-del:hover { background: var(--bad); color: #fff; border-color: var(--bad); }
   #parityAddBtn { background: var(--good-soft); color: var(--good); border-color: var(--good);
-    font-weight: 600; transition: background .12s, color .12s; }
-  #parityAddBtn:hover { background: var(--good); color: #05130B; }
+    font-family: inherit; font-weight: 600; transition: background .12s, color .12s; }
+  #parityAddBtn:hover:not(:disabled) { background: var(--good); color: #05130B; }
+  #parityAddBtn:disabled { opacity: .45; cursor: not-allowed; }
 
   .field-group { display: flex; flex-direction: column; gap: 7px; }
   .field-label { font-size: var(--fs-micro); font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-faint); }
@@ -1605,7 +1606,7 @@
           <tbody id="parityRows"></tbody>
         </table>
         <div class="field-row">
-          <div class="btn" id="parityAddBtn" data-i18n="settings.parity.add_row">+ Add model</div>
+          <button type="button" class="btn" id="parityAddBtn" data-i18n="settings.parity.add_row">+ Add model</button>
         </div>
         <details id="parityGrid">
           <summary data-i18n="settings.parity.effective_mapping">Effective mapping</summary>

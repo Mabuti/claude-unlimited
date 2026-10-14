@@ -1,5 +1,6 @@
 """Run the parity editor's state transitions with a minimal DOM, offline."""
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
@@ -7,6 +8,8 @@ import pytest
 
 
 def _run_editor(checks):
+    markup = (Path(__file__).parents[1] / "claude_unlimited/static/index.html").read_text()
+    assert re.search(r'<button\b(?=[^>]*\btype="button")(?=[^>]*\bid="parityAddBtn")[^>]*>', markup)
     source = (Path(__file__).parents[1] / "claude_unlimited/static/app.js").read_text()
     start = source.index("let _parityRows =")
     end = source.index("async function resetModelParity()", start)
@@ -16,8 +19,10 @@ def _run_editor(checks):
 const assert = require('node:assert/strict');
 const elements = new Map();
 const callbacks = new Map();
-function element() {
-  return { style: {}, dataset: {}, disabled: false, title: '', children: [],
+function element(tag = 'div') {
+  const attributes = new Set();
+  const node = { style: {}, dataset: {}, title: '', children: [],
+    hasAttribute: name => attributes.has(name),
     querySelectorAll: () => [],
     get innerHTML() { return this.html || ''; },
     set innerHTML(html) {
@@ -31,9 +36,14 @@ function element() {
       }
     }
   };
+  if (tag === 'button') Object.defineProperty(node, 'disabled', {
+    get: () => attributes.has('disabled'),
+    set: value => value ? attributes.add('disabled') : attributes.delete('disabled'),
+  });
+  return node;
 }
 for (const id of ['parityRows', 'parityGridRows', 'parityAddBtn', 'modelParitySection',
-                  'parityNewBanner', 'parityNewBannerSub']) elements.set(id, element());
+                  'parityNewBanner', 'parityNewBannerSub']) elements.set(id, element(id === 'parityAddBtn' ? 'button' : 'div'));
 const document = { getElementById: id => elements.get(id) || null };
 const esc = (v) => String(v).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;');
 const t = (key) => key;
@@ -121,14 +131,14 @@ _parityMeta.claude_selectable = [{id: 'claude-one', label: 'One'}, {id: 'claude-
 _parityRows = [{claude_model: 'claude-one', model: 'base', effort: 'low'}];
 renderParityRows();
 const add = document.getElementById('parityAddBtn');
-assert.equal(add.disabled, false);
+assert.equal(add.hasAttribute('disabled'), false);
 onAddParityRow();
 onAddParityRow();
 assert.deepEqual(_parityRows.map(r => r.claude_model), ['claude-one', 'claude-two']);
-assert.equal(add.disabled, true);
+assert.equal(add.hasAttribute('disabled'), true);
 assert.ok(add.title);
 onDeleteParityRow(1);
-assert.equal(add.disabled, false);
+assert.equal(add.hasAttribute('disabled'), false);
 assert.equal(add.title, '');
 onAddParityRow();
 assert.equal(_parityRows.length, 2);
