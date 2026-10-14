@@ -448,13 +448,18 @@ Existing files with absent parity, `{}`, or `[]` resolve to concrete curated row
 at read time, with no rewrite and no following of incoming effort: one fixed effort
 per family head. Legacy sparse dicts overlay those concrete defaults; explicit saved
 rows preserve their behavior.
-Loading a missing `config.json` seeds an explicit follow default list. With the bundled
+First launch with no config → Follow; Reset → Follow; import never writes Follow
+defaults. Loading a missing `config.json` seeds an explicit follow default list. With the bundled
 catalogue its four ids are `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5`, and
-`claude-haiku-4-5`. Any other catalogue id needs an explicit matching Follow row to
-follow effort (including a base/family match); otherwise it uses its curated fallback.
-`claude-mythos-5-1` needs its own explicit row. Saving never converts empty parity into
-follow. Importing explicit `{}`, `[]`, or `null` parity materializes concrete legacy
-curated rows. An import without the key does the same on a fresh install, but leaves
+`claude-haiku-4-5`; fresh/Reset seeding reads this snapshot when no live catalogue is
+loaded. Follow rows match via base id or family: `claude-fable-5-1-20260101` matches
+the `claude-fable-5-1` Follow row through its base id and follows incoming effort.
+The two curated cases are distinct: a Follow row with no effort sent uses the model's
+curated effort; no matching row at all, such as `claude-mythos-5-1`, uses a fixed
+curated target, does not follow, and does not appear on the grid until you add a row.
+Saving never converts empty parity into follow. Importing missing, `null`, `{}`, or
+`[]` parity on a new machine materializes concrete legacy curated rows. Explicit
+empty/null parity does the same on an existing config. An import without the key leaves
 the parity table alone in an existing config. Config existence is checked before
 profile imports, which can create the file.
 Reset confirms all changed/disappearing Claude ids with their old/new Codex models

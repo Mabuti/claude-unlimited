@@ -355,7 +355,9 @@ class ResponseTranslator:
     the client. Fully incremental: OpenAI's token-level
     response.output_text.delta events are forwarded as Anthropic
     content_block_delta events as they arrive, never buffered to
-    completion."""
+    completion. Tool arguments may arrive only on the `.done` events; they
+    are emitted once as `input_json_delta`, and the opening `input: {}` is
+    a placeholder."""
 
     message_id: str = "msg_openai_bridge"
     model: str = ""

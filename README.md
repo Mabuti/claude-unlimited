@@ -403,16 +403,22 @@ not copy it to the Claude side or inject a Claude effort.
   Absent effort uses the Any row. An unmatched model uses its curated fallback from the
   loaded catalogue. The generic `gpt-5.6-terra` / medium fallback is only for ids outside
   that catalogue with no recognized base or family. Per-profile Codex overrides win.
-- **Fresh installs and Reset use Follow.** First creation of `config.json` writes explicit
+- **First launch with no config → Follow; Reset → Follow; import never writes Follow defaults.**
+  First launch with no `config.json` seeds explicit
   follow default rows for the four family heads: `claude-fable-5-1`, `claude-opus-5-5`,
-  `claude-sonnet-5`, and `claude-haiku-4-5` in the bundled catalogue. Any other catalogue
-  id needs an explicit matching Follow row to follow effort (including a base/family
-  match); otherwise it uses its curated fallback. `claude-mythos-5-1` needs its own row.
+  `claude-sonnet-5`, and `claude-haiku-4-5` in the bundled catalogue, also used when no
+  live catalogue is loaded. Follow rows match via base id or family: for example,
+  `claude-fable-5-1-20260101` matches the `claude-fable-5-1` Follow row through its
+  base id and follows incoming effort. Two curated cases differ: **a Follow row with
+  no effort sent** uses the model's curated effort; **no matching row at all**, such
+  as `claude-mythos-5-1`, uses a fixed curated target, does not follow incoming effort,
+  and does not appear on the grid until you add a row.
   Existing files with absent parity, `{}`, or `[]` resolve to concrete curated rows
   at read time, with no rewrite and no following of incoming effort: one fixed effort
   per family head. Existing explicit rows retain their behavior.
-  **Import exception:** explicit `{}`, `[]`, or `null` parity, or an import without the
-  key on a fresh install, writes the fixed curated efforts. An import without the key
+  **Import:** missing, `null`, `{}`, or `[]` parity on a new machine writes fixed
+  curated efforts. Explicit empty/null parity also writes fixed curated efforts on
+  an existing config. An import without the key
   into an existing config leaves its parity table alone.
   **Reset to defaults** confirms changed and disappearing model IDs and their Codex
   and Claude efforts, then writes the explicit follow list, replacing saved rows and

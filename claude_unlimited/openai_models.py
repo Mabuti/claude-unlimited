@@ -1,9 +1,10 @@
 """Claude model -> OpenAI/Codex model + reasoning-effort mapping.
 
-Pure, no I/O of its own. Model NAMES come from model_catalogue.current()
+Model NAMES come from model_catalogue.current()
 when the daemon has initialized it (LiteLLM via GitHub's API, with disk
 cache and a vendored snapshot behind it); the literals below survive as the
-fallback when no catalogue is loaded, and as the CURATED tier decisions.
+legacy fallback when no catalogue is loaded, and as the CURATED tier decisions.
+Fresh/Reset defaults read the vendored snapshot if no catalogue is loaded.
 
 The tiering is best-effort, matched by price/role parity between the Codex
 model catalog and Anthropic's published pricing; neither vendor documents an
@@ -25,11 +26,12 @@ rank (see effective_model_map), never onto a brand-new target.
 Every public function takes an optional injected `catalogue` so it stays
 unit-testable without the module-level state; None means "whatever
 model_catalogue.current() says", which before initialize() is None too —
-so tests that never initialize run entirely on the literals.
+so legacy reads that never initialize run entirely on the literals.
 """
 
 from __future__ import annotations
 
+import json
 import re
 
 from dataclasses import dataclass
@@ -253,9 +255,18 @@ def default_parity_rows(catalogue: Optional[Catalogue] = None) -> list[dict]:
     With the vendored catalogue this is exactly
     claude-fable-5-1 / claude-opus-5-5 / claude-sonnet-5 / claude-haiku-4-5 —
     the same ids cli.py's _MODEL_TIER_IDS use, so the /model picker relabels
-    the native tiers instead of duplicating them. No catalogue -> one
-    _MODEL_MAP literal per family (the newest listed)."""
+    the native tiers instead of duplicating them. Before catalogue startup,
+    read only the vendored snapshot, without initializing shared state or
+    reading the app cache. Unavailable snapshot -> legacy literal ids."""
     cat = _catalogue_or_current(catalogue)
+    if cat is None:
+        cat = model_catalogue.load(source=lambda: json.loads(
+            model_catalogue._VENDORED_FILE.read_text(encoding="utf-8")))
+    return [dict(row, effort="follow") for row in _curated_parity_rows(cat)]
+
+
+def _curated_parity_rows(cat: Optional[Catalogue]) -> list[dict]:
+    """Legacy family heads and concrete efforts; no vendored seeding fallback."""
     rows: list[dict] = []
     if cat is not None and cat.anthropic:
         for family in _DEFAULT_FAMILIES:
@@ -270,7 +281,7 @@ def default_parity_rows(catalogue: Optional[Catalogue] = None) -> list[dict]:
             head = max(members, key=lambda m: model_catalogue._version_of(m.id)).id
             target = _curated_fallback(head, cat)
             rows.append({"claude_model": head, "model": target.model,
-                         "effort": "follow", "claude_effort": None})
+                         "effort": target.reasoning_effort, "claude_effort": None})
     if not rows:
         # One row per family here too: _MODEL_MAP can hold several ids of one
         # family (Opus 5.5 beside Opus 5), newest first, and a fresh install
@@ -282,7 +293,7 @@ def default_parity_rows(catalogue: Optional[Catalogue] = None) -> list[dict]:
                 continue
             seen.add(family)
             rows.append({"claude_model": claude_id, "model": target.model,
-                         "effort": "follow", "claude_effort": None})
+                         "effort": target.reasoning_effort, "claude_effort": None})
     return rows
 
 
@@ -301,8 +312,7 @@ def normalize_parity(raw, catalogue: Optional[Catalogue] = None) -> list[dict]:
         would give Claude Code an empty /v1/models).
     """
     cat = _catalogue_or_current(catalogue)
-    defaults = [dict(row, effort=_curated_fallback(row["claude_model"], cat).reasoning_effort)
-                for row in default_parity_rows(cat)]
+    defaults = _curated_parity_rows(cat)
     if isinstance(raw, list):
         rows: list[dict] = []
         for entry in raw:

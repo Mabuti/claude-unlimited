@@ -250,13 +250,26 @@ def test_legacy_empty_configs_pin_ad6ef5f_without_writes(shape, effort, monkeypa
     assert models.normalize_parity(config.load_pool().settings.model_parity) == LEGACY_EMPTY_ROWS
 
 
-def test_first_config_creation_writes_explicit_follow_rows():
+DOCUMENTED_DEFAULT_IDS = [
+    'claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5', 'claude-haiku-4-5',
+]
+
+
+@pytest.mark.parametrize('shape', [None, {}, []])
+def test_legacy_empty_normalization_without_catalogue_stays_ad6ef5f(shape, monkeypatch):
+    monkeypatch.setattr(models.model_catalogue, 'current', lambda: None)
+    assert models.normalize_parity(shape) == LEGACY_EMPTY_ROWS
+
+
+def test_first_config_creation_writes_explicit_follow_rows(monkeypatch):
+    monkeypatch.setattr(models.model_catalogue, 'current', lambda: None)
     assert not config.CONFIG_FILE.exists()
     pool = config.load_pool()
     config.save_pool(pool)
     stored = json.loads(config.CONFIG_FILE.read_text())['settings']['model_parity']
     assert stored == models.default_parity_rows()
     assert len(stored) == 4
+    assert [r['claude_model'] for r in stored] == DOCUMENTED_DEFAULT_IDS
     config.save_pool(pool)
     assert config.load_pool().settings.model_parity == stored
     assert all(r['effort'] == 'follow' for r in stored)
@@ -264,10 +277,12 @@ def test_first_config_creation_writes_explicit_follow_rows():
                             requested_effort='max').reasoning_effort == 'max'
 
 
-def test_explicit_reset_defaults_persist_and_follow_all_levels():
+def test_explicit_reset_defaults_persist_and_follow_all_levels(monkeypatch):
+    monkeypatch.setattr(models.model_catalogue, 'current', lambda: None)
     config.CONFIG_FILE.write_text(json.dumps({'settings': {'model_parity': LEGACY_ROWS}}))
     config.update_settings(model_parity=models.default_parity_rows())
     stored = config.load_pool().settings.model_parity
+    assert [r['claude_model'] for r in stored] == DOCUMENTED_DEFAULT_IDS
     assert models.normalize_parity(stored) == models.default_parity_rows()
     for effort in models.CLAUDE_REASONING_EFFORTS:
         for r in stored:
