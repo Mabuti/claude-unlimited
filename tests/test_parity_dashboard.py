@@ -226,7 +226,7 @@ def test_reset_lists_changed_and_removed_ids_cancel_preserves_everything():
   assert.equal(calls.length, 0);
   assert.equal(JSON.stringify(_parityRows), before);
   assert.equal(JSON.stringify(_paritySavedRows), saved);
-  assert.equal(confirmation, 'Changed: claude-fable-5-1: *: base/medium → base/settings.parity.follow\nclaude-opus-5-5: *: override/settings.parity.follow → base/settings.parity.follow\nclaude-sonnet-5: *: base/settings.parity.follow, high: override/settings.parity.follow → base/settings.parity.follow\nRemoved: claude-saved-deleted: *: base/low\nclaude-mythos-5-1: *: override/high');
+  assert.equal(confirmation, 'Changed: claude-fable-5-1: *: base/medium (Claude: settings.parity.leave_requested) → base/settings.parity.follow (Claude: settings.parity.leave_requested)\nclaude-opus-5-5: *: override/settings.parity.follow (Claude: settings.parity.leave_requested) → base/settings.parity.follow (Claude: settings.parity.leave_requested)\nclaude-sonnet-5: *: base/settings.parity.follow (Claude: settings.parity.leave_requested), high: override/settings.parity.follow (Claude: settings.parity.leave_requested) → base/settings.parity.follow (Claude: settings.parity.leave_requested)\nRemoved: claude-saved-deleted: *: base/low (Claude: settings.parity.leave_requested)\nclaude-mythos-5-1: *: override/high (Claude: settings.parity.leave_requested)');
   confirmed = true;
   await resetModelParity();
   assert.equal(patches.length, 1);
@@ -247,7 +247,7 @@ def test_reset_warns_about_restored_models_and_claude_effort_changes():
   ];
   _parityRows = [{claude_model: 'claude-existing', model: 'base', effort: 'follow', claude_effort: 'high'}];
   await resetModelParity();
-  assert.equal(confirmation, 'Changed: claude-existing: *: base/settings.parity.follow → base/settings.parity.follow\nclaude-restored: settings.parity.not_present → base/settings.parity.follow\nRemoved: settings.parity.no_changes');
+  assert.equal(confirmation, 'Changed: claude-existing: *: base/settings.parity.follow (Claude: high) → base/settings.parity.follow (Claude: settings.parity.leave_requested)\nclaude-restored: settings.parity.not_present → base/settings.parity.follow (Claude: settings.parity.leave_requested)\nRemoved: settings.parity.no_changes');
   assert.equal(calls.length, 0);
 })().catch(e => { console.error(e); process.exitCode = 1; });
 ''')

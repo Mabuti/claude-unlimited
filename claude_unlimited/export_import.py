@@ -252,7 +252,10 @@ def apply_import(
 
     incoming = None
     if import_settings and parsed.settings is not None:
-        from .config import Settings, validated_settings_changes
+        from .config import CONFIG_FILE, Settings, validated_settings_changes
+
+        # Profile imports below can create this file before settings are merged.
+        config_existed = CONFIG_FILE.exists()
 
         # Validate all settings before any profile or credential writes.
         # A bundle is a file from somewhere else, and settings carry
@@ -266,9 +269,10 @@ def apply_import(
         # chose to send.
         incoming = {k: v for k, v in parsed.settings.items()
                     if k in Settings.__dataclass_fields__ and k not in _MACHINE_LOCAL_SETTINGS}
-        # Empty/missing parity in an imported settings payload is a legacy
-        # decision, even if load_pool() just seeded fresh-install follow rows.
-        if "model_parity" not in incoming or incoming["model_parity"] in ({}, []):
+        # Omission preserves an existing table. Explicit empty/null parity,
+        # or omission on a fresh install, retains legacy concrete efforts.
+        if (("model_parity" not in incoming and not config_existed)
+                or ("model_parity" in incoming and incoming["model_parity"] in (None, {}, []))):
             from .openai_models import normalize_parity
             incoming["model_parity"] = normalize_parity(None)
         incoming = validated_settings_changes(incoming)

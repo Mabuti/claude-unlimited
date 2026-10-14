@@ -291,7 +291,7 @@ def test_offline_picker_model_and_effort_are_neutral():
             assert 'follows Claude Code' not in description
 
 
-@pytest.mark.parametrize("shape", ["absent", {}, []])
+@pytest.mark.parametrize("shape", ["absent", {}, [], None])
 @pytest.mark.parametrize("effort", EFFORTS)
 def test_import_legacy_settings_into_fresh_install_pins_ad6ef5f(shape, effort, monkeypatch):
     from claude_unlimited import export_import as ei
@@ -311,6 +311,54 @@ def test_import_legacy_settings_into_fresh_install_pins_ad6ef5f(shape, effort, m
         assert models.map_model(legacy["claude_model"], parity=stored,
                                 requested_effort=effort) == models.OpenAIModelTarget(
                                     legacy["model"], legacy["effort"])
+
+
+@pytest.mark.parametrize("shape", ["absent", {}, [], None, LEGACY_ROWS[:2]])
+def test_import_existing_settings_preserves_or_replaces_parity(shape, monkeypatch):
+    from claude_unlimited import export_import as ei
+    monkeypatch.setattr(models.model_catalogue, "current", lambda: None)
+    monkeypatch.setattr(ei.activity_module, "record", lambda *a, **kw: None)
+    config.CONFIG_FILE.write_text(json.dumps({"settings": {
+        "language": "en", "model_parity": LEGACY_ROWS}}))
+    before = {(r["claude_model"], e): models.map_model(
+        r["claude_model"], parity=LEGACY_ROWS, requested_effort=e)
+        for r in LEGACY_ROWS for e in EFFORTS}
+    settings = {"language": "de"}
+    if shape != "absent":
+        settings["model_parity"] = shape
+    parsed = ei.ParsedBundle(profiles=[], settings=settings, activity=None)
+    ei.apply_import(parsed, import_profiles=False, import_settings=True)
+    stored = json.loads(config.CONFIG_FILE.read_text())["settings"]
+    assert stored["language"] == "de"
+    expected = LEGACY_ROWS if shape == "absent" else (shape or LEGACY_EMPTY_ROWS)
+    if shape == "absent" or shape:
+        assert stored["model_parity"] == expected
+    else:
+        assert isinstance(stored["model_parity"], list)
+        assert [r["effort"] for r in stored["model_parity"]] == ["medium", "high", "medium", "low"]
+        assert models.normalize_parity(stored["model_parity"]) == expected
+    if shape == "absent":
+        assert {(model, e): models.map_model(model, parity=stored["model_parity"],
+                                            requested_effort=e)
+                for model, e in before} == before
+
+
+def test_fresh_import_checks_config_existence_before_profile_writes(monkeypatch):
+    from claude_unlimited import export_import as ei
+    monkeypatch.setattr(models.model_catalogue, "current", lambda: None)
+    monkeypatch.setattr(ei.activity_module, "record", lambda *a, **kw: None)
+    monkeypatch.setattr(ei.secret_store, "set_token", lambda *a: None)
+    assert not config.CONFIG_FILE.exists()
+    parsed = ei.ParsedBundle(
+        profiles=[{"name": "Fixture", "kind": "api", "credential": "fixture"}],
+        settings={"language": "de"}, activity=None)
+    result = ei.apply_import(parsed, import_profiles=True, import_settings=True)
+    assert result["profiles_added"] == 1
+    stored = json.loads(config.CONFIG_FILE.read_text())["settings"]
+    assert stored["language"] == "de"
+    assert isinstance(stored["model_parity"], list)
+    assert [r["effort"] for r in stored["model_parity"]] == ["medium", "high", "medium", "low"]
+    assert models.normalize_parity(stored["model_parity"]) == LEGACY_EMPTY_ROWS
 
 
 @pytest.mark.parametrize("shape", [{}, []])

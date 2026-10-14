@@ -4854,7 +4854,7 @@ async function resetModelParity() {
     for (const row of defaults) {
       if (!currentIds.has(row.claude_model)) changed.add(row.claude_model);
     }
-    const describe = (row) => `${row.model}/${codexEffortLabel(row.effort)}`;
+    const describe = (row) => `${row.model}/${codexEffortLabel(row.effort)} (Claude: ${row.claude_effort || t('settings.parity.leave_requested')})`;
     const before = (id) => [...new Set([..._paritySavedRows, ..._parityRows]
       .filter((r) => r.claude_model === id)
       .map((r) => `${r.source_effort || '*'}: ${describe(r)}`))].join(', ')

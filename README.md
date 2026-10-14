@@ -387,7 +387,9 @@ omitted). Optional override rows use `source_effort: low|medium|high|xhigh|max`
 to choose a different Codex target or effort for that requested level. A row stores
 `{claude_model, source_effort, model, effort, claude_effort}`. Codex `effort` can be a
 fixed level or **Follow Claude Code (same level)** (`follow`). Follow copies an explicit
-requested level. When effort is absent, it uses this concrete curated table:
+requested level. When effort is absent, Codex Follow uses this concrete curated table.
+This absent-effort default applies only to Codex Follow: **Leave as requested** does
+not copy it to the Claude side or inject a Claude effort.
 
 | Claude family | Default Codex target | Curated effort when absent |
 |---|---|---|
@@ -398,14 +400,23 @@ requested level. When effort is absent, it uses this concrete curated table:
 
 - **Matching:** exact Claude id → dated/undated base id → first matching family group.
   Within that group, an exact requested-effort override wins; otherwise its Any row wins.
-  Absent effort uses the Any row. An unmatched model uses the curated fallback (unknown
-  families use `gpt-5.6-terra` / medium). Per-profile Codex model and effort overrides win.
+  Absent effort uses the Any row. An unmatched model uses its curated fallback from the
+  loaded catalogue. The generic `gpt-5.6-terra` / medium fallback is only for ids outside
+  that catalogue with no recognized base or family. Per-profile Codex overrides win.
 - **Fresh installs and Reset use Follow.** First creation of `config.json` writes explicit
-  follow default rows for the four family heads. Existing files with absent `model_parity`,
-  `{}`, or `[]` retain the old concrete curated efforts for every requested level, resolved
-  at read time without writing. Existing explicit rows retain their behavior.
-  **Reset to defaults** confirms changed and disappearing model IDs, then writes the
-  explicit follow list, replacing saved rows and unsaved edits; it never writes `[]`.
+  follow default rows for the four family heads: `claude-fable-5-1`, `claude-opus-5-5`,
+  `claude-sonnet-5`, and `claude-haiku-4-5` in the bundled catalogue. Any other catalogue
+  id needs an explicit matching Follow row to follow effort (including a base/family
+  match); otherwise it uses its curated fallback. `claude-mythos-5-1` needs its own row.
+  Existing files with absent parity, `{}`, or `[]` resolve to concrete curated rows
+  at read time, with no rewrite and no following of incoming effort: one fixed effort
+  per family head. Existing explicit rows retain their behavior.
+  **Import exception:** explicit `{}`, `[]`, or `null` parity, or an import without the
+  key on a fresh install, writes the fixed curated efforts. An import without the key
+  into an existing config leaves its parity table alone.
+  **Reset to defaults** confirms changed and disappearing model IDs and their Codex
+  and Claude efforts, then writes the explicit follow list, replacing saved rows and
+  unsaved edits; it never writes `[]`.
 - **Edit up to 64 rows.** Add models or per-effort overrides, then **Save**. Removing a base
   row also removes its overrides. The read-only **Effective mapping** grid shows each
   saved model × requested effort, matched rule, resolved target and effort, and Claude

@@ -433,7 +433,9 @@ effort selects its override, otherwise the base row wins. Absent effort selects 
 base row. Codex `effort: "follow"` copies the requested level name; when none is sent,
 it uses the curated effort below. A fixed row effort ignores the requested level.
 Per-profile Codex model and effort overrides take precedence independently.
-Unmatched model ids use curated fallback; unknown families use Terra / medium.
+Unmatched model ids use their curated fallback from the loaded catalogue. The generic
+Terra / medium fallback is only for ids outside that catalogue with no recognized
+base or family.
 
 | Claude family | Curated Codex model | Curated effort |
 |---|---|---|
@@ -443,13 +445,21 @@ Unmatched model ids use curated fallback; unknown families use Terra / medium.
 | Haiku | `gpt-5.6-luna` | low |
 
 Existing files with absent parity, `{}`, or `[]` resolve to concrete curated rows
-at read time, with no rewrite and no following of incoming effort. Legacy sparse
-dicts overlay those concrete defaults; explicit saved rows preserve their behavior.
-Loading a missing `config.json` seeds an explicit follow default list. Saving never
-converts empty parity into follow. Importing a settings payload with missing or empty
-parity materializes concrete legacy curated rows, including on a fresh install.
+at read time, with no rewrite and no following of incoming effort: one fixed effort
+per family head. Legacy sparse dicts overlay those concrete defaults; explicit saved
+rows preserve their behavior.
+Loading a missing `config.json` seeds an explicit follow default list. With the bundled
+catalogue its four ids are `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5`, and
+`claude-haiku-4-5`. Any other catalogue id needs an explicit matching Follow row to
+follow effort (including a base/family match); otherwise it uses its curated fallback.
+`claude-mythos-5-1` needs its own explicit row. Saving never converts empty parity into
+follow. Importing explicit `{}`, `[]`, or `null` parity materializes concrete legacy
+curated rows. An import without the key does the same on a fresh install, but leaves
+the parity table alone in an existing config. Config existence is checked before
+profile imports, which can create the file.
 Reset confirms all changed/disappearing Claude ids with their old/new Codex models
-and efforts, then writes the explicit follow list, never an empty list.
+and efforts, including Claude effort or Leave as requested, then writes the explicit
+follow list, never an empty list.
 `default_parity_rows()` supplies fresh/Reset defaults; `normalize_parity()` supplies
 legacy read semantics.
 
@@ -463,7 +473,9 @@ the same level first; the bridge steps down only after a backend 400 rejection.
 
 `claude_effort` is injected as `output_config.effort` onto oauth/api-served requests,
 gated by `openai_models.apply_claude_effort` so unsupported models (Haiku, Sonnet ≤4.5)
-receive no injection. Dropdown order is catalogue rank (cost/generation descending).
+receive no injection. The absent-effort curated value applies only to Codex Follow;
+**Leave as requested** does not copy it to the Claude side or inject a Claude effort.
+Dropdown order is catalogue rank (cost/generation descending).
 
 Codex quota is spent on reasoning tokens produced × model tier, not on context size — see
 [ADR 0007](adr/0007-codex-quota-is-driven-by-reasoning-not-context.md).
