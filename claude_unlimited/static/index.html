@@ -23,6 +23,7 @@
        Claude/Anthropic blue used by oauth+api), applied consistently across
        their icon, badge, and type-card. */
     --codex: #2FD9C4; --codex-soft: rgba(47,217,196,0.14); --codex-border: rgba(47,217,196,0.38);
+    --claude: #D97757; --claude-soft: rgba(217,119,87,0.16); --claude-border: rgba(217,119,87,0.40);
     --track: #1E1E23; --track-marker: rgba(255,255,255,0.5); --chip-off: #2A2A2F; --knob-on: #0A0A0C;
     --fs-micro: 10.5px; --fs-body: 13px; --fs-name: 16px; --fs-stat: 20px;
   }
@@ -35,6 +36,7 @@
     --good: #1C8A3E; --good-soft: rgba(28,138,62,0.12);
     --bad: #D42B2B; --bad-soft: rgba(212,43,43,0.1); --bad-border: rgba(212,43,43,0.3);
     --codex: #0E8F80; --codex-soft: rgba(14,143,128,0.12); --codex-border: rgba(14,143,128,0.32);
+    --claude: #C15F3C; --claude-soft: rgba(193,95,60,0.12); --claude-border: rgba(193,95,60,0.34);
     --track: #E7E9EC; --track-marker: rgba(0,0,0,0.35); --chip-off: #DDE0E4; --knob-on: #FFFFFF;
   }
   body {
@@ -259,6 +261,8 @@
      same priority order tag-color has over any kind-based default. */
   .p-icon.kind-codex:not(.has-tag) { color: var(--codex); background: var(--codex-soft); }
   .p-icon-lg.kind-codex:not(.has-tag) { color: var(--codex); background: var(--codex-soft); }
+  .p-icon.kind-claude:not(.has-tag) { color: var(--claude); background: var(--claude-soft); }
+  .p-icon-lg.kind-claude:not(.has-tag) { color: var(--claude); background: var(--claude-soft); }
   .p-name { font-size: var(--fs-body); font-weight: 700; }
   .p-kind { font-size: var(--fs-micro); color: var(--text-faint); margin-left: 2px; }
   .p-status-word { font-size: var(--fs-micro); font-weight: 700; margin-left: auto; padding: 2px 7px; border-radius: 5px; white-space: nowrap; }
@@ -509,11 +513,12 @@
   .type-icon svg { width: 14px; height: 14px; }
   .type-name { font-size: var(--fs-body); font-weight: 700; }
   .type-desc { font-size: var(--fs-micro); color: var(--text-faint); line-height: 1.4; }
-  /* Codex/OpenAI selects into the provider accent rather than the generic
-     --accent, matching the icon and plan badge shown once a Profile
-     exists. */
+  /* Codex/OpenAI and Claude subscription choices use provider accents rather
+     than the generic --accent, matching their profile icons. */
   .type-card.sel[data-type-card="codex"] { border-color: var(--codex-border); background: var(--codex-soft); }
   .type-card.sel[data-type-card="codex"] .type-icon { color: var(--codex); }
+  .type-card.sel[data-type-card="oauth"] { border-color: var(--claude-border); background: var(--claude-soft); }
+  .type-card.sel[data-type-card="oauth"] .type-icon { color: var(--claude); }
   .model-map-table { width: 100%; border-collapse: collapse; font-size: var(--fs-micro); margin-top: 4px; }
   .model-map-table th, .model-map-table td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border-soft); color: var(--text-dim); }
   /* The Claude model name is the label for its row — it was rendering at

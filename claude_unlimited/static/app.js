@@ -1664,7 +1664,7 @@ function renderProfileCard(p) {
   return `
     <div class="p-card ${isActive ? 'active-card' : ''}${tagClass}" data-id="${esc(p.id)}"${tagStyle}>
       <div class="p-top">
-        <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
+        <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}${p.kind === 'oauth' ? ' kind-claude' : ''}">${kindIcon(p)}</div>
         <span class="p-name">${esc(p.name)}</span>
         ${planBadge(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}
         ${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}
@@ -1808,7 +1808,7 @@ function renderProfileTableRow(p) {
         <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.4"/><circle cx="9" cy="12" r="1.4"/><circle cx="9" cy="18" r="1.4"/><circle cx="15" cy="6" r="1.4"/><circle cx="15" cy="12" r="1.4"/><circle cx="15" cy="18" r="1.4"/></svg>
       </div>
       <div class="row-name-cell">
-        <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
+        <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}${p.kind === 'oauth' ? ' kind-claude' : ''}">${kindIcon(p)}</div>
         <div class="row-name-text">
           <div class="p-name">${esc(p.name)} ${planBadge(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}${creditsPill(p)}</div>
           <div class="p-kind">${kindLabel}</div>${modelUsageChips(p)}
@@ -2173,6 +2173,7 @@ function openProfileDetailModal(profileId) {
   pdIcon.innerHTML = kindIcon(p);
   pdIcon.classList.toggle('has-tag', !!p.tag_color);
   pdIcon.classList.toggle('kind-codex', p.kind === 'codex');
+  pdIcon.classList.toggle('kind-claude', p.kind === 'oauth');
   pdIcon.style.setProperty('--tag-color', p.tag_color || '');
   document.getElementById('pd_name').firstChild.textContent = p.name + ' ';
   document.getElementById('pd_name_input').value = p.name;
