@@ -334,14 +334,13 @@ Branches matter because the prompt cache is per-account. Rotating a branch to a 
 account costs a full cache miss; keeping a branch on one account keeps it warm. So the
 gateway holds `_branch_pins`: a bounded, TTL'd `branch key → profile` map (1 h, 512
 entries). It evicts the oldest closed pin first; a pin with an open response is never
-evicted. If every pin is open, the cap may be exceeded temporarily, but that overflow is
-bounded by actual concurrent open requests: each one holds a live socket bounded by the
-idle timeouts in `claude_unlimited/upstream.py` (`DEFAULT_TIMEOUT_SECONDS`, passed to
-`HTTP(S)Connection`) and `claude_unlimited/openai_bridge.py` (`DEFAULT_TIMEOUT_SECONDS`).
-When either a stalled pre-header wait or a stalled stream raises, the existing exception
-path releases the in-flight slot and open-response count; the map then shrinks as responses
-close and new pins are added. An open response counts as active and protects its pin until
-it closes/finalizes, with no staleness exception. It is a routing preference, never a guarantee
+evicted. If every pin is open, the cap may be exceeded temporarily, bounded by the number
+of concurrent open requests. Upstream connect/read stalls raise through the transport socket
+timeouts; a downstream client that stops reading remains open and counted until it
+disconnects or the body is closed/finalized. The one-hour retention cutoff applies only to
+pins with no open response. An open response counts as active and protects its pin until
+it closes/finalizes or its transport raises, with no staleness exception. It is a routing
+preference, never a guarantee
 — a pin whose Profile went ineligible, was already attempted this request, or was deleted
 is dropped, and the request falls through to normal rotation.
 
@@ -394,7 +393,8 @@ Because that traffic never moves `current_profile_id`, the Dashboard reads
 which accounts have agents active in the last five minutes (an open response or recent
 activity). This is the same five-minute meaning shown by the HUD detail card's session line;
 it is separate from the `in_use_now` recent-use grace signal and the `agents_since` age of the
-oldest retained pin (retention expires after one hour of inactivity). A silent open response
+oldest retained pin (retention expires after one hour of inactivity when no response is open).
+A silent open response
 counts for the badge and balancer, but does not by itself keep "Used now"
 (`_IN_FLIGHT_MAX_SECONDS`). An open response remains in `live_agents` even if that pin has
 passed the retention cutoff, but closing it does not extend the pin and the next request may

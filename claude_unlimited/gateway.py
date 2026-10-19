@@ -108,11 +108,10 @@ ACTIVE_AGENT_WINDOW_SECONDS = 300.0
 # Hard ceiling so a long-lived daemon can't accumulate pins without bound;
 # pins without open responses are evicted first, oldest-touched within
 # that set. If every pin is open, the cap is allowed to overflow temporarily.
-# Such overflow is bounded by actual concurrent open requests: each open
-# response holds a live socket, and both transports bound socket idle time
-# (upstream.DEFAULT_TIMEOUT_SECONDS via HTTP(S)Connection and
-# openai_bridge.DEFAULT_TIMEOUT_SECONDS), after which the existing exception
-# paths release the in-flight slot and open-response count.
+# Such overflow is bounded by actual concurrent open requests. Upstream
+# connect/read stalls raise through the transport socket timeouts, while a
+# downstream client that stops reading remains open and counted until it
+# disconnects or the response body is closed/finalized.
 BRANCH_PIN_CAP = 512
 
 
@@ -2124,10 +2123,30 @@ class Gateway:
                         activity.record("rotation", f"{profile.name} hit its quota", meta="rotating to next eligible profile")
                         continue
 
+                branch_retry_available = False
+                if (isinstance(observation, Unknown) and observation.status_code == 429
+                        and forced_profile_id is None
+                        and transient_failovers < _MAX_TRANSIENT_FAILOVERS_PER_REQUEST):
+                    if branch_routed:
+                        # Ask the same branch-aware selector that will choose
+                        # the next loop's retry. It includes a forced subagent
+                        # Profile even when automatic routing is disabled,
+                        # without creating or moving the pin during this
+                        # availability check.
+                        with self._lock:
+                            branch_retry_available = self._branch_decision(
+                                pool, snapshot, now, branch, is_subagent, parent_agent_id,
+                                attempted, distribute, may_create_pin=False,
+                                app_pinned=app_pinned, fit=fit).profile_id is not None
+                    else:
+                        branch_retry_available = (
+                            choose(snapshot, now, fit=fit,
+                                   exclude=transient_exclude).profile_id is not None)
+
                 if (isinstance(observation, Unknown) and observation.status_code == 429
                         and forced_profile_id is None
                         and transient_failovers < _MAX_TRANSIENT_FAILOVERS_PER_REQUEST
-                        and choose(snapshot, now, fit=fit, exclude=transient_exclude).profile_id is not None):
+                        and branch_retry_available):
                     # A 429 that classify() judged NOT to be about this
                     # account's quota (see observation.classify) deliberately
                     # leaves Router state alone, so this Profile is never
@@ -3968,13 +3987,12 @@ class Gateway:
     def _branch_response_is_open_locked(self, response_key: tuple) -> bool:
         """Whether a response remains open; caller holds ``self._lock``.
 
-        Open responses count and protect their pins until close/finalize, with
-        no staleness exception. Both transports use socket idle timeouts —
-        ``upstream.DEFAULT_TIMEOUT_SECONDS`` is passed to HTTP(S)Connection
-        and ``openai_bridge.DEFAULT_TIMEOUT_SECONDS`` bounds the Codex path —
-        so a stalled pre-header wait or stream raises. The existing exception
-        paths then release both the in-flight slot and this open-response
-        count instead of leaving a request open forever.
+        Open responses count and protect their pins until close/finalize or a
+        transport exception, with no staleness exception. The socket timeouts
+        bound upstream connect/read stalls (including a pre-header wait or an
+        upstream stream read). They do not bound a downstream client that
+        stops reading: that response stays open and counted until the client
+        disconnects, the body is closed/finalized, or the transport raises.
         """
         return self._branch_open_responses.get(response_key, 0) > 0
 
@@ -4026,8 +4044,10 @@ class Gateway:
 
         An open response counts regardless of its last yielded byte or pin
         age; otherwise the selector's least-loaded tie-break would drop a
-        silent stream. Socket idle timeouts bound how long a stalled transport
-        can remain open, and its exception path releases the count.
+        silent stream. Upstream connect/read stalls raise through the socket
+        timeouts; a downstream client that stops reading remains open and
+        counted until disconnect, body close/finalization, or a transport
+        raise.
         """
         counts: dict = {}
         now = _pin_clock()
@@ -4454,10 +4474,11 @@ class Gateway:
         closed — including closed before anything was read, which is what a
         discarded result looks like (see _InFlightBody). `closers` are the
         upstream objects behind `chunks` (raw body, connection) that must be
-        closed with it. Branch-routed responses count while their open-response
-        activity is fresh and refresh that timestamp while bytes flow and when
-        the response finishes, so a long stream does not disappear from the
-        five-minute active count mid-response."""
+        closed with it. Branch-routed responses count for the whole open
+        response, including a silent one, and remain counted until the client
+        disconnects, the body is closed/finalized, or the transport raises.
+        Bytes flowing and the final touch refresh recent pin activity; the
+        one-hour retention cutoff applies only when no response is open."""
         def touch() -> None:
             self._touch_in_flight(profile_id)
             if branch_key is not None:

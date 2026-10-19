@@ -381,6 +381,38 @@ def test_transient_429_branch_retry_honors_forced_subagent_profile(pool_env, mon
     assert moves == [("a", "f", "transient_429")]
 
 
+def test_transient_429_branch_retry_allows_manual_only_forced_subagent(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a", priority=1),
+                             prof("f", priority=9, automatic=False)]))
+    gw = healthy_gateway()
+    assert serve(gw, hdrs(agent="ag1"), distribute=True).profile_id == "a"
+
+    save_pool(Pool(profiles=[prof("a", priority=1),
+                             prof("f", priority=9, automatic=False,
+                                  forced_for_subagents=True)]))
+    served = []
+
+    def transport(req):
+        profile_id = next(pid for pid in ("a", "f") if f"tok-{pid}" in str(req.headers))
+        served.append(profile_id)
+        if profile_id == "a":
+            return fake_response(429, {"x-should-retry": "true"})
+        return fake_response(200, HEALTHY)
+
+    gw._transport = transport
+    moves = []
+    monkeypatch.setattr(gw, "_record_branch_move",
+                        lambda pool, from_id, to_id, why: moves.append((from_id, to_id, why)))
+    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    list(result.body_chunks)
+
+    assert served == ["a", "f"]
+    assert result.profile_id == "f"
+    assert [(pin["agent_id"], pin["profile_id"])
+            for pin in gw.branch_pins()] == [("ag1", "f")]
+    assert moves == [("a", "f", "transient_429")]
+
+
 def test_transient_429_branch_failover_does_not_capture_manual_only_current(pool_env):
     save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2),
                              prof("manual", priority=3, automatic=False)]))

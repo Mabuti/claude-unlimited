@@ -680,11 +680,11 @@ its own prompt cache warm instead of paying a cache miss on every rotation.
 
 > **Balancing happens only when an agent starts — never mid-session.** An agent moves only
 > if its account reaches its switch threshold or a usage limit, becomes unavailable (turned
-> off, cooling down, needs re-auth), or the agent sits idle for an hour. An open response
-> counts in **Agents: N** while its activity is within that one-hour bound, even when silent;
-> after more than an hour without activity it no longer counts or protects the pin until a
-> byte or touch refreshes it. It does not extend the routing pin; once it closes, the next
-> request may be assigned again. It balances by how many agents have
+> off, cooling down, needs re-auth), or its branch pin has had no request activity for an hour
+> and no response is open. An open response counts in **Agents: N** and protects its pin until
+> the client disconnects, the body is closed/finalized, or the transport raises, even when silent; the one-hour
+> retention cutoff does not apply while a response is open. It does not extend the routing pin;
+> once it closes, the next request may be assigned again. It balances by how many agents have
 > been active on each account in the last 5 minutes, not by usage percentage, so usage
 > evens out roughly over many sessions rather than exactly.
 
@@ -1077,8 +1077,9 @@ the old `CapacityWidget.app`, the name it had before, keeping your saved positio
   account is in its 15-minute recent-use grace, it says **used recently**; otherwise it shows
   when the account was last used. A separate **on account** duration, when a retained pin is
   still inside its one-hour inactivity window, gives the age of the oldest retained branch pin;
-  a fresh open response past that pin's retention cutoff can still count as active without an
-  **on account** age, but a response silent for more than one hour no longer counts.
+  an open response past that pin's retention cutoff can still count as active without an
+  **on account** age, and remains counted while silent until the client disconnects or the body
+  is closed/finalized, or the transport raises.
   Under that, the model and project of its latest request (a Codex account
   shows the Claude model it translated, e.g. `opus-5 → gpt-5.6-terra`).
 - Right-click (or Control-click) a profile to **Take over**, to **Enable** or **Disable** it, or
