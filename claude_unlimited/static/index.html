@@ -19,9 +19,10 @@
     --warn: #FFB020; --warn-soft: rgba(255,176,32,0.14); --warn-border: rgba(255,176,32,0.32);
     --good: #35D07F; --good-soft: rgba(53,208,127,0.14);
     --bad: #FF5C5C; --bad-soft: rgba(255,92,92,0.12); --bad-border: rgba(255,92,92,0.35);
-    /* Codex/OpenAI Profiles get their own accent, distinct from --accent (the
-       Claude/Anthropic blue used by oauth+api), applied consistently across
-       their icon, badge, and type-card. */
+    /* --accent is product chrome, also used by API profiles and charts.
+       --codex is the Codex/OpenAI mark; --claude is the Claude subscription
+       (kind oauth) mark and its type-card. A profile tag color still wins
+       over both provider accents. */
     --codex: #2FD9C4; --codex-soft: rgba(47,217,196,0.14); --codex-border: rgba(47,217,196,0.38);
     --claude: #D97757; --claude-soft: rgba(217,119,87,0.16); --claude-border: rgba(217,119,87,0.40);
     --track: #1E1E23; --track-marker: rgba(255,255,255,0.5); --chip-off: #2A2A2F; --knob-on: #0A0A0C;
@@ -36,7 +37,7 @@
     --good: #1C8A3E; --good-soft: rgba(28,138,62,0.12);
     --bad: #D42B2B; --bad-soft: rgba(212,43,43,0.1); --bad-border: rgba(212,43,43,0.3);
     --codex: #0E8F80; --codex-soft: rgba(14,143,128,0.12); --codex-border: rgba(14,143,128,0.32);
-    --claude: #C15F3C; --claude-soft: rgba(193,95,60,0.12); --claude-border: rgba(193,95,60,0.34);
+    --claude: #A8452A; --claude-soft: rgba(168,69,42,0.12); --claude-border: rgba(168,69,42,0.34);
     --track: #E7E9EC; --track-marker: rgba(0,0,0,0.35); --chip-off: #DDE0E4; --knob-on: #FFFFFF;
   }
   body {
