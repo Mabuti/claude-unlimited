@@ -106,8 +106,13 @@ BRANCH_PIN_TTL_SECONDS = 3600.0
 # Independent of _IN_FLIGHT_MAX_SECONDS below; equal values are coincidental.
 ACTIVE_AGENT_WINDOW_SECONDS = 300.0
 # Hard ceiling so a long-lived daemon can't accumulate pins without bound;
-# pins without fresh open responses are evicted first, oldest-touched within
+# pins without open responses are evicted first, oldest-touched within
 # that set. If every pin is open, the cap is allowed to overflow temporarily.
+# Such overflow is bounded by actual concurrent open requests: each open
+# response holds a live socket, and both transports bound socket idle time
+# (upstream.DEFAULT_TIMEOUT_SECONDS via HTTP(S)Connection and
+# openai_bridge.DEFAULT_TIMEOUT_SECONDS), after which the existing exception
+# paths release the in-flight slot and open-response count.
 BRANCH_PIN_CAP = 512
 
 
@@ -545,15 +550,17 @@ class _InFlightBody:
             _close_quietly(self._inner)
             _close_all(self._closers)
         finally:
-            if not finalizing and self._finish is not None:
-                try:
-                    self._finish()
-                except Exception:  # noqa: BLE001 - bookkeeping must never break the relay
-                    pass
-            if finalizing:
-                self._release_without_blocking()
-            else:
-                self._release()
+            try:
+                if not finalizing and self._finish is not None:
+                    try:
+                        self._finish()
+                    except Exception:  # noqa: BLE001 - bookkeeping must never break the relay
+                        pass
+            finally:
+                if finalizing:
+                    self._release_without_blocking()
+                else:
+                    self._release()
 
     def _release_without_blocking(self) -> None:
         # With no non-blocking variant supplied, nothing is known about what
@@ -1293,13 +1300,9 @@ class Gateway:
         # Profile id is part of the key so an old response cannot make a pin
         # that moved to another Profile look active. Details for assignments
         # whose pin was re-routed or evicted stay beside the count until the
-        # response closes; while fresh, an open agent cannot disappear from
-        # the badge, and stale entries remain only for exact-once cleanup.
+        # response closes; an open agent cannot disappear from the badge or
+        # balancer while its response is open.
         self._branch_open_responses: dict[tuple, int] = {}
-        # Monotonic pin-clock time of the most recent registration or yielded
-        # byte for each open branch/profile assignment. A stale entry remains
-        # until its response closes, but no longer counts or protects a pin.
-        self._branch_open_response_activity: dict[tuple, float] = {}
         self._branch_open_response_details: dict[tuple, tuple[str, Optional[str]]] = {}
         self._branch_move_notified_at: dict[str, float] = {}
         # Epoch seconds of each Profile's last usage reading, from any source
@@ -1763,22 +1766,22 @@ class Gateway:
 
             if retry_excluding_attempted:
                 retry_excluding_attempted = False
-                decision = choose(snapshot, now, fit=fit, exclude=transient_exclude)
+                if not branch_routed:
+                    # Ordinary requests keep the existing global sticky
+                    # selector. Branch-routed requests already went through
+                    # _branch_decision above, which excludes every Profile
+                    # in `attempted` and applies forced-subagent routing plus
+                    # the least-loaded branch tie-break.
+                    decision = choose(snapshot, now, fit=fit, exclude=transient_exclude)
                 if decision.profile_id is not None:
                     if branch_routed and branch is not None:
-                        # The transient-429 failover uses global choose() for
-                        # this attempt, which may select a different Profile
-                        # from the branch-aware assignment made above. Keep
-                        # the pin on the account that actually serves; the
-                        # response wrapper must be able to own its activity.
-                        with self._lock:
-                            # Ancillary branch calls ride the existing pin;
-                            # only message traffic may rebind or create one.
-                            if may_create_pin:
-                                self._remember_pin(branch, decision.profile_id, parent_agent_id)
-                            if branch_moves:
-                                from_id, _, _ = branch_moves[-1]
-                                branch_moves[-1] = (from_id, decision.profile_id, "transient_429")
+                        # _branch_decision already re-pinned message traffic
+                        # to this branch-aware choice. Mark the move as the
+                        # transient-429 failover, while the response wrapper
+                        # remains owned by the Profile that actually serves.
+                        if branch_moves:
+                            from_id, _, _ = branch_moves[-1]
+                            branch_moves[-1] = (from_id, decision.profile_id, "transient_429")
                     decision = RoutingDecision(profile_id=decision.profile_id, reason="transient_failover")
 
             for from_id, to_id, why in branch_moves:
@@ -3936,12 +3939,12 @@ class Gateway:
         while len(self._branch_pins) >= BRANCH_PIN_CAP:
             eviction_pool = [
                 k for k in self._branch_pins
-                if not self._branch_has_open_response_locked(k, now)
+                if not self._branch_has_open_response_locked(k)
             ]
             if not eviction_pool:
-                # Every retained pin has a fresh open response. Keep all of
-                # them routable until a body closes; the map may exceed its
-                # cap temporarily rather than moving an active branch.
+                # Every retained pin has an open response. Keep all of them
+                # routable until a body closes; the map may exceed its cap
+                # temporarily rather than moving an active branch.
                 break
             oldest = min(eviction_pool, key=lambda k: self._branch_pins[k].last_touch)
             del self._branch_pins[oldest]
@@ -3958,34 +3961,32 @@ class Gateway:
         """
         with self._lock:
             now = _pin_clock()
-            response_key = (key, profile_id)
-            if self._branch_open_responses.get(response_key, 0) > 0:
-                self._branch_open_response_activity[response_key] = now
             pin = self._branch_pins.get(key)
             if pin is not None and pin.profile_id == profile_id:
                 pin.last_active = now
 
-    def _branch_response_is_open_locked(self, response_key: tuple, now: float) -> bool:
-        """Whether an open response is still fresh enough to count/protect.
+    def _branch_response_is_open_locked(self, response_key: tuple) -> bool:
+        """Whether a response remains open; caller holds ``self._lock``.
 
-        The response count remains until close/finalize, but a transport that
-        hangs forever must not keep a branch active or make its pin immortal.
-        Caller holds ``self._lock``.
+        Open responses count and protect their pins until close/finalize, with
+        no staleness exception. Both transports use socket idle timeouts —
+        ``upstream.DEFAULT_TIMEOUT_SECONDS`` is passed to HTTP(S)Connection
+        and ``openai_bridge.DEFAULT_TIMEOUT_SECONDS`` bounds the Codex path —
+        so a stalled pre-header wait or stream raises. The existing exception
+        paths then release both the in-flight slot and this open-response
+        count instead of leaving a request open forever.
         """
-        if self._branch_open_responses.get(response_key, 0) <= 0:
-            return False
-        activity = self._branch_open_response_activity.get(response_key)
-        return activity is not None and now - activity < BRANCH_PIN_TTL_SECONDS
+        return self._branch_open_responses.get(response_key, 0) > 0
 
-    def _branch_has_open_response_locked(self, key: tuple, now: float) -> bool:
-        """Whether any fresh response still belongs to ``key``.
+    def _branch_has_open_response_locked(self, key: tuple) -> bool:
+        """Whether any open response still belongs to ``key``.
 
         A branch can have an old response on its former Profile while its pin
         now names another one, so eviction protection is branch-wide rather
         than limited to the pin's current Profile. Caller holds the lock.
         """
         return any(response_key[0] == key
-                   and self._branch_response_is_open_locked(response_key, now)
+                   and self._branch_response_is_open_locked(response_key)
                    for response_key in self._branch_open_responses)
 
     def _open_branch_response_locked(self, key: Optional[tuple], profile_id: str,
@@ -4008,7 +4009,6 @@ class Gateway:
             self._branch_open_response_details[response_key] = details
         self._branch_open_responses[response_key] = (
             self._branch_open_responses.get(response_key, 0) + 1)
-        self._branch_open_response_activity[response_key] = _pin_clock()
         return True
 
     def _close_branch_response_locked(self, key: tuple, profile_id: str) -> None:
@@ -4019,16 +4019,15 @@ class Gateway:
             self._branch_open_responses[response_key] = remaining
         else:
             self._branch_open_responses.pop(response_key, None)
-            self._branch_open_response_activity.pop(response_key, None)
             self._branch_open_response_details.pop(response_key, None)
 
     def _branch_counts(self) -> dict:
         """Agents active in the shared five-minute load window per Profile.
 
-        A fresh open response counts regardless of its last yielded byte;
-        otherwise the selector's least-loaded tie-break would drop a silent
-        stream. Its activity is bounded by the one-hour pin TTL so a hung
-        transport cannot count forever or protect a pin forever.
+        An open response counts regardless of its last yielded byte or pin
+        age; otherwise the selector's least-loaded tie-break would drop a
+        silent stream. Socket idle timeouts bound how long a stalled transport
+        can remain open, and its exception path releases the count.
         """
         counts: dict = {}
         now = _pin_clock()
@@ -4037,7 +4036,7 @@ class Gateway:
         represented: set[tuple] = set()
         for key, pin in self._branch_pins.items():
             represented.add((key, pin.profile_id))
-            open_response = self._branch_response_is_open_locked((key, pin.profile_id), now)
+            open_response = self._branch_response_is_open_locked((key, pin.profile_id))
             if pin.last_touch <= retention_cutoff and not open_response:
                 continue
             last_active = pin.last_active if pin.last_active is not None else pin.last_touch
@@ -4048,7 +4047,7 @@ class Gateway:
         # assignment too, without making the replacement pin look active.
         for response_key in self._branch_open_responses:
             key, profile_id = response_key
-            if self._branch_response_is_open_locked(response_key, now) and response_key not in represented:
+            if self._branch_response_is_open_locked(response_key) and response_key not in represented:
                 counts[profile_id] = counts.get(profile_id, 0) + 1
         return counts
 
@@ -4341,7 +4340,7 @@ class Gateway:
             pins = []
             represented = set()
             for key, pin in self._branch_pins.items():
-                open_response = self._branch_response_is_open_locked((key, pin.profile_id), now)
+                open_response = self._branch_response_is_open_locked((key, pin.profile_id))
                 if pin.last_touch <= retention_cutoff and not open_response:
                     continue
                 represented.add((key, pin.profile_id))
@@ -4354,7 +4353,7 @@ class Gateway:
             # Keep an old serving assignment visible if a later request
             # re-routed the branch after the old pin expired or was evicted.
             for response_key in self._branch_open_responses:
-                if (not self._branch_response_is_open_locked(response_key, now)
+                if (not self._branch_response_is_open_locked(response_key)
                         or response_key in represented):
                     continue
                 key, profile_id = response_key

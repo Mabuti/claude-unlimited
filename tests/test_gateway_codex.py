@@ -1,4 +1,5 @@
 import json
+import socket
 import threading
 import time as real_time
 
@@ -116,6 +117,24 @@ def test_branch_response_counts_before_codex_headers(pool_env, monkeypatch):
     assert not worker.is_alive()
     list(result_holder[0].body_chunks)
     assert gw._branch_open_responses == {}
+
+
+def test_codex_socket_timeout_before_headers_releases_branch_activity(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex_profile()]))
+
+    def fake_run(profile, credential, body, timeout=120, parity=None, context=None):
+        raise socket.timeout("stalled before headers")
+
+    monkeypatch.setattr(gateway_module.openai_bridge, "run", fake_run)
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("unused")))
+    headers = {"x-claude-code-session-id": "s1", "x-claude-code-agent-id": "ag1"}
+
+    with pytest.raises(socket.timeout):
+        gw.handle("POST", "/v1/messages", headers, b'{"stream": true}', distribute=True)
+
+    assert gw._in_flight_count == {}
+    assert gw._branch_open_responses == {}
+    assert gw.serving_now_ids() == set()
 
 
 def test_rotating_onto_a_codex_profile_announces_it_and_answers(pool_env, monkeypatch):

@@ -333,10 +333,15 @@ by the whole lineage. Together they form a **branch key**: `(session_id, agent_i
 Branches matter because the prompt cache is per-account. Rotating a branch to a different
 account costs a full cache miss; keeping a branch on one account keeps it warm. So the
 gateway holds `_branch_pins`: a bounded, TTL'd `branch key → profile` map (1 h, 512
-entries). It evicts the oldest closed pin first; a pin with a fresh open response is never
-evicted. If every pin is open, the map may temporarily exceed its cap, then shrinks as
-responses close and new pins are added. An open response idle for more than one hour no
-longer counts as active or protects its pin. It is a routing preference, never a guarantee
+entries). It evicts the oldest closed pin first; a pin with an open response is never
+evicted. If every pin is open, the cap may be exceeded temporarily, but that overflow is
+bounded by actual concurrent open requests: each one holds a live socket bounded by the
+idle timeouts in `claude_unlimited/upstream.py` (`DEFAULT_TIMEOUT_SECONDS`, passed to
+`HTTP(S)Connection`) and `claude_unlimited/openai_bridge.py` (`DEFAULT_TIMEOUT_SECONDS`).
+When either a stalled pre-header wait or a stalled stream raises, the existing exception
+path releases the in-flight slot and open-response count; the map then shrinks as responses
+close and new pins are added. An open response counts as active and protects its pin until
+it closes/finalizes, with no staleness exception. It is a routing preference, never a guarantee
 — a pin whose Profile went ineligible, was already attempted this request, or was deleted
 is dropped, and the request falls through to normal rotation.
 

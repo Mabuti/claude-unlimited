@@ -6,7 +6,9 @@ import urllib.request
 import pytest
 
 import claude_unlimited.daemon as daemon
+import claude_unlimited.gateway as gateway_module
 import claude_unlimited.profiles as profile_repo
+from claude_unlimited.config import Pool, Profile, save_pool
 
 
 class FakeSecretStore:
@@ -226,7 +228,6 @@ def test_add_profile_accepts_the_dashboard_form_payload(running_server):
 
 
 def test_branch_pins_expose_active_without_dropping_retained_pins(running_server, monkeypatch):
-    import claude_unlimited.gateway as gateway_module
     from claude_unlimited.gateway import BranchPin
 
     now = [10000.0]
@@ -244,6 +245,38 @@ def test_branch_pins_expose_active_without_dropping_retained_pins(running_server
     by_agent = {pin["agent_id"]: pin for pin in body["pins"]}
     assert by_agent["ag-live"]["active"] is True
     assert by_agent["ag-stale"]["active"] is False
+
+
+def test_status_and_profiles_report_active_window_separately_from_retained_pin(running_server, monkeypatch):
+    from claude_unlimited.gateway import BranchPin
+
+    save_pool(Pool(profiles=[Profile(id="p", name="P", kind="api", automatic=True)]))
+    now = [10000.0]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: now[0])
+    gw = daemon._gateway
+    with gw._lock:
+        gw._branch_pins = {
+            ("s1", "ag1"): BranchPin("p", now[0] - 60, now[0] - 60, "ag1"),
+        }
+        gw._branch_open_responses = {}
+
+    base, _ = running_server
+    status, body = _request(f"{base}/api/status")
+    assert status == 200
+    assert body["live_agents"].get("p") == 1
+    status, body = _request(f"{base}/api/profiles")
+    assert status == 200
+    assert body["profiles"][0]["live_agents"] == 1
+    assert body["profiles"][0]["agents_since"] is not None
+
+    now[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 1
+    status, body = _request(f"{base}/api/status")
+    assert status == 200
+    assert body["live_agents"].get("p", 0) == 0
+    status, body = _request(f"{base}/api/profiles")
+    assert status == 200
+    assert body["profiles"][0]["live_agents"] == 0
+    assert body["profiles"][0]["agents_since"] is not None
 
 
 def test_leave_on_fable_limit_is_on_the_wire_for_every_kind_and_settable(running_server):

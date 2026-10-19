@@ -15,6 +15,7 @@ All offline: fake transport, tmp config, no keychain.
 """
 
 import gc
+import socket
 import threading
 import time as real_time
 from datetime import datetime, timezone
@@ -328,8 +329,9 @@ def test_transient_429_branch_failover_pins_the_profile_that_serves(pool_env, mo
         return fake_response(200, HEALTHY)
 
     gw = Gateway(transport=transport)
-    # Branch assignment chooses A, then the transient failover's global
-    # choose() follows the sticky pointer to C. The pin must follow C too.
+    # Branch assignment chooses A. The retry must use the branch-aware
+    # least-loaded selector, which chooses B after excluding A; global
+    # choose() would follow the sticky pointer to C instead.
     gw._current_profile_id = "c"
     moves = []
     monkeypatch.setattr(gw, "_record_branch_move",
@@ -337,12 +339,46 @@ def test_transient_429_branch_failover_pins_the_profile_that_serves(pool_env, mo
     result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
     list(result.body_chunks)
 
-    assert served == ["a", "c"]
-    assert result.profile_id == "c"
+    assert served == ["a", "b"]
+    assert result.profile_id == "b"
     assert [(pin["agent_id"], pin["profile_id"], pin["active"])
-            for pin in gw.branch_pins()] == [("ag1", "c", True)]
-    assert gw.live_agent_counts() == {"c": 1}
-    assert moves == [("a", "c", "transient_429")]
+            for pin in gw.branch_pins()] == [("ag1", "b", True)]
+    assert gw.live_agent_counts() == {"b": 1}
+    assert moves == [("a", "b", "transient_429")]
+
+
+def test_transient_429_branch_retry_honors_forced_subagent_profile(pool_env, monkeypatch):
+    # The branch was already warm on A before F became the forced subagent
+    # target. A transient 429 on that old pin must move the branch to F, not
+    # let global choose() select another account.
+    save_pool(Pool(profiles=[prof("a", priority=1), prof("c", priority=2), prof("f", priority=9)]))
+    gw = healthy_gateway()
+    assert serve(gw, hdrs(agent="ag1"), distribute=True).profile_id == "a"
+
+    save_pool(Pool(profiles=[prof("a", priority=1), prof("c", priority=2),
+                             prof("f", priority=9, forced_for_subagents=True)]))
+    gw._current_profile_id = "c"
+    served = []
+
+    def transport(req):
+        profile_id = next(pid for pid in ("a", "c", "f") if f"tok-{pid}" in str(req.headers))
+        served.append(profile_id)
+        if profile_id == "a":
+            return fake_response(429, {"x-should-retry": "true"})
+        return fake_response(200, HEALTHY)
+
+    gw._transport = transport
+    moves = []
+    monkeypatch.setattr(gw, "_record_branch_move",
+                        lambda pool, from_id, to_id, why: moves.append((from_id, to_id, why)))
+    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    list(result.body_chunks)
+
+    assert served == ["a", "f"]
+    assert result.profile_id == "f"
+    assert [(pin["agent_id"], pin["profile_id"])
+            for pin in gw.branch_pins()] == [("ag1", "f")]
+    assert moves == [("a", "f", "transient_429")]
 
 
 def test_transient_429_branch_failover_does_not_capture_manual_only_current(pool_env):
@@ -409,7 +445,7 @@ def test_transient_429_ancillary_branch_call_keeps_existing_pin(pool_env):
     ancillary = gw.handle("POST", "/v1/messages/count_tokens", hdrs(agent="ag1"), b"{}",
                            distribute=True)
     list(ancillary.body_chunks)
-    assert served == ["a", "c"]
+    assert served == ["a", "b"]
     assert [pin["profile_id"] for pin in gw.branch_pins()] == ["a"]
 
     next_message = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
@@ -685,22 +721,7 @@ def test_pin_cap_keeps_all_open_pins_routable_when_every_pin_is_open(pool_env, m
     assert gw._branch_open_responses == {}
 
 
-def test_open_response_idle_for_59_minutes_still_counts(pool_env, monkeypatch):
-    save_pool(Pool(profiles=[prof("a")]))
-    clock = [real_time.monotonic()]
-    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
-    gw = healthy_gateway()
-
-    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
-    clock[0] += gateway_module.BRANCH_PIN_TTL_SECONDS - 60
-
-    assert gw.live_agent_counts() == {"a": 1}
-    assert gw.branch_pins()[0]["active"] is True
-    result.body_chunks.close()
-
-
-def test_open_response_idle_past_pin_ttl_stops_counting(pool_env, monkeypatch):
-    monkeypatch.setattr(gateway_module, "BRANCH_PIN_CAP", 1)
+def test_open_response_idle_past_pin_ttl_still_counts_until_close(pool_env, monkeypatch):
     save_pool(Pool(profiles=[prof("a")]))
     clock = [real_time.monotonic()]
     monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
@@ -709,29 +730,39 @@ def test_open_response_idle_past_pin_ttl_stops_counting(pool_env, monkeypatch):
     result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
     clock[0] += gateway_module.BRANCH_PIN_TTL_SECONDS + 1
 
-    assert gw.live_agent_counts() == {}
-    assert gw.branch_pins() == []
-    replacement = gw.handle("POST", "/v1/messages", hdrs(agent="ag2"), b"{}", distribute=True)
-    assert set(gw._branch_pins) == {("s1", "ag2")}
+    assert gw.live_agent_counts() == {"a": 1}
+    assert gw.branch_pins()[0]["active"] is True
     result.body_chunks.close()
-    replacement.body_chunks.close()
     assert gw._branch_open_responses == {}
-
-
-def test_touch_refreshes_an_open_response_after_pin_ttl(pool_env, monkeypatch):
-    save_pool(Pool(profiles=[prof("a")]))
-    clock = [real_time.monotonic()]
-    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
-    gw = healthy_gateway()
-
-    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
-    clock[0] += gateway_module.BRANCH_PIN_TTL_SECONDS + 1
     assert gw.live_agent_counts() == {}
 
-    assert next(result.body_chunks) == b"ok"
-    assert gw.live_agent_counts() == {"a": 1}
-    assert gw.branch_pins()[0]["active"] is True
-    result.body_chunks.close()
+
+def test_anthropic_socket_timeout_before_headers_releases_branch_activity(pool_env):
+    save_pool(Pool(profiles=[prof("a")]))
+
+    def transport(req):
+        raise socket.timeout("stalled before headers")
+
+    gw = Gateway(transport=transport)
+    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+
+    assert result.status == 429
+    assert gw._in_flight_count == {}
+    assert gw._branch_open_responses == {}
+    assert gw.serving_now_ids() == set()
+
+
+def test_in_flight_body_releases_after_finish_base_exception():
+    released = []
+
+    def finish():
+        raise KeyboardInterrupt()
+
+    body = gateway_module._InFlightBody(iter([b"ok"]), lambda: released.append(True),
+                                        finish=finish)
+    with pytest.raises(KeyboardInterrupt):
+        body.close()
+    assert released == [True]
 
 
 def test_branch_response_counts_before_anthropic_headers(pool_env, monkeypatch):
