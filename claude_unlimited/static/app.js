@@ -1214,7 +1214,7 @@ function renderStatStrip(profiles) {
 
   // Agents routed per branch (balancing, forced subagents) never move
   // current_profile_id, so the pointer alone would name a stale account.
-  // Profiles serving live agents are what is actually active; busiest first.
+  // Profiles with recently active agents are what the badge reports; busiest first.
   const serving = profiles.filter((p) => p.live_agents > 0).sort((a, b) => b.live_agents - a.live_agents);
   const activeName = serving.length
     ? serving.slice(0, 2).map((p) => p.name).join(', ') + (serving.length > 2 ? ` +${serving.length - 2}` : '')
@@ -1314,8 +1314,8 @@ function fableLeaveTag(p) {
   return `<span class="subagent-tag" title="${esc(t('profiles.leave_fable_tag_title'))}">${FABLE_TAG_ICON}<span>${esc(t('profiles.leave_fable_tag'))}</span></span>`;
 }
 
-// How many Claude Code agents (main agents and subagents) are pinned to this
-// Profile right now. The live counterpart of "active" for per-branch routing.
+// How many Claude Code agents (main agents and subagents) touched this Profile
+// in the last five minutes. The live counterpart of "active" for routing.
 function liveAgentsPill(p) {
   if (!(p.live_agents > 0)) return '';
   return `<span class="live-agents-pill" title="${esc(t('profiles.live_agents_title'))}">${esc(t('profiles.live_agents_tag').replace('{n}', String(p.live_agents)))}</span>`;

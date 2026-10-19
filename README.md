@@ -674,18 +674,19 @@ separately.
 
 **`code --distribute`** balances the session across your pool. Each new agent — the main
 agent when the session starts, and each subagent when it's spawned — goes to the account
-with the **fewest agents already working on it**, counted across all your sessions (ties go
-to your priority order, then to the least-used account). It then *stays* there, so it keeps
+with the **fewest agents active in the last 5 minutes**, counted across all your sessions
+(ties go to your priority order, then to the least-used account). It then *stays* there, so it keeps
 its own prompt cache warm instead of paying a cache miss on every rotation.
 
 > **Balancing happens only when an agent starts — never mid-session.** An agent moves only
 > if its account reaches its switch threshold or a usage limit, becomes unavailable (turned
 > off, cooling down, needs re-auth), or the agent sits idle for an hour. It balances by how
-> many agents each account is serving, not by usage percentage, so usage evens out roughly
-> over many sessions rather than exactly.
+> many agents have been active on each account in the last 5 minutes, not by usage
+> percentage, so usage evens out roughly over many sessions rather than exactly.
 
-While agents are spread out, each profile on the dashboard shows how many it is serving
-(**Agents: N**), and every agent moved off an unavailable account is logged in Activity.
+While agents are spread out, each profile on the dashboard shows how many agents were
+active in the last 5 minutes (**Agents: N**), and every agent moved off an unavailable
+account is logged in Activity.
 
 **Settings → Session routing → "Balance sessions and subagents across accounts"** makes that
 the default for every session, with no flag to remember. **Off by default**, because it changes how your

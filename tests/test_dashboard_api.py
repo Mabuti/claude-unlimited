@@ -225,6 +225,27 @@ def test_add_profile_accepts_the_dashboard_form_payload(running_server):
     assert [p["live_agents"] for p in body["profiles"]] == [0, 0]
 
 
+def test_branch_pins_expose_active_without_dropping_retained_pins(running_server, monkeypatch):
+    import claude_unlimited.gateway as gateway_module
+    from claude_unlimited.gateway import BranchPin
+
+    now = [10000.0]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: now[0])
+    gw = daemon._gateway
+    with gw._lock:
+        gw._branch_pins = {
+            ("s-live", "ag-live"): BranchPin("p-live", now[0] - 240, now[0] - 500, "ag-live"),
+            ("s-stale", "ag-stale"): BranchPin("p-stale", now[0] - 360, now[0] - 900, "ag-stale"),
+        }
+
+    base, _ = running_server
+    status, body = _request(f"{base}/api/branch-pins")
+    assert status == 200
+    by_agent = {pin["agent_id"]: pin for pin in body["pins"]}
+    assert by_agent["ag-live"]["active"] is True
+    assert by_agent["ag-stale"]["active"] is False
+
+
 def test_leave_on_fable_limit_is_on_the_wire_for_every_kind_and_settable(running_server):
     """The Add Profile form and the detail panel both send it; /api/profiles
     reports it for oauth, codex and api alike (the UI hides it for api)."""

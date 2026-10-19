@@ -374,6 +374,73 @@ def test_live_agent_counts_show_where_agents_actually_are(pool_env):
     assert sum(counts.values()) == 3 and set(counts) == {"a", "b"}
 
 
+def test_a_retained_pin_ages_out_of_active_count_but_stays_on_its_account(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    gw = healthy_gateway()
+    clock = [real_time.monotonic()]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+
+    assert serve(gw, hdrs(agent="ag1"), distribute=True).profile_id == "a"
+    clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 60
+
+    assert gw.live_agent_counts() == {}
+    pins = gw.branch_pins()
+    assert len(pins) == 1 and pins[0]["active"] is False
+    # Active-count expiry must not be pin expiry: the branch remains sticky.
+    assert serve(gw, hdrs(agent="ag1"), distribute=True).profile_id == "a"
+
+
+def test_a_recent_pin_is_in_the_active_count(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    gw = healthy_gateway()
+    clock = [real_time.monotonic()]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+
+    serve(gw, hdrs(agent="ag1"), distribute=True)
+    clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS - 60
+
+    assert gw.live_agent_counts() == {"a": 1}
+    assert gw.branch_pins()[0]["active"] is True
+
+
+def test_new_branch_balancer_ignores_stale_retained_pins(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2)]))
+    gw = healthy_gateway()
+    clock = [real_time.monotonic()]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+
+    assert serve(gw, hdrs(agent="old"), distribute=True).profile_id == "a"
+    clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 60
+
+    # With the old one-hour count this would choose B; with the shared
+    # five-minute count A and B tie, so priority chooses A.
+    assert gw.live_agent_counts() == {}
+    assert serve(gw, hdrs(agent="new"), distribute=True).profile_id == "a"
+
+
+def test_streaming_branch_response_refreshes_pin_activity(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a")]))
+    gw = healthy_gateway()
+    clock = [real_time.monotonic()]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+
+    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 1
+    assert gw.live_agent_counts() == {}
+
+    # The first streamed byte refreshes the pin, so a long response remains
+    # active instead of disappearing from the badge mid-response.
+    assert next(result.body_chunks) == b"ok"
+    assert gw.live_agent_counts() == {"a": 1}
+
+    # Completion also refreshes it, including an empty/silent tail after the
+    # last byte has already aged beyond the active window.
+    clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 1
+    with pytest.raises(StopIteration):
+        next(result.body_chunks)
+    assert gw.live_agent_counts() == {"a": 1}
+
+
 def test_agents_moved_off_an_unavailable_account_are_logged_and_notified_once(pool_env, monkeypatch):
     """With every agent branch-routed, no request moves the pointer, so the
     old "Rotated" path never fired. Each move is logged; the notification fires

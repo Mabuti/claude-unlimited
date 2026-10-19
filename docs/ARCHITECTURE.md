@@ -381,7 +381,7 @@ Branch routing bypasses the "Rotated" global-pointer update the way a session pi
 branch choosing its own account must not move the pointer every other session follows.
 Because that traffic never moves `current_profile_id`, the Dashboard reads
 `Gateway.live_agent_counts()` (`live_agents` in `/api/status` and `/api/profiles`) to show
-which accounts are actually serving agents. When a live pin has to be re-assigned because
+which accounts had agents active in the last five minutes. When a retained pin has to be re-assigned because
 its account stopped being eligible, `_record_branch_move` logs every move and fires the
 "rotated" notification at most once per source account every
 `BRANCH_MOVE_NOTIFY_INTERVAL_SECONDS`. The branch key itself — a full JSON parse of the
