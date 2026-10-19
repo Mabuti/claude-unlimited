@@ -276,7 +276,8 @@ class Settings:
     notify_needs_attention: bool = True
     # Make `code --distribute` the default for every session (UI: "Balance
     # sessions and subagents across accounts"): each new agent starts on the
-    # least-busy account and stays there. OFF by default — it changes how
+    # account with fewest agents active in the last 5 minutes (an open response
+    # or recent activity) and stays there. OFF by default — it changes how
     # accounts are consumed, so it must be chosen, never inherited. The flag
     # stays available per-session either way; the two are OR-ed, so this
     # setting can only ever turn distribution ON, never override a `--profile`

@@ -288,8 +288,9 @@ def choose_for_new_branch(pool: PoolSnapshot, now: datetime,
     priority": its job is to spread branches so one account isn't drained
     while another sits idle. Ordering, in force:
 
-      1. fewest branches currently pinned to it (`branch_counts`) — the
-         spreading rule, and it has to come FIRST. Any other leading key
+      1. fewest agents active on it in the last five minutes (`branch_counts`;
+         an open response or recent activity) — the spreading rule, and it
+         has to come FIRST. Any other leading key
          (priority, utilization) is the same for every branch of a session,
          so every branch would pick the same winner and "each subagent gets
          its own account" would quietly become "all of them share one".

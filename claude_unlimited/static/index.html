@@ -1502,7 +1502,7 @@
         <div class="field-row">
           <div class="field-text">
             <div class="field-title" data-i18n="settings.routing.distribute_label">Balance sessions and subagents across accounts</div>
-            <div class="field-sub" data-i18n="settings.routing.distribute_sub">Each new agent starts on the least-busy account. Same as launching every session with --distribute. Off by default.</div>
+            <div class="field-sub" data-i18n="settings.routing.distribute_sub">Each new agent starts on the account with fewest agents active in the last 5 minutes (an open response or recent activity). Same as launching every session with --distribute. Off by default.</div>
           </div>
           <div class="toggle off" id="distributeDefaultToggle" data-field="distribute_sessions_default"><div class="toggle-knob"></div></div>
         </div>
@@ -1531,7 +1531,7 @@
           </div>
           <div class="routing-example">
             <div class="routing-example-title" data-i18n="settings.routing.example_on_title">Setting ON — agents spread across accounts</div>
-            <div class="routing-example-body" data-i18n="settings.routing.example_on">Example: the same audit, with the setting on. The agent you type at starts on Personal Max, the first subagent on Work Max, the second on Codex — all three at the same time, each on the account that was least busy when it started. Each stays on its own account until it finishes. If Work Max reaches its threshold mid-task, only the subagent on Work Max moves; the other two stay where they are.</div>
+            <div class="routing-example-body" data-i18n="settings.routing.example_on">Example: the same audit, with the setting on. The agent you type at starts on Personal Max, the first subagent on Work Max, the second on Codex — all three at the same time, each on the account with fewest agents active in the last 5 minutes when it started. Each stays on its own account until it finishes. If Work Max reaches its threshold mid-task, only the subagent on Work Max moves; the other two stay where they are.</div>
           </div>
           <div class="routing-note" data-i18n="settings.routing.note">Still available per session either way: cu code --distribute turns balancing on for one session while this is off. cu code --profile &lt;name&gt; always wins over both and pins the main agent to one account; its subagents go to a profile marked "Forced in subagents" if there is one, held just as strictly — never rerouted (if that profile is disabled, they follow the pin).</div>
         </div>
@@ -2054,7 +2054,7 @@
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.code">Starts the daemon if it isn't already running, then launches claude routed through your pool. With more than one enabled Profile, prompts you to pick one for this session (or Rotated accounts for the default automatic behavior) — pass --profile &lt;name&gt; to skip the prompt, or run non-interactively for the same default. --distribute instead balances the session across accounts: the main agent and each subagent start on the least-busy account and stay there, each keeping its own prompt cache warm. Any other extra arguments pass straight through to claude. It also repairs the cu shortcut if an update left it missing. The executable it launches is whatever Settings → Launch commands has for Claude Code.</div>
+          <div class="field-sub" data-i18n="help.cmd.code">Starts the daemon if it isn't already running, then launches claude routed through your pool. With more than one enabled Profile, prompts you to pick one for this session (or Rotated accounts for the default automatic behavior) — pass --profile &lt;name&gt; to skip the prompt, or run non-interactively for the same default. --distribute instead balances the session across accounts: the main agent and each subagent start on the account with fewest agents active in the last 5 minutes and stay there, each keeping its own prompt cache warm. Any other extra arguments pass straight through to claude. It also repairs the cu shortcut if an update left it missing. The executable it launches is whatever Settings → Launch commands has for Claude Code.</div>
         </div>
         <div class="divider"></div>
         <div class="cmd-row">
@@ -2114,7 +2114,7 @@
           </tr>
           <tr>
             <td class="mono">cu code --distribute</td>
-            <td data-i18n="help.routing.r_distribute">The main agent and each subagent start on the least-busy account and stay there, each keeping its own prompt cache warm. No rebalancing mid-session.</td>
+            <td data-i18n="help.routing.r_distribute">The main agent and each subagent start on the account with fewest agents active in the last 5 minutes and stay there, each keeping its own prompt cache warm. No rebalancing mid-session.</td>
           </tr>
           <tr>
             <td data-i18n="help.routing.r_setting_how">Settings → Session routing</td>

@@ -14,6 +14,7 @@ Two modes are covered:
 All offline: fake transport, tmp config, no keychain.
 """
 
+import gc
 import time as real_time
 from datetime import datetime, timezone
 
@@ -426,19 +427,113 @@ def test_streaming_branch_response_refreshes_pin_activity(pool_env, monkeypatch)
 
     result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
     clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 1
-    assert gw.live_agent_counts() == {}
+    # An open response remains active through a silent gap, even before it
+    # yields its first byte.
+    assert gw.live_agent_counts() == {"a": 1}
+    assert gw.branch_pins()[0]["active"] is True
 
-    # The first streamed byte refreshes the pin, so a long response remains
-    # active instead of disappearing from the badge mid-response.
+    # The first streamed byte refreshes the activity timestamp too, so a long
+    # response remains active after it eventually closes.
     assert next(result.body_chunks) == b"ok"
     assert gw.live_agent_counts() == {"a": 1}
 
-    # Completion also refreshes it, including an empty/silent tail after the
-    # last byte has already aged beyond the active window.
+    # The open-response count covers a silent tail after the last byte has
+    # already aged beyond the active window.
     clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 1
+    assert gw.live_agent_counts() == {"a": 1}
     with pytest.raises(StopIteration):
         next(result.body_chunks)
-    assert gw.live_agent_counts() == {"a": 1}
+    assert gw.live_agent_counts() == {"a": 1}  # finish records last_active
+
+    clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 1
+    assert gw.live_agent_counts() == {}
+
+
+def test_a_branch_response_with_no_body_releases_its_slot(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a")]))
+    clock = [real_time.monotonic()]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+
+    def transport(req):
+        return UpstreamResponse(status=200, headers=HEALTHY, body_chunks=None,
+                                connection=FakeConnection())
+
+    gw = Gateway(transport=transport)
+    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 1
+
+    assert result.body_chunks is None
+    assert gw._branch_open_responses == {}
+    assert gw.serving_now_ids() == set()
+
+    assert gw.live_agent_counts() == {}
+    assert gw.branch_pins()[0]["active"] is False
+
+
+def test_discarded_and_finalized_branch_bodies_release_activity_and_slots(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a")]))
+    clock = [real_time.monotonic()]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+    gw = healthy_gateway()
+
+    discarded = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    discarded.body_chunks.close()
+    assert gw._branch_open_responses == {}
+    assert gw.serving_now_ids() == set()
+
+    finalized = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    body = finalized.body_chunks
+    del finalized
+    with gw._lock:
+        del body
+        gc.collect()
+
+    deadline = real_time.monotonic() + 2
+    while gw.serving_now_ids() and real_time.monotonic() < deadline:
+        real_time.sleep(0.01)
+    assert gw.serving_now_ids() == set()
+    assert gw._branch_open_responses == {}
+
+    clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 1
+    assert gw.live_agent_counts() == {}
+
+
+def test_streaming_activity_does_not_extend_pin_retention(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a")]))
+    start = real_time.monotonic()
+    clock = [start]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+    gw = healthy_gateway()
+
+    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    clock[0] += 600
+    assert next(result.body_chunks) == b"ok"
+    assert gw.branch_pins()[0]["active"] is True
+
+    clock[0] = start + gateway_module.BRANCH_PIN_TTL_SECONDS + 1
+    assert gw.branch_pins() == []
+    assert gw.live_agent_counts() == {}
+    result.body_chunks.close()
+    assert gw.serving_now_ids() == set()
+
+
+def test_old_response_finish_does_not_activate_a_moved_pin(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    start = real_time.monotonic()
+    clock = [start]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+    gw = healthy_gateway()
+
+    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    key = ("s1", "ag1")
+    with gw._lock:
+        gw._remember_pin(key, "b", None)
+    clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 1
+
+    result.body_chunks.close()
+    assert gw.branch_pins()[0]["profile_id"] == "b"
+    assert gw.branch_pins()[0]["active"] is False
+    assert gw.live_agent_counts() == {}
 
 
 def test_agents_moved_off_an_unavailable_account_are_logged_and_notified_once(pool_env, monkeypatch):

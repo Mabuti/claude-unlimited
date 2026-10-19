@@ -102,8 +102,7 @@ def _pool_retry_after_seconds(pool: PoolSnapshot, now: datetime) -> Optional[int
 BRANCH_PIN_TTL_SECONDS = 3600.0
 # How long a pin's recent activity contributes to the Dashboard count and
 # new-branch balancing. Separate from retention: pins stay warm for an hour,
-# while short-lived helper calls should stop affecting load after the
-# five-minute Claude Code prompt-cache window.
+# while the shared badge/balancer load window is only five minutes.
 ACTIVE_AGENT_WINDOW_SECONDS = 300.0
 # Hard ceiling so a long-lived daemon can't accumulate pins without bound;
 # oldest-touched is evicted first.
@@ -954,15 +953,20 @@ def _restorable_state_fields(persisted: Optional[dict], now: datetime) -> dict:
 
 @dataclass
 class BranchPin:
-    """Which account one conversation branch is bound to, and when it was last
-    used (for TTL/LRU eviction). agent_id/parent_agent_id are carried for the
-    Dashboard's session tree only — routing keys on the map key, not these."""
+    """Which account one conversation branch is bound to.
+
+    ``last_touch`` is request-start activity for TTL/LRU eviction. Streaming
+    activity belongs in ``last_active`` instead, so a long response cannot
+    extend the one-hour pin retention window. ``None`` keeps direct test and
+    compatibility construction safe; live pins always set it explicitly.
+    """
 
     profile_id: str
     last_touch: float  # time.monotonic()
     created_at: float
     agent_id: str
     parent_agent_id: Optional[str] = None
+    last_active: Optional[float] = None  # recent activity for the 5-minute load window
 
 
 def _blocked_models_for(profile: Profile, model_usage, settings, now: datetime,
@@ -1281,6 +1285,10 @@ class Gateway:
         # it is mutable cross-request state with a clock and a lock — exactly
         # what that module's purity contract excludes.
         self._branch_pins: dict[tuple, BranchPin] = {}
+        # Number of open responses for each branch/profile assignment. The
+        # Profile id is part of the key so an old response cannot make a pin
+        # that moved to another Profile look active.
+        self._branch_open_responses: dict[tuple, int] = {}
         self._branch_move_notified_at: dict[str, float] = {}
         # Epoch seconds of each Profile's last usage reading, from any source
         # (real traffic or usage_probe) — so a background check can skip an
@@ -3850,7 +3858,9 @@ class Gateway:
                       and rt.automatic and not must_leave(rt, now)]
             if others:
                 return None
-        pin.last_touch = _pin_clock()
+        now = _pin_clock()
+        pin.last_touch = now
+        pin.last_active = now
         return pin.profile_id
 
     def _remember_pin(self, key: tuple, profile_id: str, parent_agent_id: Optional[str]) -> None:
@@ -3863,12 +3873,14 @@ class Gateway:
                 existing.created_at = now
             existing.profile_id = profile_id
             existing.last_touch = now
+            existing.last_active = now
             return
         if len(self._branch_pins) >= BRANCH_PIN_CAP:
             oldest = min(self._branch_pins, key=lambda k: self._branch_pins[k].last_touch)
             del self._branch_pins[oldest]
         self._branch_pins[key] = BranchPin(profile_id=profile_id, last_touch=now, created_at=now,
-                                            agent_id=key[1], parent_agent_id=parent_agent_id)
+                                            agent_id=key[1], parent_agent_id=parent_agent_id,
+                                            last_active=now)
 
     def _touch_branch_pin(self, key: tuple, profile_id: str) -> None:
         """Refresh a branch pin only while its response still belongs to it.
@@ -3880,16 +3892,51 @@ class Gateway:
         with self._lock:
             pin = self._branch_pins.get(key)
             if pin is not None and pin.profile_id == profile_id:
-                pin.last_touch = _pin_clock()
+                pin.last_active = _pin_clock()
+
+    def _open_branch_response(self, key: Optional[tuple], profile_id: str) -> bool:
+        """Record one open response for the current branch/profile pair.
+
+        The response owns this count until its body closes, drains, fails, or
+        is finalized. A profile guard keeps a response that raced with a pin
+        move from charging the replacement assignment.
+        """
+        if key is None:
+            return False
+        with self._lock:
+            pin = self._branch_pins.get(key)
+            if pin is None or pin.profile_id != profile_id:
+                return False
+            response_key = (key, profile_id)
+            self._branch_open_responses[response_key] = (
+                self._branch_open_responses.get(response_key, 0) + 1)
+            return True
+
+    def _close_branch_response_locked(self, key: tuple, profile_id: str) -> None:
+        """Release one branch response; caller holds ``self._lock``."""
+        response_key = (key, profile_id)
+        remaining = self._branch_open_responses.get(response_key, 0) - 1
+        if remaining > 0:
+            self._branch_open_responses[response_key] = remaining
+        else:
+            self._branch_open_responses.pop(response_key, None)
 
     def _branch_counts(self) -> dict:
-        """Recently active pins per Profile — the selector's least-loaded
-        tie-break, so two equally-utilized accounts alternate instead of both
-        taking every branch."""
+        """Agents active in the shared five-minute load window per Profile.
+
+        An open response counts regardless of its last yielded byte; otherwise
+        the selector's least-loaded tie-break would drop a silent stream.
+        """
         counts: dict = {}
-        cutoff = _pin_clock() - ACTIVE_AGENT_WINDOW_SECONDS
-        for pin in self._branch_pins.values():
-            if pin.last_touch > cutoff:
+        now = _pin_clock()
+        cutoff = now - ACTIVE_AGENT_WINDOW_SECONDS
+        retention_cutoff = now - BRANCH_PIN_TTL_SECONDS
+        for key, pin in self._branch_pins.items():
+            if pin.last_touch <= retention_cutoff:
+                continue
+            last_active = pin.last_active if pin.last_active is not None else pin.last_touch
+            open_response = self._branch_open_responses.get((key, pin.profile_id), 0) > 0
+            if open_response or last_active > cutoff:
                 counts[pin.profile_id] = counts.get(pin.profile_id, 0) + 1
         return counts
 
@@ -4150,10 +4197,9 @@ class Gateway:
             return dict(self._usage_observed_at)
 
     def live_agent_counts(self) -> dict:
-        """Recently active branch pins per Profile id, for the Dashboard:
-        how many main agents and subagents touched each account in the last
-        five minutes. Needed because branch-routed traffic never moves
-        current_profile_id."""
+        """Agents active in the shared five-minute window per Profile id, for
+        the Dashboard: an open response or recent activity. Needed because
+        branch-routed traffic never moves current_profile_id."""
         with self._lock:
             return self._branch_counts()
 
@@ -4181,7 +4227,9 @@ class Gateway:
             return [
                 {"session_id": key[0], "agent_id": pin.agent_id,
                  "parent_agent_id": pin.parent_agent_id, "profile_id": pin.profile_id,
-                 "active": pin.last_touch > active_cutoff}
+                 "active": (self._branch_open_responses.get((key, pin.profile_id), 0) > 0
+                             or (pin.last_active if pin.last_active is not None else pin.last_touch)
+                             > active_cutoff)}
                 for key, pin in self._branch_pins.items()
                 if pin.last_touch > retention_cutoff
             ]
@@ -4233,6 +4281,31 @@ class Gateway:
             self._lock.release()
         return True
 
+    def _release_in_flight_and_branch(self, profile_id: str, branch_key: Optional[tuple],
+                                      branch_response_open: bool) -> None:
+        """Release the Profile slot and its branch response under one lock."""
+        with self._lock:
+            try:
+                self._mark_profile_idle(profile_id)
+            finally:
+                if branch_response_open and branch_key is not None:
+                    self._close_branch_response_locked(branch_key, profile_id)
+
+    def _try_release_in_flight_and_branch(self, profile_id: str, branch_key: Optional[tuple],
+                                          branch_response_open: bool) -> bool:
+        """Non-blocking counterpart used by ``_InFlightBody`` finalizers."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            try:
+                self._mark_profile_idle(profile_id)
+            finally:
+                if branch_response_open and branch_key is not None:
+                    self._close_branch_response_locked(branch_key, profile_id)
+        finally:
+            self._lock.release()
+        return True
+
     def _wrap_with_in_flight_clear(self, chunks, profile_id: str, *closers,
                                    branch_key: Optional[tuple] = None):
         """Hands the in-flight slot taken for this response to the body
@@ -4240,9 +4313,10 @@ class Gateway:
         closed — including closed before anything was read, which is what a
         discarded result looks like (see _InFlightBody). `closers` are the
         upstream objects behind `chunks` (raw body, connection) that must be
-        closed with it. Branch-routed responses also refresh their pin while
-        bytes flow and when the response finishes, so a long stream does not
-        disappear from the five-minute active count mid-response."""
+        closed with it. Branch-routed responses count while open and refresh
+        their activity timestamp while bytes flow and when the response
+        finishes, so a long stream does not disappear from the five-minute
+        active count mid-response."""
         def touch() -> None:
             self._touch_in_flight(profile_id)
             if branch_key is not None:
@@ -4252,15 +4326,20 @@ class Gateway:
             if branch_key is not None:
                 self._touch_branch_pin(branch_key, profile_id)
 
+        branch_response_open = self._open_branch_response(branch_key, profile_id)
+
         if chunks is None:
             finish()
-            with self._lock:
-                self._mark_profile_idle(profile_id)
+            self._release_in_flight_and_branch(profile_id, branch_key, branch_response_open)
             _close_all(closers)
             return chunks
-        return _InFlightBody(chunks, lambda: self._release_in_flight(profile_id), closers,
-                             try_release=lambda: self._try_release_in_flight(profile_id),
-                             touch=touch, finish=finish)
+        return _InFlightBody(
+            chunks,
+            lambda: self._release_in_flight_and_branch(profile_id, branch_key, branch_response_open),
+            closers,
+            try_release=lambda: self._try_release_in_flight_and_branch(
+                profile_id, branch_key, branch_response_open),
+            touch=touch, finish=finish)
 
     def _touch_in_flight(self, profile_id: str) -> None:
         """A response body on this Profile just delivered bytes: its in-flight

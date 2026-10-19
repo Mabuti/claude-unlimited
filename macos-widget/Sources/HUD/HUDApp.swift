@@ -579,7 +579,7 @@ struct DetailCard: View {
         if profile.needsReauth { return "needs re-auth · sign in from the Dashboard" }
         if profile.isServing {
             let n = profile.liveAgents ?? 0
-            var line = n > 0 ? "serving now · \(n) agent\(n == 1 ? "" : "s")" : "serving now"
+            var line = n > 0 ? "\(n) agent\(n == 1 ? "" : "s") in last 5 min" : "serving now"
             // How long agents have been on this account, not one request.
             if let since = Fmt.elapsed(since: profile.agentsSince) { line += " · \(since)" }
             return line

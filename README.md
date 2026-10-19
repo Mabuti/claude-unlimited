@@ -714,7 +714,7 @@ Which one wins, in order:
 |---|---|
 | `cu code --profile <name>` | That terminal's main agent uses that account, never rotated. Its subagents do too — unless a profile is marked "Force in subagents", in which case they go there, just as strictly. |
 | "Force in subagents" on a profile | Every subagent goes there; the main agent rotates normally (or stays pinned, with `--profile`). |
-| `cu code --distribute` | Main agent and each subagent start on the least-busy account and stay there, that session. |
+| `cu code --distribute` | Main agent and each subagent start on the account with fewest agents active in the last 5 minutes (an open response or recent activity) and stay there for that session; the pin is retained for up to one hour. |
 | Settings → "Balance sessions and subagents across accounts" | Same as above, for every session, no flag needed. |
 | *nothing set (default)* | Normal rotation — everyone shares one account until it's spent. |
 
@@ -1181,7 +1181,7 @@ Every command below also works under the short alias **`cu`** — e.g. `cu code`
 |---|---|
 | `claude-unlimited code` | **The one you'll use.** Launches `claude` routed through your pool — or whatever **Settings → Launch commands** has in its place. Also repairs the `cu` shortcut if an update dropped it. |
 | `claude-unlimited code --profile <name>` | Pin the session to one account instead of rotating. |
-| `claude-unlimited code --distribute` | Balance the session across accounts — the main agent and each subagent start on the least-busy account and stay there, each keeping its own prompt cache warm. |
+| `claude-unlimited code --distribute` | Balance the session across accounts — the main agent and each subagent start on the account with fewest agents active in the last 5 minutes (an open response or recent activity) and stay there, each keeping its own prompt cache warm; the pin is retained for up to one hour. |
 | `claude-unlimited codex [--port <n>] [--account <name>] [--] [codex args…]` | Launches the real **Codex CLI**, routed through your pool's enabled Codex/ChatGPT accounts — needs at least one (add-codex-account). Routes with `-c` overrides on the command line only; it never edits `~/.codex/config.toml`. A Codex session never moves the Claude Code rotation, and each Codex session stays on the account that served it until that account runs out, needs re-auth or is cooling down. With more than one enabled Codex account, prompts you to pick one — default is rotated accounts, the same as `cu code` — and `--account <name>` skips the prompt. `--port`, `--account` and `-h`/`--help` are read only right after `codex`, before any other argument (use `cu codex -- --help` for Codex's own help): from the first other argument on, everything goes to `codex` verbatim and in order — including Codex's own `-p`/`--profile`, and a `--port` or `--account` meant for Codex (`cu codex exec --port 9` hands `--port 9` to Codex) — and a `--` right after these options is dropped. |
 | `claude-unlimited desktop` | Route the Claude **desktop app** through your pool, then launch it. `--revert` undoes it. |
 | `claude-unlimited status` | Is the daemon installed and running, and its pid. |

@@ -1,4 +1,5 @@
 import json
+import time as real_time
 
 import pytest
 
@@ -51,6 +52,36 @@ def test_successful_codex_request_returns_200_and_sets_current_profile(pool_env,
     assert result.status == 200
     assert result.profile_id == "c"
     assert gw._current_profile_id == "c"
+
+
+def test_a_branch_routed_codex_stream_stays_active_through_a_silent_gap(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex_profile()]))
+    clock = [real_time.monotonic()]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+
+    def fake_run(profile, credential, body, timeout=120, parity=None, context=None):
+        return OpenAIBridgeResult(status=200, headers={"content-type": "text/event-stream"},
+                                   body_chunks=iter([b"translated frame"]))
+
+    monkeypatch.setattr(gateway_module.openai_bridge, "run", fake_run)
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("unused")))
+    headers = {"x-claude-code-session-id": "s1", "x-claude-code-agent-id": "ag1"}
+    result = gw.handle("POST", "/v1/messages", headers, b'{"stream": true}', distribute=True)
+
+    assert result.profile_id == "c"
+    assert gw.live_agent_counts() == {"c": 1}
+    clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 1
+    assert gw.live_agent_counts() == {"c": 1}  # open, despite no yielded byte
+
+    assert next(result.body_chunks) == b"translated frame"
+    clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 1
+    assert gw.live_agent_counts() == {"c": 1}  # open count covers the silent tail
+
+    result.body_chunks.close()
+    assert gw._branch_open_responses == {}
+    assert gw.serving_now_ids() == set()
+    clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 1
+    assert gw.live_agent_counts() == {}
 
 
 def test_rotating_onto_a_codex_profile_announces_it_and_answers(pool_env, monkeypatch):

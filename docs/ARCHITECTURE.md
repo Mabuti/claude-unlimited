@@ -341,12 +341,14 @@ Precedence for one request, first match wins:
 
 1. **Session pin** (`code --profile`) — every request in the terminal, main and subagents
    alike, goes to that one Profile.
-2. **Live branch pin** — this branch already has a warm account. (`branch_pinned`)
+2. **Live branch pin** — this branch already has a warm account; the pin is
+   retained for up to one hour of request inactivity. (`branch_pinned`)
 3. **Forced-for-subagents Profile** — if a subagent sent this and some Profile carries
    `forced_for_subagents`, and it is eligible. (`subagent_forced`)
-4. **New branch assignment** — `router.choose_for_new_branch()` picks the least-loaded
-   eligible Profile and the choice is remembered as this branch's pin. Only in distribute
-   mode, or for a subagent when a forced Profile exists but is not currently eligible.
+4. **New branch assignment** — `router.choose_for_new_branch()` picks the eligible
+   Profile with fewest agents active in the last five minutes (an open response or
+   recent activity), then remembers the choice as this branch's one-hour pin. Only in
+   distribute mode, or for a subagent when a forced Profile exists but is not currently eligible.
    (`branch_assigned`)
 5. **Normal rotation** — `router.choose()`, sticky-until-threshold.
 
@@ -381,7 +383,9 @@ Branch routing bypasses the "Rotated" global-pointer update the way a session pi
 branch choosing its own account must not move the pointer every other session follows.
 Because that traffic never moves `current_profile_id`, the Dashboard reads
 `Gateway.live_agent_counts()` (`live_agents` in `/api/status` and `/api/profiles`) to show
-which accounts had agents active in the last five minutes. When a retained pin has to be re-assigned because
+which accounts have agents active in the last five minutes (an open response or recent
+activity). This is the same five-minute meaning shown by the HUD; it is separate from
+the one-hour pin-retention view. When a retained pin has to be re-assigned because
 its account stopped being eligible, `_record_branch_move` logs every move and fires the
 "rotated" notification at most once per source account every
 `BRANCH_MOVE_NOTIFY_INTERVAL_SECONDS`. The branch key itself — a full JSON parse of the
