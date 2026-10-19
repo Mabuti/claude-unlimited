@@ -654,21 +654,84 @@ def test_pin_cap_evicts_closed_pins_before_open_responses(pool_env, monkeypatch)
     assert gw._branch_open_responses == {}
 
 
-def test_pin_cap_evicts_an_open_pin_only_when_every_pin_is_open(pool_env, monkeypatch):
+def test_pin_cap_keeps_all_open_pins_routable_when_every_pin_is_open(pool_env, monkeypatch):
     monkeypatch.setattr(gateway_module, "BRANCH_PIN_CAP", 2)
-    save_pool(Pool(profiles=[prof("a")]))
+    save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2),
+                             prof("c", priority=3)]))
     gw = healthy_gateway()
 
-    first = gw.handle("POST", "/v1/messages", hdrs(agent="first"), b"{}", distribute=True)
-    second = gw.handle("POST", "/v1/messages", hdrs(agent="second"), b"{}", distribute=True)
-    third = gw.handle("POST", "/v1/messages", hdrs(agent="third"), b"{}", distribute=True)
+    responses = {
+        agent: gw.handle("POST", "/v1/messages", hdrs(agent=agent), b"{}", distribute=True)
+        for agent in ("first", "second", "third")
+    }
 
-    assert set(gw._branch_pins) == {("s1", "second"), ("s1", "third")}
+    assert len(gw._branch_pins) == 3
     assert {pin["agent_id"] for pin in gw.branch_pins()} == {"first", "second", "third"}
-    assert gw.live_agent_counts() == {"a": 3}
-    for result in (first, second, third):
+    assert {result.profile_id for result in responses.values()} == {"a", "b", "c"}
+    assert gw.live_agent_counts() == {"a": 1, "b": 1, "c": 1}
+
+    # A follow-up on each still-open branch must hit its own retained Profile;
+    # none of the three pins may have been evicted just because the cap was 2.
+    followups = {
+        agent: gw.handle("POST", "/v1/messages", hdrs(agent=agent), b"{}", distribute=True)
+        for agent in responses
+    }
+    assert {followups[agent].profile_id for agent in responses} == {
+        responses[agent].profile_id for agent in responses
+    }
+
+    for result in (*responses.values(), *followups.values()):
         result.body_chunks.close()
     assert gw._branch_open_responses == {}
+
+
+def test_open_response_idle_for_59_minutes_still_counts(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a")]))
+    clock = [real_time.monotonic()]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+    gw = healthy_gateway()
+
+    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    clock[0] += gateway_module.BRANCH_PIN_TTL_SECONDS - 60
+
+    assert gw.live_agent_counts() == {"a": 1}
+    assert gw.branch_pins()[0]["active"] is True
+    result.body_chunks.close()
+
+
+def test_open_response_idle_past_pin_ttl_stops_counting(pool_env, monkeypatch):
+    monkeypatch.setattr(gateway_module, "BRANCH_PIN_CAP", 1)
+    save_pool(Pool(profiles=[prof("a")]))
+    clock = [real_time.monotonic()]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+    gw = healthy_gateway()
+
+    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    clock[0] += gateway_module.BRANCH_PIN_TTL_SECONDS + 1
+
+    assert gw.live_agent_counts() == {}
+    assert gw.branch_pins() == []
+    replacement = gw.handle("POST", "/v1/messages", hdrs(agent="ag2"), b"{}", distribute=True)
+    assert set(gw._branch_pins) == {("s1", "ag2")}
+    result.body_chunks.close()
+    replacement.body_chunks.close()
+    assert gw._branch_open_responses == {}
+
+
+def test_touch_refreshes_an_open_response_after_pin_ttl(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a")]))
+    clock = [real_time.monotonic()]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+    gw = healthy_gateway()
+
+    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    clock[0] += gateway_module.BRANCH_PIN_TTL_SECONDS + 1
+    assert gw.live_agent_counts() == {}
+
+    assert next(result.body_chunks) == b"ok"
+    assert gw.live_agent_counts() == {"a": 1}
+    assert gw.branch_pins()[0]["active"] is True
+    result.body_chunks.close()
 
 
 def test_branch_response_counts_before_anthropic_headers(pool_env, monkeypatch):
@@ -710,6 +773,10 @@ def test_open_response_stays_visible_when_next_request_reroutes_after_retention(
 
     old_response = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
     assert old_response.profile_id == "a"
+    # The pin will expire at the one-hour retention boundary, but a byte
+    # shortly before then keeps the still-open response's activity fresh.
+    clock[0] = start + gateway_module.BRANCH_PIN_TTL_SECONDS - 60
+    assert next(old_response.body_chunks) == b"ok"
     clock[0] = start + gateway_module.BRANCH_PIN_TTL_SECONDS + 1
     new_response = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
 

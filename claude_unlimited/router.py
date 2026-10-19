@@ -294,8 +294,9 @@ def choose_for_new_branch(pool: PoolSnapshot, now: datetime,
          (priority, utilization) is the same for every branch of a session,
          so every branch would pick the same winner and "each subagent gets
          its own account" would quietly become "all of them share one".
-         Count-first makes the assignment round-robin: each account takes a
-         branch before any account takes a second.
+         Count-first makes the assignment round-robin while accounts differ in
+         five-minute activity; when all tie at 0 (e.g. after a quiet spell),
+         it falls through to priority.
       2. priority band — decides the order WITHIN a round, so the user's
          preference still says who is used first, second, third.
       3. least-utilized first (`last_usage_percent`) — accounts are limited

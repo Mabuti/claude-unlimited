@@ -333,9 +333,12 @@ by the whole lineage. Together they form a **branch key**: `(session_id, agent_i
 Branches matter because the prompt cache is per-account. Rotating a branch to a different
 account costs a full cache miss; keeping a branch on one account keeps it warm. So the
 gateway holds `_branch_pins`: a bounded, TTL'd `branch key → profile` map (1 h, 512
-entries, LRU). It is a routing preference, never a guarantee — a pin whose Profile went
-ineligible, was already attempted this request, or was deleted is dropped, and the request
-falls through to normal rotation.
+entries). It evicts the oldest closed pin first; a pin with a fresh open response is never
+evicted. If every pin is open, the map may temporarily exceed its cap, then shrinks as
+responses close and new pins are added. An open response idle for more than one hour no
+longer counts as active or protects its pin. It is a routing preference, never a guarantee
+— a pin whose Profile went ineligible, was already attempted this request, or was deleted
+is dropped, and the request falls through to normal rotation.
 
 Precedence for one request, first match wins:
 
@@ -384,12 +387,14 @@ branch choosing its own account must not move the pointer every other session fo
 Because that traffic never moves `current_profile_id`, the Dashboard reads
 `Gateway.live_agent_counts()` (`live_agents` in `/api/status` and `/api/profiles`) to show
 which accounts have agents active in the last five minutes (an open response or recent
-activity). This is the same five-minute meaning shown by the HUD; it is separate from
-the `in_use_now` recent-use grace signal and the `agents_since` age of the oldest retained pin
-(retention expires after one hour of inactivity). An open response remains in `live_agents`
-even if that pin has passed the retention cutoff, but closing it does not extend the pin and the
-next request may re-assign the branch. `agents_since` can therefore be absent while an open
-response is still counted. When a retained pin has to be re-assigned because
+activity). This is the same five-minute meaning shown by the HUD detail card's session line;
+it is separate from the `in_use_now` recent-use grace signal and the `agents_since` age of the
+oldest retained pin (retention expires after one hour of inactivity). A silent open response
+counts for the badge and balancer, but does not by itself keep "Used now"
+(`_IN_FLIGHT_MAX_SECONDS`). An open response remains in `live_agents` even if that pin has
+passed the retention cutoff, but closing it does not extend the pin and the next request may
+re-assign the branch. `agents_since` can therefore be absent while an open response is still
+counted. When a retained pin has to be re-assigned because
 its account stopped being eligible, `_record_branch_move` logs every move and fires the
 "rotated" notification at most once per source account every
 `BRANCH_MOVE_NOTIFY_INTERVAL_SECONDS`. The branch key itself — a full JSON parse of the

@@ -1314,8 +1314,9 @@ function fableLeaveTag(p) {
   return `<span class="subagent-tag" title="${esc(t('profiles.leave_fable_tag_title'))}">${FABLE_TAG_ICON}<span>${esc(t('profiles.leave_fable_tag'))}</span></span>`;
 }
 
-// How many Claude Code agents (main agents and subagents) touched this Profile
-// in the last five minutes. The live counterpart of "active" for routing.
+// How many Claude Code agents (main agents and subagents) were active on this
+// Profile in the last 5 minutes (an open response or recent activity). The
+// live counterpart of "active" for routing.
 function liveAgentsPill(p) {
   if (!(p.live_agents > 0)) return '';
   return `<span class="live-agents-pill" title="${esc(t('profiles.live_agents_title'))}">${esc(t('profiles.live_agents_tag').replace('{n}', String(p.live_agents)))}</span>`;
