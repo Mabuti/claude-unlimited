@@ -1,4 +1,5 @@
 import json
+import threading
 import time as real_time
 
 import pytest
@@ -82,6 +83,39 @@ def test_a_branch_routed_codex_stream_stays_active_through_a_silent_gap(pool_env
     assert gw.serving_now_ids() == set()
     clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 1
     assert gw.live_agent_counts() == {}
+
+
+def test_branch_response_counts_before_codex_headers(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex_profile()]))
+    clock = [real_time.monotonic()]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+    started = threading.Event()
+    release = threading.Event()
+    result_holder = []
+
+    def fake_run(profile, credential, body, timeout=120, parity=None, context=None):
+        started.set()
+        assert release.wait(2)
+        return OpenAIBridgeResult(status=200, headers={"content-type": "text/event-stream"},
+                                   body_chunks=iter([b"translated frame"]))
+
+    monkeypatch.setattr(gateway_module.openai_bridge, "run", fake_run)
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("unused")))
+    headers = {"x-claude-code-session-id": "s1", "x-claude-code-agent-id": "ag1"}
+    worker = threading.Thread(
+        target=lambda: result_holder.append(
+            gw.handle("POST", "/v1/messages", headers, b'{"stream": true}', distribute=True)))
+    worker.start()
+    assert started.wait(2)
+    try:
+        clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 1
+        assert gw.live_agent_counts() == {"c": 1}
+    finally:
+        release.set()
+    worker.join(2)
+    assert not worker.is_alive()
+    list(result_holder[0].body_chunks)
+    assert gw._branch_open_responses == {}
 
 
 def test_rotating_onto_a_codex_profile_announces_it_and_answers(pool_env, monkeypatch):

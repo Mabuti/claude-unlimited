@@ -752,9 +752,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             now_utc = datetime.now(timezone.utc)
             for item in items:
                 item["live_agents"] = live_agents.get(item["id"], 0)
-                # The widget's "serving now" block. last_* is the latest
-                # COMPLETED request (usage is recorded once known), so it is
-                # labelled as the latest, never as what is running this second.
+                # The widget's recent-use block, not the instant serving_now
+                # signal. last_* is the latest COMPLETED request (usage is
+                # recorded once known), so it is labelled as the latest, never
+                # as what is running this second.
                 last = last_use.get(item["id"]) or {}
                 item["last_model"] = last.get("model")
                 item["last_requested_model"] = last.get("requested_model")

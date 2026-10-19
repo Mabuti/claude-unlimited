@@ -103,9 +103,10 @@ BRANCH_PIN_TTL_SECONDS = 3600.0
 # How long a pin's recent activity contributes to the Dashboard count and
 # new-branch balancing. Separate from retention: pins stay warm for an hour,
 # while the shared badge/balancer load window is only five minutes.
+# Independent of _IN_FLIGHT_MAX_SECONDS below; equal values are coincidental.
 ACTIVE_AGENT_WINDOW_SECONDS = 300.0
 # Hard ceiling so a long-lived daemon can't accumulate pins without bound;
-# oldest-touched is evicted first.
+# pins without open responses are evicted first, oldest-touched within that set.
 BRANCH_PIN_CAP = 512
 
 
@@ -1211,6 +1212,8 @@ class Gateway:
     # silent this long is a leaked/hung one (a client that walked away, an
     # upstream that never closed), so stop counting it rather than pinning
     # the indicator — and the idle check — on forever.
+    # Independent of ACTIVE_AGENT_WINDOW_SECONDS above; equal values are
+    # coincidental: this bounds leaked in-flight slots, not branch activity.
     _IN_FLIGHT_MAX_SECONDS = 300.0  # 5 minutes
     _REFRESH_CHECK_COOLDOWN_SECONDS = 60.0
     # Recovery attempts on a Profile that is ALREADY needs-re-auth get their
@@ -1287,8 +1290,11 @@ class Gateway:
         self._branch_pins: dict[tuple, BranchPin] = {}
         # Number of open responses for each branch/profile assignment. The
         # Profile id is part of the key so an old response cannot make a pin
-        # that moved to another Profile look active.
+        # that moved to another Profile look active. Details for assignments
+        # whose pin was re-routed or evicted stay beside the count until the
+        # response closes, so an open agent cannot disappear from the badge.
         self._branch_open_responses: dict[tuple, int] = {}
+        self._branch_open_response_details: dict[tuple, tuple[str, Optional[str]]] = {}
         self._branch_move_notified_at: dict[str, float] = {}
         # Epoch seconds of each Profile's last usage reading, from any source
         # (real traffic or usage_probe) — so a background check can skip an
@@ -1722,10 +1728,21 @@ class Gateway:
                         pool, snapshot, now, branch, is_subagent, parent_agent_id,
                         attempted, distribute, may_create_pin, moves=branch_moves,
                         app_pinned=app_pinned, fit=fit)
+            # Remember branch_routed before the reason is rewritten to
+            # transient_failover: the attempt still belongs to the branch and
+            # must open/close its branch response count.
             branch_routed = decision.reason in _BRANCH_ROUTED_REASONS
-            for from_id, to_id, why in branch_moves:
-                self._record_branch_move(pool, from_id, to_id, why)
-            branch_moves.clear()
+            transient_exclude = attempted
+            if (branch_routed and may_create_pin
+                    and snapshot.current_profile_id is not None
+                    and any(rt.profile_id == snapshot.current_profile_id and not rt.automatic
+                            for rt in snapshot.profiles)):
+                # A manual-only current Profile is eligible for global
+                # choose() during Take over, but never for branch routing.
+                # Keep it available only to the request that explicitly
+                # selected it; do not let a transient retry capture a
+                # branch pin on it.
+                transient_exclude = attempted | {snapshot.current_profile_id}
             if decision.reason == "fable_limit_no_alternative" and decision.profile_id is not None:
                 self._note_fable_limit_served_anyway(pool, decision.profile_id, now,
                                                      "no other account can take the session — served anyway")
@@ -1740,9 +1757,27 @@ class Gateway:
 
             if retry_excluding_attempted:
                 retry_excluding_attempted = False
-                decision = choose(snapshot, now, fit=fit, exclude=attempted)
+                decision = choose(snapshot, now, fit=fit, exclude=transient_exclude)
                 if decision.profile_id is not None:
+                    if branch_routed and branch is not None:
+                        # The transient-429 failover uses global choose() for
+                        # this attempt, which may select a different Profile
+                        # from the branch-aware assignment made above. Keep
+                        # the pin on the account that actually serves; the
+                        # response wrapper must be able to own its activity.
+                        with self._lock:
+                            # Ancillary branch calls ride the existing pin;
+                            # only message traffic may rebind or create one.
+                            if may_create_pin:
+                                self._remember_pin(branch, decision.profile_id, parent_agent_id)
+                            if branch_moves:
+                                from_id, _, _ = branch_moves[-1]
+                                branch_moves[-1] = (from_id, decision.profile_id, "transient_429")
                     decision = RoutingDecision(profile_id=decision.profile_id, reason="transient_failover")
+
+            for from_id, to_id, why in branch_moves:
+                self._record_branch_move(pool, from_id, to_id, why)
+            branch_moves.clear()
 
             if decision.reason == "no_profile_fits_request" and guard is not None:
                 # Capacity exists; no account that may take this request can
@@ -1929,8 +1964,10 @@ class Gateway:
             # indicator, which can legitimately be true for MORE than one
             # Profile at once (concurrent `claude-unlimited code --profile`
             # sessions each pinned to a different one).
+            branch_key_for_attempt = branch if branch_routed else None
             with self._lock:
-                self._mark_profile_busy(profile.id)
+                branch_response_open = self._mark_profile_busy(
+                    profile.id, branch_key_for_attempt, parent_agent_id)
             # From here the slot is released exactly once: at an exit that
             # abandons the attempt, by the handler below for an unexpected
             # exception (a failed _persist, activity write, notification, ...)
@@ -1939,6 +1976,15 @@ class Gateway:
             # returned to 0, so "Used now" and the idle check stayed wedged.
             slot_held = True
             attempt_resp: Optional[UpstreamResponse] = None
+
+            def release_attempt() -> None:
+                nonlocal slot_held, branch_response_open
+                if slot_held:
+                    self._release_in_flight_and_branch_locked(
+                        profile.id, branch_key_for_attempt, branch_response_open)
+                    slot_held = False
+                    branch_response_open = False
+
             try:
                 try:
                     resp: UpstreamResponse = self._transport(upstream_req)
@@ -1966,8 +2012,7 @@ class Gateway:
                     # silently reviving a Profile another thread had just learned
                     # was out of quota.
                     with self._lock:
-                        self._mark_profile_idle(profile.id)
-                        slot_held = False
+                        release_attempt()
                         self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
                     if forced_profile_id is not None:
                         # No other Profile to fall back to when pinned — fail
@@ -1985,8 +2030,7 @@ class Gateway:
                     # while silently leaking this Profile's in-flight slot, which
                     # nothing else would ever clear.
                     with self._lock:
-                        self._mark_profile_idle(profile.id)
-                        slot_held = False
+                        release_attempt()
                     raise
 
                 observation = classify(resp.status, filter_response_headers(resp.headers), now)
@@ -2009,8 +2053,7 @@ class Gateway:
                         # pinned) exactly as the network-error branch above does.
                         resp.connection.close()
                         with self._lock:
-                            self._mark_profile_idle(profile.id)
-                            slot_held = False
+                            release_attempt()
                             self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
                         if forced_profile_id is not None:
                             activity.record("error", f"{profile.name} — could not reach upstream",
@@ -2067,8 +2110,7 @@ class Gateway:
                         # byte has reached the caller yet. Safe to retry on the
                         # next profile.
                         with self._lock:
-                            self._mark_profile_idle(profile.id)
-                            slot_held = False
+                            release_attempt()
                         resp.connection.close()
                         activity.record("rotation", f"{profile.name} hit its quota", meta="rotating to next eligible profile")
                         continue
@@ -2076,7 +2118,7 @@ class Gateway:
                 if (isinstance(observation, Unknown) and observation.status_code == 429
                         and forced_profile_id is None
                         and transient_failovers < _MAX_TRANSIENT_FAILOVERS_PER_REQUEST
-                        and choose(snapshot, now, fit=fit, exclude=attempted).profile_id is not None):
+                        and choose(snapshot, now, fit=fit, exclude=transient_exclude).profile_id is not None):
                     # A 429 that classify() judged NOT to be about this
                     # account's quota (see observation.classify) deliberately
                     # leaves Router state alone, so this Profile is never
@@ -2094,8 +2136,7 @@ class Gateway:
                     retry_excluding_attempted = True
                     transient_failovers += 1
                     with self._lock:
-                        self._mark_profile_idle(profile.id)
-                        slot_held = False
+                        release_attempt()
                     resp.connection.close()
                     activity.record("rotation", f"{profile.name} returned a transient 429",
                                      meta="not a quota signal — trying the next profile, not benching this one")
@@ -2144,15 +2185,16 @@ class Gateway:
                                                              quota_5h_percent=_anthropic_5h_percent(resp.headers))
                 body_chunks = self._wrap_with_in_flight_clear(body_chunks, profile.id,
                                                               resp.body_chunks, resp.connection,
-                                                              branch_key=branch if branch_routed else None)
+                                                              branch_key=branch_key_for_attempt,
+                                                              branch_response_open=branch_response_open)
                 # The body owns the slot and the upstream from here on.
-                slot_held, attempt_resp = False, None
+                slot_held, branch_response_open, attempt_resp = False, False, None
                 return GatewayResult(status=resp.status, headers=resp.headers, body_chunks=body_chunks,
                                       profile_id=profile.id)
             except BaseException:
                 if slot_held:
                     with self._lock:
-                        self._mark_profile_idle(profile.id)
+                        release_attempt()
                 if attempt_resp is not None:
                     _close_all((attempt_resp.body_chunks, attempt_resp.connection))
                 raise
@@ -2320,13 +2362,25 @@ class Gateway:
         if path != "/v1/messages":
             return self._codex_non_messages_response(profile, path, body)
 
+        branch_key_for_attempt = branch_key if branch_routed else None
+        branch_parent_agent_id = project_attribution.parent_agent_id_from_headers(headers)
         with self._lock:
-            self._mark_profile_busy(profile.id)
+            branch_response_open = self._mark_profile_busy(
+                profile.id, branch_key_for_attempt, branch_parent_agent_id)
         # Released exactly once: at an exit that abandons the attempt, by the
         # handler below for an unexpected exception, or — once handed over —
         # by the response body (see the Anthropic path in handle()).
         slot_held = True
         result = None
+
+        def release_attempt() -> None:
+            nonlocal slot_held, branch_response_open
+            if slot_held:
+                self._release_in_flight_and_branch_locked(
+                    profile.id, branch_key_for_attempt, branch_response_open)
+                slot_held = False
+                branch_response_open = False
+
         try:
             try:
                 branch = project_attribution.branch_key(headers, body)
@@ -2336,11 +2390,10 @@ class Gateway:
                                                 claude_session_id=branch[0] if branch else None,
                                                 agent_id=(branch[1] if branch and branch[1] != project_attribution.MAIN_BRANCH
                                                           else None),
-                                                parent_agent_id=project_attribution.parent_agent_id_from_headers(headers)))
+                                                parent_agent_id=branch_parent_agent_id))
             except openai_bridge.OpenAIBridgeError as exc:
                 with self._lock:  # same atomicity reasoning as the Anthropic path
-                    self._mark_profile_idle(profile.id)
-                    slot_held = False
+                    release_attempt()
                     self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
                 if forced_profile_id is not None:
                     activity.record("error", f"{profile.name} — could not reach OpenAI",
@@ -2355,8 +2408,7 @@ class Gateway:
                 # still surface, but not while leaking this Profile's in-flight
                 # slot, which nothing else clears.
                 with self._lock:
-                    self._mark_profile_idle(profile.id)
-                    slot_held = False
+                    release_attempt()
                 raise
 
             codex_headers = _filter_openai_headers(result.headers)
@@ -2400,8 +2452,7 @@ class Gateway:
                                      meta="pinned profile — returning the real response, not rotating")
                 else:
                     with self._lock:
-                        self._mark_profile_idle(profile.id)
-                        slot_held = False
+                        release_attempt()
                     # Discarded unread: release its connection too (see _InFlightBody).
                     _close_quietly(result.body_chunks)
                     activity.record("rotation", f"{profile.name} hit its quota", meta="rotating to next eligible profile")
@@ -2452,13 +2503,14 @@ class Gateway:
                                                          eco_stats=eco_stats, sent_bytes=len(body),
                                                          quota_5h_percent=_codex_5h_percent(result.headers))
             body_chunks = self._wrap_with_in_flight_clear(
-                body_chunks, profile.id, result.body_chunks, branch_key=branch_key)
+                body_chunks, profile.id, result.body_chunks, branch_key=branch_key_for_attempt,
+                branch_response_open=branch_response_open)
             # The body owns the slot and the upstream from here on.
-            slot_held = False
+            slot_held, branch_response_open = False, False
         except BaseException:
             if slot_held:
                 with self._lock:
-                    self._mark_profile_idle(profile.id)
+                    release_attempt()
                 if result is not None:
                     _close_quietly(result.body_chunks)
             raise
@@ -3876,7 +3928,13 @@ class Gateway:
             existing.last_active = now
             return
         if len(self._branch_pins) >= BRANCH_PIN_CAP:
-            oldest = min(self._branch_pins, key=lambda k: self._branch_pins[k].last_touch)
+            without_open_response = [
+                k for k, pin in self._branch_pins.items()
+                if not any(response_key[0] == k and count > 0
+                           for response_key, count in self._branch_open_responses.items())
+            ]
+            eviction_pool = without_open_response or list(self._branch_pins)
+            oldest = min(eviction_pool, key=lambda k: self._branch_pins[k].last_touch)
             del self._branch_pins[oldest]
         self._branch_pins[key] = BranchPin(profile_id=profile_id, last_touch=now, created_at=now,
                                             agent_id=key[1], parent_agent_id=parent_agent_id,
@@ -3894,23 +3952,27 @@ class Gateway:
             if pin is not None and pin.profile_id == profile_id:
                 pin.last_active = _pin_clock()
 
-    def _open_branch_response(self, key: Optional[tuple], profile_id: str) -> bool:
-        """Record one open response for the current branch/profile pair.
+    def _open_branch_response_locked(self, key: Optional[tuple], profile_id: str,
+                                     parent_agent_id: Optional[str] = None) -> bool:
+        """Open one branch response; caller holds ``self._lock``.
 
-        The response owns this count until its body closes, drains, fails, or
-        is finalized. A profile guard keeps a response that raced with a pin
-        move from charging the replacement assignment.
+        The count stays paired with the in-flight slot by the attempt's
+        release path. Details remain until the count closes so a re-routed
+        branch cannot hide a still-open response from the Dashboard.
         """
         if key is None:
             return False
-        with self._lock:
-            pin = self._branch_pins.get(key)
-            if pin is None or pin.profile_id != profile_id:
-                return False
-            response_key = (key, profile_id)
-            self._branch_open_responses[response_key] = (
-                self._branch_open_responses.get(response_key, 0) + 1)
-            return True
+        pin = self._branch_pins.get(key)
+        response_key = (key, profile_id)
+        if self._branch_open_responses.get(response_key, 0) <= 0:
+            if pin is not None and pin.profile_id == profile_id:
+                details = (pin.agent_id, pin.parent_agent_id)
+            else:
+                details = (key[1], parent_agent_id)
+            self._branch_open_response_details[response_key] = details
+        self._branch_open_responses[response_key] = (
+            self._branch_open_responses.get(response_key, 0) + 1)
+        return True
 
     def _close_branch_response_locked(self, key: tuple, profile_id: str) -> None:
         """Release one branch response; caller holds ``self._lock``."""
@@ -3920,24 +3982,36 @@ class Gateway:
             self._branch_open_responses[response_key] = remaining
         else:
             self._branch_open_responses.pop(response_key, None)
+            self._branch_open_response_details.pop(response_key, None)
 
     def _branch_counts(self) -> dict:
         """Agents active in the shared five-minute load window per Profile.
 
         An open response counts regardless of its last yielded byte; otherwise
-        the selector's least-loaded tie-break would drop a silent stream.
+        the selector's least-loaded tie-break would drop a silent stream. An
+        open response also bypasses the one-hour pin-retention cutoff until it
+        closes.
         """
         counts: dict = {}
         now = _pin_clock()
         cutoff = now - ACTIVE_AGENT_WINDOW_SECONDS
         retention_cutoff = now - BRANCH_PIN_TTL_SECONDS
+        represented: set[tuple] = set()
         for key, pin in self._branch_pins.items():
-            if pin.last_touch <= retention_cutoff:
+            represented.add((key, pin.profile_id))
+            open_response = self._branch_open_responses.get((key, pin.profile_id), 0) > 0
+            if pin.last_touch <= retention_cutoff and not open_response:
                 continue
             last_active = pin.last_active if pin.last_active is not None else pin.last_touch
-            open_response = self._branch_open_responses.get((key, pin.profile_id), 0) > 0
             if open_response or last_active > cutoff:
                 counts[pin.profile_id] = counts.get(pin.profile_id, 0) + 1
+        # A new request can re-route the branch after the old pin's hour has
+        # elapsed while the old response is still open. Count that serving
+        # assignment too, without making the replacement pin look active.
+        for response_key, open_count in self._branch_open_responses.items():
+            key, profile_id = response_key
+            if open_count > 0 and response_key not in represented:
+                counts[profile_id] = counts.get(profile_id, 0) + 1
         return counts
 
     def _forced_subagent_profile(self, pool: Pool):
@@ -4046,6 +4120,7 @@ class Gateway:
         from_name, to_name = self._profile_name(pool, from_id), self._profile_name(pool, to_id)
         cause = (f"{from_name} has spent its Fable weekly limit" if why == "fable_limit"
                  else f"the conversation outgrew {from_name}'s window" if why == "outgrew_window"
+                 else f"{from_name} returned a transient 429" if why == "transient_429"
                  else f"{from_name} stopped being available")
         activity.record("rotation", f"Agent moved {from_name} → {to_name}", meta=cause)
         with self._lock:
@@ -4204,10 +4279,11 @@ class Gateway:
             return self._branch_counts()
 
     def agents_on_account_seconds(self) -> dict:
-        """Profile id -> seconds since the longest-serving retained pin was
-        assigned to it. "Serving for 42m" in the widget remains a one-hour
-        retention view: it is not the five-minute active-agent count and not
-        how long one request ran. Accounts with no retained pin are absent."""
+        """Profile id -> seconds since the oldest retained pin was
+        assigned to it. "On account 42m" in the widget remains a retained-pin
+        age whose one-hour inactivity expiry is separate from the five-minute
+        active-agent count and from how long one request ran. Accounts with no
+        retained pin are absent."""
         now = _pin_clock()
         cutoff = now - BRANCH_PIN_TTL_SECONDS
         out: dict = {}
@@ -4224,28 +4300,52 @@ class Gateway:
         retention_cutoff = now - BRANCH_PIN_TTL_SECONDS
         active_cutoff = now - ACTIVE_AGENT_WINDOW_SECONDS
         with self._lock:
-            return [
-                {"session_id": key[0], "agent_id": pin.agent_id,
-                 "parent_agent_id": pin.parent_agent_id, "profile_id": pin.profile_id,
-                 "active": (self._branch_open_responses.get((key, pin.profile_id), 0) > 0
-                             or (pin.last_active if pin.last_active is not None else pin.last_touch)
-                             > active_cutoff)}
-                for key, pin in self._branch_pins.items()
-                if pin.last_touch > retention_cutoff
-            ]
+            pins = []
+            represented = set()
+            for key, pin in self._branch_pins.items():
+                open_response = self._branch_open_responses.get((key, pin.profile_id), 0) > 0
+                if pin.last_touch <= retention_cutoff and not open_response:
+                    continue
+                represented.add((key, pin.profile_id))
+                pins.append(
+                    {"session_id": key[0], "agent_id": pin.agent_id,
+                     "parent_agent_id": pin.parent_agent_id, "profile_id": pin.profile_id,
+                     "active": (open_response
+                                 or (pin.last_active if pin.last_active is not None else pin.last_touch)
+                                 > active_cutoff)})
+            # Keep an old serving assignment visible if a later request
+            # re-routed the branch after the old pin expired or was evicted.
+            for response_key, open_count in self._branch_open_responses.items():
+                if open_count <= 0 or response_key in represented:
+                    continue
+                key, profile_id = response_key
+                agent_id, parent_agent_id = self._branch_open_response_details.get(
+                    response_key, (key[1], None))
+                pins.append(
+                    {"session_id": key[0], "agent_id": agent_id,
+                     "parent_agent_id": parent_agent_id, "profile_id": profile_id,
+                     "active": True})
+            return pins
 
-    def _mark_profile_busy(self, profile_id: str) -> None:
+    def _mark_profile_busy(self, profile_id: str, branch_key: Optional[tuple] = None,
+                           parent_agent_id: Optional[str] = None) -> bool:
         """Takes one in-flight slot on a Profile — call with `self._lock`
-        held. Every call is paired with exactly one _mark_profile_idle, either
-        at the exit that abandons the attempt or by the _InFlightBody that
-        owns the response. The clock starts only when the count goes 0 -> 1,
-        so merely opening a second concurrent request does not extend it;
-        only bytes actually flowing do (see _touch_in_flight)."""
+        held. The in-flight slot is paired with exactly one _mark_profile_idle,
+        either at the exit that abandons the attempt or by the _InFlightBody
+        that owns the response. A true branch-response return is released only
+        through _release_in_flight_and_branch_locked. The clock starts only
+        when the count goes 0 -> 1, so merely opening a second concurrent
+        request does not extend it; only bytes actually flowing do (see
+        _touch_in_flight). A branch-routed attempt opens its selected
+        branch/profile assignment here, before upstream headers arrive, even
+        if another request changed the mutable pin map in the meantime, and
+        returns ownership of that count to the caller."""
         count = self._in_flight_count.get(profile_id, 0)
         if count <= 0 or profile_id not in self._in_flight:
             self._in_flight_since[profile_id] = time.monotonic()
         self._in_flight_count[profile_id] = max(count, 0) + 1
         self._in_flight.add(profile_id)
+        return self._open_branch_response_locked(branch_key, profile_id, parent_agent_id)
 
     def _mark_profile_idle(self, profile_id: str) -> None:
         """Releases one in-flight slot on a Profile and starts its "Used now"
@@ -4255,7 +4355,8 @@ class Gateway:
         or a fully-drained response) records the same last-active timestamp;
         a call site that only did `self._in_flight.discard(...)` would make
         that Profile's "Used now" pill vanish instantly instead of fading
-        out like the others."""
+        out like the others. It does not close a branch response; the attempt
+        release path closes that paired count under the same lock."""
         remaining = self._in_flight_count.get(profile_id, 0) - 1
         if remaining > 0:
             self._in_flight_count[profile_id] = remaining
@@ -4281,15 +4382,20 @@ class Gateway:
             self._lock.release()
         return True
 
+    def _release_in_flight_and_branch_locked(self, profile_id: str, branch_key: Optional[tuple],
+                                             branch_response_open: bool) -> None:
+        """Release the Profile slot and branch response; caller holds lock."""
+        try:
+            self._mark_profile_idle(profile_id)
+        finally:
+            if branch_response_open and branch_key is not None:
+                self._close_branch_response_locked(branch_key, profile_id)
+
     def _release_in_flight_and_branch(self, profile_id: str, branch_key: Optional[tuple],
                                       branch_response_open: bool) -> None:
-        """Release the Profile slot and its branch response under one lock."""
+        """Locking wrapper for the paired in-flight/branch release."""
         with self._lock:
-            try:
-                self._mark_profile_idle(profile_id)
-            finally:
-                if branch_response_open and branch_key is not None:
-                    self._close_branch_response_locked(branch_key, profile_id)
+            self._release_in_flight_and_branch_locked(profile_id, branch_key, branch_response_open)
 
     def _try_release_in_flight_and_branch(self, profile_id: str, branch_key: Optional[tuple],
                                           branch_response_open: bool) -> bool:
@@ -4297,17 +4403,14 @@ class Gateway:
         if not self._lock.acquire(blocking=False):
             return False
         try:
-            try:
-                self._mark_profile_idle(profile_id)
-            finally:
-                if branch_response_open and branch_key is not None:
-                    self._close_branch_response_locked(branch_key, profile_id)
+            self._release_in_flight_and_branch_locked(profile_id, branch_key, branch_response_open)
         finally:
             self._lock.release()
         return True
 
     def _wrap_with_in_flight_clear(self, chunks, profile_id: str, *closers,
-                                   branch_key: Optional[tuple] = None):
+                                   branch_key: Optional[tuple] = None,
+                                   branch_response_open: bool = False):
         """Hands the in-flight slot taken for this response to the body
         itself: it is released once the body is fully drained, fails, or is
         closed — including closed before anything was read, which is what a
@@ -4325,8 +4428,6 @@ class Gateway:
         def finish() -> None:
             if branch_key is not None:
                 self._touch_branch_pin(branch_key, profile_id)
-
-        branch_response_open = self._open_branch_response(branch_key, profile_id)
 
         if chunks is None:
             finish()

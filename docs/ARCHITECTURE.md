@@ -385,7 +385,11 @@ Because that traffic never moves `current_profile_id`, the Dashboard reads
 `Gateway.live_agent_counts()` (`live_agents` in `/api/status` and `/api/profiles`) to show
 which accounts have agents active in the last five minutes (an open response or recent
 activity). This is the same five-minute meaning shown by the HUD; it is separate from
-the one-hour pin-retention view. When a retained pin has to be re-assigned because
+the `in_use_now` recent-use grace signal and the `agents_since` age of the oldest retained pin
+(retention expires after one hour of inactivity). An open response remains in `live_agents`
+even if that pin has passed the retention cutoff, but closing it does not extend the pin and the
+next request may re-assign the branch. `agents_since` can therefore be absent while an open
+response is still counted. When a retained pin has to be re-assigned because
 its account stopped being eligible, `_record_branch_move` logs every move and fires the
 "rotated" notification at most once per source account every
 `BRANCH_MOVE_NOTIFY_INTERVAL_SECONDS`. The branch key itself — a full JSON parse of the

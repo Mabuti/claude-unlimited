@@ -47,7 +47,7 @@ enum Palette {
 /// clamping rules are tested rather than eyeballed: a percentage above 100 never
 /// overflows, anything above zero keeps a 3pt sliver so it does not read as
 /// empty, and an unknown percentage fills the bar (there is no progress to draw,
-/// only the fact that this account is the one serving).
+/// only the fact that this account was used recently).
 enum UsageFill {
     static func width(_ percent: Double?, total: CGFloat) -> CGFloat {
         guard total > 0 else { return 0 }
@@ -125,8 +125,8 @@ struct ProfileTile: View {
                     .animation(.easeOut(duration: 0.4), value: innerPercent)
             }
 
-            // Serving accounts alternate their logo with the orbs. Accounts
-            // that are not serving keep a static logo.
+            // Recently used accounts alternate their logo with the orbs. Accounts
+            // outside the recent-use grace keep a static logo.
             if profile.isServing {
                 ServingOrbs(diameter: diameter, accent: ringColor,
                             isDark: palette.isDark, visible: dockVisible,
@@ -431,7 +431,7 @@ struct DockColumn: View {
 
     private func visible(_ profiles: [Profile]) -> [Profile] {
         let shown = controller.hideDisabled ? profiles.filter(\.enabled) : profiles
-        // Whoever is serving leads, then the enabled ones: the thing you keep
+        // Recently used accounts lead, then the enabled ones: the thing you keep
         // the dock on screen to watch should never need scrolling to.
         return shown.sorted { a, b in
             if a.isServing != b.isServing { return a.isServing }
@@ -577,11 +577,15 @@ struct DetailCard: View {
     private var statusLine: String {
         if !profile.enabled { return "turned off" }
         if profile.needsReauth { return "needs re-auth · sign in from the Dashboard" }
+        let n = profile.liveAgents ?? 0
+        if n > 0 {
+            var line = "\(n) agent\(n == 1 ? "" : "s") in last 5 min"
+            if let since = Fmt.elapsed(since: profile.agentsSince) { line += " · on account \(since)" }
+            return line
+        }
         if profile.isServing {
-            let n = profile.liveAgents ?? 0
-            var line = n > 0 ? "\(n) agent\(n == 1 ? "" : "s") in last 5 min" : "serving now"
-            // How long agents have been on this account, not one request.
-            if let since = Fmt.elapsed(since: profile.agentsSince) { line += " · \(since)" }
+            var line = "used recently"
+            if let since = Fmt.elapsed(since: profile.agentsSince) { line += " · on account \(since)" }
             return line
         }
         var line = profile.statusWord ?? "idle"
@@ -753,8 +757,10 @@ struct HUDApp: App {
             Divider()
             Button("Quit \(hudName)") { NSApp.terminate(nil) }
         } label: {
-            // The small piece of info that lives in the top bar: the account
-            // actually serving, and how loaded it is.
+            // The small piece of info that lives in the top bar: the first
+            // account in the 15-minute recent-use grace, then the rotation
+            // pointer, then the first enabled account. This is not the
+            // instant serving_now signal or the five-minute live-agent count.
             switch pool.state {
             case .ready(let profiles, let status):
                 let serving = profiles.first(where: { $0.isServing })

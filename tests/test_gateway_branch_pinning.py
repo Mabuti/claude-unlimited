@@ -15,6 +15,7 @@ All offline: fake transport, tmp config, no keychain.
 """
 
 import gc
+import threading
 import time as real_time
 from datetime import datetime, timezone
 
@@ -315,6 +316,107 @@ def test_a_branch_repins_when_its_account_stops_being_eligible(pool_env):
     assert [p["profile_id"] for p in gw.branch_pins() if p["agent_id"] == "ag1"] == [second]
 
 
+def test_transient_429_branch_failover_pins_the_profile_that_serves(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2), prof("c", priority=3)]))
+    served = []
+
+    def transport(req):
+        profile_id = next(pid for pid in ("a", "b", "c") if f"tok-{pid}" in str(req.headers))
+        served.append(profile_id)
+        if profile_id == "a":
+            return fake_response(429, {"x-should-retry": "true"})
+        return fake_response(200, HEALTHY)
+
+    gw = Gateway(transport=transport)
+    # Branch assignment chooses A, then the transient failover's global
+    # choose() follows the sticky pointer to C. The pin must follow C too.
+    gw._current_profile_id = "c"
+    moves = []
+    monkeypatch.setattr(gw, "_record_branch_move",
+                        lambda pool, from_id, to_id, why: moves.append((from_id, to_id, why)))
+    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    list(result.body_chunks)
+
+    assert served == ["a", "c"]
+    assert result.profile_id == "c"
+    assert [(pin["agent_id"], pin["profile_id"], pin["active"])
+            for pin in gw.branch_pins()] == [("ag1", "c", True)]
+    assert gw.live_agent_counts() == {"c": 1}
+    assert moves == [("a", "c", "transient_429")]
+
+
+def test_transient_429_branch_failover_does_not_capture_manual_only_current(pool_env):
+    save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2),
+                             prof("manual", priority=3, automatic=False)]))
+    served = []
+
+    def transport(req):
+        profile_id = next(pid for pid in ("a", "b", "manual") if f"tok-{pid}" in str(req.headers))
+        served.append(profile_id)
+        if profile_id == "a":
+            return fake_response(429, {"x-should-retry": "true"})
+        return fake_response(200, HEALTHY)
+
+    gw = Gateway(transport=transport)
+    assert gw.force_active("manual") is True
+    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    list(result.body_chunks)
+
+    assert served == ["a", "b"]
+    assert result.profile_id == "b"
+    assert [(pin["agent_id"], pin["profile_id"], pin["active"])
+            for pin in gw.branch_pins()] == [("ag1", "b", True)]
+    assert gw.live_agent_counts() == {"b": 1}
+
+    gw._manual_profile_id = None
+    next_message = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    list(next_message.body_chunks)
+    assert next_message.profile_id == "b"
+
+
+def test_transient_429_ancillary_branch_call_does_not_create_a_pin(pool_env):
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    served = []
+
+    def transport(req):
+        profile_id = next(pid for pid in ("a", "b") if f"tok-{pid}" in str(req.headers))
+        served.append(profile_id)
+        return (fake_response(429, {"x-should-retry": "true"}) if len(served) == 1
+                else fake_response(200, HEALTHY))
+
+    gw = Gateway(transport=transport)
+    result = gw.handle("POST", "/v1/count_tokens", hdrs(agent="ag1"), b"{}", distribute=True)
+    list(result.body_chunks)
+
+    assert served == ["a", "b"]
+    assert gw.branch_pins() == []
+
+
+def test_transient_429_ancillary_branch_call_keeps_existing_pin(pool_env):
+    save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2), prof("c", priority=3)]))
+    gw = healthy_gateway()
+    assert serve(gw, hdrs(agent="ag1"), distribute=True).profile_id == "a"
+    gw._current_profile_id = "c"
+    served = []
+
+    def transport(req):
+        profile_id = next(pid for pid in ("a", "b", "c") if f"tok-{pid}" in str(req.headers))
+        served.append(profile_id)
+        return (fake_response(429, {"x-should-retry": "true"}) if len(served) == 1
+                else fake_response(200, HEALTHY))
+
+    gw._transport = transport
+    ancillary = gw.handle("POST", "/v1/messages/count_tokens", hdrs(agent="ag1"), b"{}",
+                           distribute=True)
+    list(ancillary.body_chunks)
+    assert served == ["a", "c"]
+    assert [pin["profile_id"] for pin in gw.branch_pins()] == ["a"]
+
+    next_message = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    list(next_message.body_chunks)
+    assert next_message.profile_id == "a"
+
+
 # ---- the pointer/notification discipline ----------------------------------
 
 def test_branch_routing_never_moves_the_shared_rotation_pointer(pool_env):
@@ -499,7 +601,7 @@ def test_discarded_and_finalized_branch_bodies_release_activity_and_slots(pool_e
 
 
 def test_streaming_activity_does_not_extend_pin_retention(pool_env, monkeypatch):
-    save_pool(Pool(profiles=[prof("a")]))
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
     start = real_time.monotonic()
     clock = [start]
     monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
@@ -511,10 +613,148 @@ def test_streaming_activity_does_not_extend_pin_retention(pool_env, monkeypatch)
     assert gw.branch_pins()[0]["active"] is True
 
     clock[0] = start + gateway_module.BRANCH_PIN_TTL_SECONDS + 1
-    assert gw.branch_pins() == []
-    assert gw.live_agent_counts() == {}
+    assert gw.branch_pins()[0]["active"] is True
+    assert gw.live_agent_counts() == {"a": 1}
     result.body_chunks.close()
     assert gw.serving_now_ids() == set()
+    assert gw.branch_pins() == []
+    assert gw.live_agent_counts() == {}
+
+    decisions = []
+    original_decision = gw._branch_decision
+
+    def record_decision(*args, **kwargs):
+        decision = original_decision(*args, **kwargs)
+        decisions.append(decision.reason)
+        return decision
+
+    monkeypatch.setattr(gw, "_branch_decision", record_decision)
+    rerouted = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    list(rerouted.body_chunks)
+    assert decisions == ["branch_assigned"]
+
+
+def test_pin_cap_evicts_closed_pins_before_open_responses(pool_env, monkeypatch):
+    monkeypatch.setattr(gateway_module, "BRANCH_PIN_CAP", 3)
+    save_pool(Pool(profiles=[prof("a")]))
+    gw = healthy_gateway()
+
+    oldest_open = gw.handle("POST", "/v1/messages", hdrs(agent="old-open"), b"{}", distribute=True)
+    closed = gw.handle("POST", "/v1/messages", hdrs(agent="closed"), b"{}", distribute=True)
+    list(closed.body_chunks)
+    newer_open = gw.handle("POST", "/v1/messages", hdrs(agent="new-open"), b"{}", distribute=True)
+
+    newest_open = gw.handle("POST", "/v1/messages", hdrs(agent="newest-open"), b"{}", distribute=True)
+    agents = {pin["agent_id"] for pin in gw.branch_pins()}
+    assert agents == {"old-open", "new-open", "newest-open"}
+    assert gw._branch_open_responses
+
+    for result in (oldest_open, newer_open, newest_open):
+        result.body_chunks.close()
+    assert gw._branch_open_responses == {}
+
+
+def test_pin_cap_evicts_an_open_pin_only_when_every_pin_is_open(pool_env, monkeypatch):
+    monkeypatch.setattr(gateway_module, "BRANCH_PIN_CAP", 2)
+    save_pool(Pool(profiles=[prof("a")]))
+    gw = healthy_gateway()
+
+    first = gw.handle("POST", "/v1/messages", hdrs(agent="first"), b"{}", distribute=True)
+    second = gw.handle("POST", "/v1/messages", hdrs(agent="second"), b"{}", distribute=True)
+    third = gw.handle("POST", "/v1/messages", hdrs(agent="third"), b"{}", distribute=True)
+
+    assert set(gw._branch_pins) == {("s1", "second"), ("s1", "third")}
+    assert {pin["agent_id"] for pin in gw.branch_pins()} == {"first", "second", "third"}
+    assert gw.live_agent_counts() == {"a": 3}
+    for result in (first, second, third):
+        result.body_chunks.close()
+    assert gw._branch_open_responses == {}
+
+
+def test_branch_response_counts_before_anthropic_headers(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a")]))
+    clock = [real_time.monotonic()]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+    started = threading.Event()
+    release = threading.Event()
+    result_holder = []
+
+    def transport(req):
+        started.set()
+        assert release.wait(2)
+        return fake_response(200, HEALTHY)
+
+    gw = Gateway(transport=transport)
+    worker = threading.Thread(
+        target=lambda: result_holder.append(
+            gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)))
+    worker.start()
+    assert started.wait(2)
+    try:
+        clock[0] += gateway_module.ACTIVE_AGENT_WINDOW_SECONDS + 1
+        assert gw.live_agent_counts() == {"a": 1}
+    finally:
+        release.set()
+    worker.join(2)
+    assert not worker.is_alive()
+    list(result_holder[0].body_chunks)
+    assert gw._branch_open_responses == {}
+
+
+def test_open_response_stays_visible_when_next_request_reroutes_after_retention(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    start = real_time.monotonic()
+    clock = [start]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+    gw = healthy_gateway()
+
+    old_response = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    assert old_response.profile_id == "a"
+    clock[0] = start + gateway_module.BRANCH_PIN_TTL_SECONDS + 1
+    new_response = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+
+    assert new_response.profile_id == "b"
+    assert {(pin["profile_id"], pin["active"]) for pin in gw.branch_pins()} == {("a", True), ("b", True)}
+    assert gw.live_agent_counts() == {"a": 1, "b": 1}
+    old_response.body_chunks.close()
+    new_response.body_chunks.close()
+    assert gw._branch_open_responses == {}
+
+
+def test_busy_registration_keeps_selected_assignment_after_pin_rebind(pool_env):
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    gw = healthy_gateway()
+    serve(gw, hdrs(agent="ag1"), distribute=True)
+    key = ("s1", "ag1")
+
+    with gw._lock:
+        gw._remember_pin(key, "b", None)
+        opened = gw._mark_profile_busy("a", key)
+    assert opened is True
+    assert gw.live_agent_counts() == {"b": 1, "a": 1}
+    pins = {pin["profile_id"]: pin for pin in gw.branch_pins()}
+    assert set(pins) == {"a", "b"}
+    assert all(pin["active"] for pin in pins.values())
+
+    gw._release_in_flight_and_branch("a", key, opened)
+    assert gw._branch_open_responses == {}
+
+
+def test_failed_branch_attempt_releases_open_response_before_rotation(pool_env):
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    calls = []
+
+    def transport(req):
+        calls.append(req)
+        if len(calls) == 1:
+            raise OSError("first account unavailable")
+        return fake_response(200, HEALTHY)
+
+    gw = Gateway(transport=transport)
+    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    list(result.body_chunks)
+    assert len(calls) == 2
+    assert gw._branch_open_responses == {}
 
 
 def test_old_response_finish_does_not_activate_a_moved_pin(pool_env, monkeypatch):
@@ -599,9 +839,9 @@ def test_the_body_is_parsed_at_most_once_per_request(pool_env, monkeypatch):
 
 
 
-# ---- "serving for" in the widget ------------------------------------------
+# ---- retained-pin age in the widget ----------------------------------------
 
-def test_agents_on_account_reports_the_longest_serving_live_agent(pool_env, monkeypatch):
+def test_agents_on_account_reports_the_oldest_retained_pin(pool_env, monkeypatch):
     save_pool(Pool(profiles=[prof("a")]))
     gw = healthy_gateway()
     start = real_time.monotonic()

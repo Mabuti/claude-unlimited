@@ -22,11 +22,16 @@ struct Profile: Decodable, Identifiable, Equatable {
     let usage7dPercent: Double?
     let usage5hResetsAt: String?
     let usage7dResetsAt: String?
+    /// Recent-use indicator with the daemon's 15-minute grace period.
     let inUseNow: Bool?
+    /// Branches active in the shared five-minute window: an open response or recent activity.
+    /// An open response still counts after its one-hour routing-pin retention
+    /// expires, so this can be nonzero while agentsSince is nil.
     let liveAgents: Int?
     let forcedForSubagents: Bool?
-    // The session block: the latest COMPLETED request, and how long the
-    // longest-serving live agent has been on this account.
+    // The session block: the latest COMPLETED request, and the age of the
+    // oldest retained branch pin (one-hour inactivity expiry), independent of
+    // liveAgents. An open response past that cutoff has no agentsSince age.
     let lastModel: String?
     let lastRequestedModel: String?
     let lastProject: String?
@@ -85,6 +90,8 @@ struct Profile: Decodable, Identifiable, Equatable {
     /// profile. Codex subscriptions report a weekly window and often no 5h one.
     var headlinePercent: Double? { usage5hPercent ?? usage7dPercent }
     var headlineResetsAt: String? { usage5hPercent != nil ? usage5hResetsAt : usage7dResetsAt }
+    /// Whether the account was used recently; this 15-minute grace signal is
+    /// not an open-request signal or the five-minute live-agent count.
     var isServing: Bool { inUseNow == true }
     /// Its credentials were refused: nothing is served from it until the
     /// user signs in again, and the dock says so in red.

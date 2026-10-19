@@ -680,9 +680,11 @@ its own prompt cache warm instead of paying a cache miss on every rotation.
 
 > **Balancing happens only when an agent starts — never mid-session.** An agent moves only
 > if its account reaches its switch threshold or a usage limit, becomes unavailable (turned
-> off, cooling down, needs re-auth), or the agent sits idle for an hour. It balances by how
-> many agents have been active on each account in the last 5 minutes, not by usage
-> percentage, so usage evens out roughly over many sessions rather than exactly.
+> off, cooling down, needs re-auth), or the agent sits idle for an hour. An open response
+> still counts in **Agents: N** after that hour, but does not extend the routing pin; once
+> it closes, the next request may be assigned again. It balances by how many agents have
+> been active on each account in the last 5 minutes, not by usage percentage, so usage
+> evens out roughly over many sessions rather than exactly.
 
 While agents are spread out, each profile on the dashboard shows how many agents were
 active in the last 5 minutes (**Agents: N**), and every agent moved off an unavailable
@@ -1011,7 +1013,9 @@ see the state of your pool without opening the dashboard.
 **On macOS you get it automatically.** Installing or updating Claude Unlimited installs
 `HUD - Heads-Up Display.app` into `~/Applications`, registers it to start when you log in,
 and opens it — nothing to build, nothing to run. It also appears in the menu bar, showing
-the account currently serving and how close it is to rotating.
+the first account in its 15-minute recent-use grace (or the rotation pointer when none is
+recent) and how close it is to rotating; this is not the instant `serving_now` signal or
+the five-minute **Agents: N** count.
 
 <p align="center">
 <img src="docs/screenshots/hud-floating-vertical.png" height="300" alt="HUD floating, vertical">
@@ -1052,7 +1056,8 @@ the old `CapacityWidget.app`, the name it had before, keeping your saved positio
   pull it about 40 points away to let go. Release it while it is stuck and it **docks**: flush against the edge, its ends curving
   out into it like the display notch, vertical on the left or right, horizontal along the top or bottom, remembered across restarts and display
   changes. **Undock** in the cog menu floats it again.
-- An account that is serving lights up from inside, in its provider's colour; several can be lit
+- An account used recently lights up from inside, in its provider's colour; this 15-minute
+  recent-use grace is separate from the five-minute agent count, and several accounts can be lit
   at once. Each account has **two rings**: the outer one is the 5-hour window — green, then amber,
   then red as it nears the switch threshold, the same bands as the Dashboard's bars — and the
   thinner inner one is the weekly window, blue until 90% and red from there. An account whose
@@ -1066,8 +1071,12 @@ the old `CapacityWidget.app`, the name it had before, keeping your saved positio
   (Dark otherwise). Anything you change in the cog menu is kept.
 - It refreshes every 5 seconds (every 2 while the pointer is over it).
 - Hover a profile for its detail card: plan, usage windows, reset times, today's spend, and a
-  session line — while it is serving, how many agents are on it and for how long; otherwise when
-  it was last used. Under that, the model and project of its latest request (a Codex account
+  session line — the number of agents active in the last 5 minutes; if that is zero but the
+  account is in its 15-minute recent-use grace, it says **used recently**; otherwise it shows
+  when the account was last used. A separate **on account** duration, when a retained pin is
+  still inside its one-hour inactivity window, gives the age of the oldest retained branch pin;
+  an open response past that window can still count as active without an **on account** age.
+  Under that, the model and project of its latest request (a Codex account
   shows the Claude model it translated, e.g. `opus-5 → gpt-5.6-terra`).
 - Right-click (or Control-click) a profile to **Take over**, to **Enable** or **Disable** it, or
   to choose whether its percentage shows the **5-hour** or the **weekly** window (**Percentage
