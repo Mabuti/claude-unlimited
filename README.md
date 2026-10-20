@@ -382,9 +382,9 @@ Claude Code asks for a Claude model. When the request lands on a Codex account, 
 has to decide which GPT model actually answers — and how hard it thinks. That's the
 **parity list** in **Settings → Models parity**, and it's yours to edit:
 
-The two `gpt-6.1-sol` variants are explicit choices: select one in a profile's Codex model
-override or in a Codex cell under **Settings → Models parity**. Neither variant is used unless
-you choose it there.
+The two `gpt-6.1-sol` variants are explicit choices: select one in a profile's **Model override**
+widget or in a **Settings → Models parity** Codex cell. Neither variant is used unless you
+choose it there.
 
 Each model has one base **Any** row (`source_effort: "*"`, also the default when
 omitted). Optional override rows use `source_effort: low|medium|high|xhigh|max`
@@ -635,8 +635,9 @@ so on your behalf, and you get the million back:
 the two `gpt-6.1-sol` choices is simple: the 500K subscription choice keeps a long
 conversation on the account until about **443K estimated input tokens**, while the 272K cap
 rotates at about **226K estimated input tokens**. Ordinary GPT/Codex models have about **272K**
-windows, so the daemon sizes every turn before routing it: a normal choice takes turns up to
-about 226K estimated input tokens, leaving room for the reply and its reasoning, and longer
+windows, so the daemon sizes every turn before routing it: ordinary GPT/Codex models take turns up
+to about 226K estimated input tokens after the same headroom and reply/reasoning reserve documented
+in ADR 0009, and longer
 turns go to a Claude account. The capped choice aims to keep requests under OpenAI's 272K
 long-context threshold, but the estimate cannot see replayed reasoning, so that is a target,
 not a guarantee; long conversations move to another account sooner. OpenAI's published API
@@ -644,9 +645,12 @@ pricing bills prompts over 272K input tokens at 2× input and 1.5× output for t
 so long turns can cost more. On a ChatGPT subscription, the quota meter has been observed to
 track reasoning output rather than input size (docs/adr/0007), so subscription cost of long input
 is unmeasured; the certain effect is rotation around **443K versus 226K** estimated input tokens.
-On an API-key profile there is no published API window for the 500K model yet, so that id is
-budgeted at the assumed 272K floor. The 272K alias is an explicit cap on every profile kind and
-is translated to `gpt-6.1-sol` before it reaches OpenAI.
+On an API-key profile there is no published API window for the 500K model yet, so that id uses an
+assumed 272K window, yielding about 226K estimated input tokens after the guard reserve. The
+`gpt-6.1-sol-272k` alias (the **GPT-6.1 Sol (272K cap)** choice in a profile's **Model override**
+widget or the **Settings → Models parity** Codex cell) is an explicit cap on every profile kind and
+is translated to
+`gpt-6.1-sol` before it reaches OpenAI.
 
 When no account that may take the request can hold it — say the Claude accounts are out of
 capacity and a 400K conversation arrives — the daemon answers exactly the "prompt is too long"
@@ -658,13 +662,13 @@ The rules the guard follows: an explicit choice — `cu code --profile <ChatGPT 
 "prompt is too long" instead of being sent to fail. A branch pinned to a ChatGPT account whose
 conversation outgrew it moves to a Claude account and stays there. A profile marked "Forced in
 subagents" falls back to normal balancing for a subagent whose conversation it cannot hold. A
-GPT model this build has not met is assumed at 272K and said so, in the Activity log and in
+GPT window this build cannot verify is assumed at 272K and said so, in the Activity log and in
 Settings — never excluded on a guess.
 
 **Auto is the cautious alternative** — it stays quiet when it cannot be sure: when only ChatGPT/Codex accounts can take the
 session (ordinary GPT/Codex models are about 272K; only a user-selected 500K gpt-6.1-sol on a
-ChatGPT-subscription profile budgets past that, while an API-key profile for this model stays
-at the assumed 272K floor), when an
+ChatGPT-subscription profile budgets past that, while an API-key profile for this model uses an
+assumed 272K window and yields about 226K estimated input tokens after the guard reserve), when an
 API profile points somewhere other than Anthropic, or when your Claude Code version has not
 been checked for it. The launch prints why, and Settings shows the same verdict together with
 each ChatGPT account's window.

@@ -1367,10 +1367,12 @@ class Gateway:
         # is information, one per request is a flood. Cleared the moment the
         # account is no longer spent, so the next week gets its own line.
         self._fable_limit_noted: set = set()
-        # GPT ids the capacity guard has already said it is ASSUMING a window
-        # for (not in gpt_windows' table). One Activity line per id per
+        # GPT model/backend/reason combinations the capacity guard has already
+        # said it is ASSUMING a window for, including a listed model whose
+        # backend window is not published. One Activity line per tuple per
         # daemon run; the preview shows the assumption for as long as it holds.
-        self._window_assumed_noted: set = set()
+        self._window_assumed_noted: set[tuple[str, str, Optional[str]]] = set()
+        self._window_assumed_noted_lock = threading.Lock()
         # When the guard last answered "prompt is too long" for a given
         # session/pin key -> monotonic time. Claude Code compacts and retries
         # on that answer, so one Activity line per key per interval is the
@@ -3774,28 +3776,37 @@ class Gateway:
         return RoutingDecision(profile_id=forced_profile_id, reason="forced")
 
     def _note_assumed_windows(self, pool: Pool, guard: "RequestGuard") -> None:
-        """One Activity line per model/backend combination with no known window,
-        such as `gpt-6.1-sol` on an API-key profile. The
+        """One Activity line per model/backend/reason combination with no known
+        window, such as `gpt-6.1-sol` on an API-key profile. The
         `assumption_reason` selects the explanation, so a known subscription
         slug without a published API window is not described as missing from
-        `gpt_windows`. Safe without self._lock: a set add and an Activity
-        write."""
+        `gpt_windows`. The dedicated note lock makes the check-and-add atomic;
+        the Activity write remains outside it."""
         for profile_id, info in guard.windows.items():
-            if not info.assumed or info.model in self._window_assumed_noted:
+            note_key = (info.model, info.backend, info.assumption_reason)
+            if not info.assumed:
                 continue
-            self._window_assumed_noted.add(info.model)
+            with self._window_assumed_noted_lock:
+                if note_key in self._window_assumed_noted:
+                    continue
+                self._window_assumed_noted.add(note_key)
             if info.assumption_reason == "no_published_api_window":
-                meta = (f"There is no published API window for {info.model} yet; it is budgeted "
-                        "at the assumed 272K floor.")
+                meta = (f"There is no published API window for {info.model} yet; it uses the "
+                        f"assumed {info.window:,}-token window and a {info.budget:,} estimated "
+                        "input-token guard budget.")
             elif info.assumption_reason == "no_published_subscription_window":
                 meta = (f"{info.model} has no published ChatGPT subscription window yet; it is "
-                        "budgeted at the assumed 272K floor.")
+                        f"using the assumed {info.window:,}-token window and a {info.budget:,} "
+                        "estimated input-token guard budget.")
             elif info.assumption_reason == "unknown_backend":
-                meta = (f"{info.model} uses an unverified backend; it is budgeted at the "
-                        "assumed 272K floor.")
+                meta = (f"{info.model} uses an unverified backend; it uses the assumed "
+                        f"{info.window:,}-token window and a {info.budget:,} estimated "
+                        "input-token guard budget.")
             else:
-                meta = (f"{info.model} is not in gpt_windows.py ({info.backend} backend); "
-                        "add it there and re-run scripts/check_gpt_windows.py")
+                meta = (f"{info.model} has no verified window ({info.backend} backend); it uses "
+                        f"the assumed {info.window:,}-token window and a {info.budget:,} "
+                        "estimated input-token guard budget. Add it to gpt_windows.py and "
+                        "re-run scripts/check_gpt_windows.py")
             activity.record("config", f"{self._profile_name(pool, profile_id)} — assuming a {info.window:,}-token "
                                       f"window for {info.model}",
                              meta=meta)

@@ -55,9 +55,10 @@ OpenAI's published API pricing lists prompts over 272K input tokens at 2×
 input and 1.5× output for the whole API request; that pricing reference does
 not claim that a ChatGPT subscription quota meter uses the same multiplier.
 On an API-key profile no published API window exists for the 500K model yet, so
-that id is budgeted at the assumed 272K floor. The local `gpt-6.1-sol-272k`
+that id uses an assumed 272K window, yielding a 226,400 estimated-input budget
+after the formula. The local `gpt-6.1-sol-272k`
 alias is an explicit 272K cap on every profile kind. Both variants are chosen
-in a profile's Codex model override or a Settings → Models parity Codex cell;
+in a profile's Model override widget or a Settings → Models parity Codex cell;
 neither is used unless chosen there. The alias is translated to `gpt-6.1-sol`
 before it reaches the backend, and the Dashboard explains the quota trade-off
 beside both choices.
@@ -72,12 +73,17 @@ its backend cannot hold.** Concretely:
   the public OpenAI API (max input) for `api_key` codex Profiles. A custom
   `base_url` is an unknown backend. **Budget = floor(window × 0.95) − 32,000**
   output/reasoning reserve: **226,400** estimated input tokens on a 272K
-  subscription row, or **443,000** for the explicitly selected 500K
-  `gpt-6.1-sol` variant. The table is maintained by hand:
+  subscription row, or **443,000**, the ChatGPT-subscription budget for the
+  selected 500K `gpt-6.1-sol`; an API-key profile uses an assumed
+  272,000-token window, yielding **226,400** estimated input tokens after the
+  formula, while the local `gpt-6.1-sol-272k` alias is an explicit
+  272,000-token cap on every profile kind, with the same formula-derived
+  **226,400** estimated-input budget. The table is maintained by hand:
   `scripts/check_gpt_windows.py` diffs it against the Codex CLI's cache before
   a push, outside pytest.
-* **Unknown GPT id → assumed at 272K, said once in Activity, shown as
-  "assumed" in Settings** — never excluded on a guess.
+* **Assumed GPT window → 272K, one Activity line per (model, backend,
+  assumption reason) per daemon run, shown as "assumed" in Settings** — never
+  excluded on a guess.
 * **Estimate** (`gpt_windows.estimate_input_tokens`): stage 1 is free — a body
   under 673,200 bytes cannot exceed the smallest budget at 3 bytes/token, so
   nothing is parsed; stage 2 reuses the request's one parse, subtracts image
@@ -141,8 +147,9 @@ Decision table, replacing ADR 0008's:
 * A mixed pool runs at 1M. The one visible sign of the guard is a compaction
   that comes earlier than it would on Claude accounts alone — only when
   nothing but a ChatGPT account is left to take a long turn.
-* The budget line is **272K by default, not 872K**: that is the floor and the
-  long-context price threshold. `gpt-6.1-sol` is the user-chosen exception:
+* The assumed window is **272K by default, not 872K**: after the reserve, the
+  guard's ordinary budget is about **226K estimated input tokens**, and 272K is
+  the long-context price threshold. `gpt-6.1-sol` is the user-chosen exception:
   its 500K subscription choice keeps a conversation on the account until
   about 443K estimated input tokens, while the local 272K cap rotates at about
   226K. The 2× input / 1.5× output figures are OpenAI's published API pricing

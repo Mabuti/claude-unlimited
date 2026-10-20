@@ -334,6 +334,17 @@ def test_the_launch_note_names_each_codex_account_and_its_window():
     assert "not in gpt_windows.py" not in line
 
 
+def test_the_codex_only_launch_note_names_the_variant_selection_widgets():
+    import claude_unlimited.cli as cli
+
+    note = cli._ONE_M_REASON_NOTES["codex_only_route"]
+    assert "Ordinary GPT/Codex models" in note
+    assert "profile's Model override widget" in note
+    assert "Settings → Models parity Codex cell" in note
+    assert "a normal choice" not in note
+    assert "budgeted at an assumed 272K window" not in note
+
+
 def test_the_launch_note_shows_each_distinct_resolved_budget():
     import claude_unlimited.cli as cli
     from claude_unlimited.config import Pool, Profile, Settings

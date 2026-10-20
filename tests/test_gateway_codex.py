@@ -1251,6 +1251,81 @@ def test_an_api_key_gpt_6_1_sol_assumption_names_the_unpublished_api_window(pool
     assert "not in gpt_windows.py" not in assumed[0]
 
 
+def test_assumed_window_activity_notes_are_distinct_by_backend_and_reason(pool_env, monkeypatch):
+    """The same model gets one note for each distinct assumption reason."""
+    save_pool(Pool(profiles=[
+        _codex_profile(priority=1, auth_mode="api_key", codex_model="gpt-6.1-sol"),
+        _codex_profile(id="a", name="Foreign", priority=2, auth_mode="api_key",
+                       base_url="https://llm.example.com/v1", codex_model="gpt-6.1-sol"),
+    ]))
+    _codex_recorder(monkeypatch)
+    gw = Gateway(transport=_anthropic_ok)
+    _drain(gw.handle("POST", "/v1/messages", {}, _big_body(tokens_over=400_000)))
+
+    lines = _activity_lines()
+    assumed = [line for line in lines
+               if "assuming a 272,000-token window for gpt-6.1-sol" in line]
+    assert len(assumed) == 2, lines
+    assert sum("no published API window for gpt-6.1-sol yet" in line for line in assumed) == 1
+    assert sum("uses an unverified backend" in line for line in assumed) == 1
+
+
+def test_assumed_window_activity_notes_keep_backend_in_key_for_same_reason(pool_env, monkeypatch):
+    """The backend remains part of the key even when the reason is shared."""
+    save_pool(Pool(profiles=[
+        _codex_profile(priority=1, codex_model="gpt-99-nova"),
+        _codex_profile(id="a", name="API", priority=2, auth_mode="api_key",
+                       codex_model="gpt-99-nova"),
+    ]))
+    _codex_recorder(monkeypatch)
+    gw = Gateway(transport=_anthropic_ok)
+    _drain(gw.handle("POST", "/v1/messages", {}, _big_body(tokens_over=400_000)))
+
+    lines = _activity_lines()
+    assumed = [line for line in lines
+               if "assuming a 272,000-token window for gpt-99-nova" in line]
+    assert len(assumed) == 2, lines
+    assert sum("chatgpt_subscription backend" in line for line in assumed) == 1
+    assert sum("openai_api backend" in line for line in assumed) == 1
+
+
+def test_assumed_window_activity_notes_are_atomic_across_concurrent_requests(pool_env, monkeypatch):
+    """Concurrent first requests still produce one note for a tuple."""
+    save_pool(Pool(profiles=[
+        _codex_profile(priority=1, codex_model="gpt-99-nova"),
+    ]))
+    gw = Gateway(transport=_anthropic_ok)
+
+    class SlowSet(set):
+        def __contains__(self, item):
+            present = super().__contains__(item)
+            real_time.sleep(0.01)
+            return present
+
+    gw._window_assumed_noted = SlowSet()
+    pool = load_pool()
+    guard = gateway_module._request_guard(_big_body(tokens_over=400_000), None, pool)
+    errors = []
+
+    def note():
+        try:
+            gw._note_assumed_windows(pool, guard)
+        except BaseException as exc:  # pragma: no cover - failure reporting only
+            errors.append(exc)
+
+    threads = [threading.Thread(target=note) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(2)
+
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    assumed = [line for line in _activity_lines()
+               if "assuming a 272,000-token window for gpt-99-nova" in line]
+    assert len(assumed) == 1, assumed
+
+
 def test_a_failing_estimator_degrades_to_todays_routing(pool_env, monkeypatch):
     """Anything going wrong inside the guard must mean "not sized", never a
     blocked request: codex serves exactly as it did before the guard."""

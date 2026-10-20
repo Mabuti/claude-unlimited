@@ -1248,13 +1248,18 @@ def _codex_assumption_summary(summary: dict) -> str:
         model = str(entry.get("model") or "?")
         reason = entry.get("reason")
         if reason == "no_published_api_window":
-            details.append(f"no published API window for {model} yet; budgeted at the assumed 272K floor")
+            details.append(f"no published API window for {model} yet; uses an assumed 272K window, "
+                           "yielding about 226K estimated input tokens after the guard reserve")
         elif reason == "no_published_subscription_window":
-            details.append(f"no published ChatGPT subscription window for {model} yet; budgeted at the assumed 272K floor")
+            details.append(f"no published ChatGPT subscription window for {model} yet; uses an "
+                           "assumed 272K window, yielding about 226K estimated input tokens after "
+                           "the guard reserve")
         elif reason == "unknown_backend":
-            details.append(f"{model} uses an unverified backend; budgeted at the assumed 272K floor")
+            details.append(f"{model} uses an unverified backend and an assumed 272K window, "
+                           "yielding about 226K estimated input tokens after the guard reserve")
         else:
-            details.append(f"{model} is not in gpt_windows.py; budgeted at the assumed 272K floor")
+            details.append(f"{model} has no verified window; uses an assumed 272K window, yielding "
+                           "about 226K estimated input tokens after the guard reserve")
     return f" (window assumed — {'; '.join(details)})"
 
 
@@ -1288,13 +1293,15 @@ _ONE_M_REASON_NOTES = {
                         "500K GPT-6.1 Sol subscription choice keeps a long conversation on the "
                         "account to about 443K estimated input tokens, while the explicit 272K cap "
                         "on every profile kind rotates at about 226K. On an API-key profile there is "
-                        "no published API window for the 500K model yet, so that id is budgeted at "
-                        "the assumed 272K floor. OpenAI's published API pricing bills prompts over "
+                        "no published API window for the 500K model yet, so that id uses an assumed "
+                        "272K window, yielding about 226K estimated input tokens after the guard "
+                        "reserve. OpenAI's published API pricing bills prompts over "
                         "272K input tokens at 2× input / 1.5× output for the whole request; on a "
                         "ChatGPT subscription, the quota meter has been observed to track reasoning "
                         "output rather than input size (docs/adr/0007), so subscription cost of long "
                         "input is unmeasured. The certain effect is rotation around ~443K versus "
-                        "~226K. Add a Claude account "
+                        "~226K. Choose either variant in a profile's Model override widget or in a "
+                        "Settings → Models parity Codex cell. Add a Claude account "
                         "to the rotation (long turns then go there) — or choose Force 1M in Settings "
                         "to set it anyway.",
     "custom_gateway_unknown": "an API profile points somewhere other than Anthropic, and we "

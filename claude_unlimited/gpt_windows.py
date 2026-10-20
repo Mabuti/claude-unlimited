@@ -29,8 +29,9 @@ from typing import Optional
 # pages, 2026-09). This does not claim that a subscription quota meter applies
 # that API-pricing multiplier.
 # gpt-6.1-sol's listed 500K window is above that threshold: budgeting it is an
-# explicit user choice, and the local -272k variant is an explicit 272K cap on
-# every profile kind that targets the 272K line. The byte estimate cannot see
+# explicit user choice, and the local -272k variant is an explicit 272,000 cap
+# on every profile kind, including API-key; it is not an assumed window. The
+# byte estimate cannot see
 # replayed reasoning, so that target is not a guarantee that every upstream
 # request stays below the pricing threshold.
 # `max_context_window` is the server ceiling a user can raise Codex CLI's own
@@ -62,8 +63,9 @@ CODEX_MODEL_VARIANTS: dict[str, tuple[str, int]] = {
 CODEX_BACKEND_EFFECTIVE = 0.95
 
 # 272K is the smallest context_window any listed slug has had, so it stays the
-# honest, conservative floor for an id the table has not met yet — the account
-# is not idled on a guess, the guess is
+# honest, conservative floor for an id the table has not met yet, or for a
+# listed slug whose resolved backend has no published window. The account is
+# not idled on a guess, the guess is
 # just made visible ("assumed") wherever the window is shown.
 UNKNOWN_WINDOW = 272_000
 
@@ -94,9 +96,10 @@ BACKEND_UNKNOWN = "unknown"   # an api_key Profile pointed at a custom base_url
 @dataclass(frozen=True)
 class WindowInfo:
     """One GPT id's window on one backend, and the per-request input budget
-    derived from it. `assumed` is True when the id (or the backend) is not in
-    the table and UNKNOWN_WINDOW was used instead. `assumption_reason` explains
-    why the floor was used for the Settings summary."""
+    derived from it. `assumed` is True when the resolved model/backend has no
+    published window in the table and UNKNOWN_WINDOW was used instead.
+    `assumption_reason` explains why the floor was used for the Settings
+    summary."""
     model: str
     backend: str
     window: int
@@ -111,8 +114,8 @@ def budget_for(window: int) -> int:
     return max(0, math.floor(window * CODEX_BACKEND_EFFECTIVE) - OUTPUT_RESERVE)
 
 
-# The smallest budget any codex backend can have (272K): what the cheap
-# stage-1 byte check is sized against.
+# The smallest budget any codex backend can have (226.4K estimated input
+# tokens): what the cheap stage-1 byte check is sized against.
 MIN_BUDGET = budget_for(UNKNOWN_WINDOW)
 
 
@@ -148,8 +151,9 @@ def window_for(model: Optional[str], auth_mode: Optional[str] = None,
                base_url: Optional[str] = None) -> WindowInfo:
     """The window and budget for `model` on the backend a codex Profile with
     this auth_mode/base_url is served from. A known local variant is an explicit
-    cap on every profile kind; an unknown id or backend is `assumed` at
-    UNKNOWN_WINDOW."""
+    cap on every profile kind. An unknown id, unknown backend, or known slug
+    without a published window for that backend is `assumed` at UNKNOWN_WINDOW;
+    `assumption_reason` identifies which case applied."""
     key = (model or "").strip().lower()
     variant = CODEX_MODEL_VARIANTS.get(key)
     real_key = upstream_slug(key)
