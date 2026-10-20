@@ -4355,7 +4355,10 @@ class Gateway:
                     self._remember_pin(key, forced_profile.id, parent_agent_id,
                                        reserve_pending=reserve_pending)
                 return RoutingDecision(profile_id=forced_profile.id, reason="subagent_forced",
-                                       reserved=reserve_pending)
+                                       # Ancillary requests may use the forced
+                                       # Profile without creating a pin or its
+                                       # pending reservation.
+                                       reserved=may_create_pin and reserve_pending)
 
         decision = choose_for_new_branch(snapshot, now, self._branch_counts(),
                                           exclude=frozenset(attempted), fit=fit)

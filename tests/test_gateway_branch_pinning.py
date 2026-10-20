@@ -417,6 +417,74 @@ def test_attempt_owned_reservation_survives_repin_ancillary_retry_and_cap_trim(p
     a_results[0].body_chunks.close()
 
 
+def test_forced_subagent_count_tokens_does_not_consume_real_turn_reservation(pool_env, monkeypatch):
+    monkeypatch.setattr(gateway_module, "BRANCH_PIN_CAP", 1)
+    save_pool(Pool(profiles=[prof("k", priority=1),
+                             _leaving("f", priority=9, forced_for_subagents=True)]))
+    setup_started = threading.Event()
+    allow_setup = threading.Event()
+    real_thread = []
+    real_results = []
+    real_errors = []
+
+    def get_token(profile_id):
+        if real_thread and threading.current_thread() is real_thread[0]:
+            setup_started.set()
+            assert allow_setup.wait(2)
+        return f"tok-{profile_id}"
+
+    monkeypatch.setattr(gateway_module.secret_store, "get_token", get_token)
+    gw = healthy_gateway()
+
+    def run_real_turn():
+        real_thread.append(threading.current_thread())
+        try:
+            real_results.append(gw.handle(
+                "POST", "/v1/messages", hdrs(session="K", agent="F"), b"{}"))
+        except BaseException as exc:
+            real_errors.append(exc)
+
+    worker = threading.Thread(target=run_real_turn)
+    worker.start()
+    assert setup_started.wait(2)
+    key = ("K", "F")
+
+    try:
+        with gw._lock:
+            assert gw._branch_pending_attempts[(key, "f")] == 1
+            assert gw._branch_pins[key].profile_id == "f"
+
+        # The forced account is still explicitly selected, but its branch pin
+        # is eligible to move because its Fable week is spent. That makes the
+        # ancillary request exercise the forced-subagent insertion path.
+        _spend_fable_on(gw, "f")
+        ancillary = gw.handle(
+            "POST", "/v1/messages/count_tokens", hdrs(session="K", agent="F"), b"{}")
+        list(ancillary.body_chunks)
+        with gw._lock:
+            assert gw._branch_pending_attempts[(key, "f")] == 1
+
+        # A second forced branch attempts the cap-1 insertion while the real
+        # turn is still in setup. The first branch must remain protected by its
+        # pending reservation.
+        inserted = gw.handle(
+            "POST", "/v1/messages", hdrs(session="K", agent="other"), b"{}")
+        inserted.body_chunks.close()
+
+        with gw._lock:
+            assert gw._branch_pending_attempts[(key, "f")] == 1
+            assert key in gw._branch_pins
+            assert gw._branch_pins[key].profile_id == "f"
+    finally:
+        allow_setup.set()
+        worker.join(2)
+
+    assert not worker.is_alive()
+    assert real_errors == []
+    assert len(real_results) == 1
+    real_results[0].body_chunks.close()
+
+
 def test_non_reserving_branch_assignment_does_not_change_pending(pool_env):
     save_pool(Pool(profiles=[prof("a"), prof("b")]))
     gw = healthy_gateway()
