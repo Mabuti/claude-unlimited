@@ -223,6 +223,21 @@ def test_wsl_falls_back_to_cmd_start(monkeypatch):
     assert shlex.join([sys.executable, "-m", "claude_unlimited", "reauth", "--profile", "deadbeef"]) in argv[-1]
 
 
+def test_wsl_rejects_interpreter_path_with_spaces_without_spawning(monkeypatch):
+    monkeypatch.setattr(daemon.sys, "platform", "linux")
+    monkeypatch.setattr(daemon.sys, "executable", "/opt/Python With Space/bin/python")
+    monkeypatch.setattr(daemon, "_is_wsl", lambda: True)
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    spawned = []
+    monkeypatch.setattr(daemon, "_spawn_detached", lambda *args, **kwargs: spawned.append((args, kwargs)))
+
+    launched, reason = daemon._launch_reauth_terminal("deadbeef")
+
+    assert launched is False
+    assert "interpreter path cannot be passed through Windows safely" in reason
+    assert spawned == []
+
+
 def test_native_windows_uses_wt_when_available(monkeypatch):
     argv = _capture_terminal(
         monkeypatch, platform="win32",
@@ -361,8 +376,25 @@ def test_linux_launcher_uses_the_login_interactive_shell_and_keeps_window_open(m
     assert argv[:4] == ["/usr/bin/x-terminal-emulator", "-e", "/bin/zsh", "-lic"]
     assert shlex.join([sys.executable, "-m", "claude_unlimited", "reauth", "--profile", "deadbeef"]) in argv[4]
     assert "status=$?" in argv[4]
+    assert '"' not in argv[4]
     assert "read -r" in argv[4]
     assert "attacker" not in argv[4]
+
+
+@pytest.mark.parametrize(
+    ("configured_shell", "expected_shell"),
+    [
+        ("/usr/bin/fish", "/bin/bash"),
+        ("/usr/bin/zsh", "/usr/bin/zsh"),
+    ],
+)
+def test_reauth_login_shell_allows_only_supported_shells(monkeypatch, configured_shell, expected_shell):
+    monkeypatch.setattr(daemon, "pwd", SimpleNamespace(
+        getpwuid=lambda uid: SimpleNamespace(pw_shell=configured_shell),
+    ))
+    monkeypatch.setattr(daemon.os, "getuid", lambda: 123)
+
+    assert daemon._reauth_login_shell() == expected_shell
 
 
 def test_native_windows_replaces_pythonw_with_sibling_python(monkeypatch, tmp_path):

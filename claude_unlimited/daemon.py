@@ -187,7 +187,7 @@ def _reauth_login_shell() -> str:
         shell = pwd.getpwuid(os.getuid()).pw_shell if pwd is not None else ""
     except (AttributeError, KeyError, OSError):
         shell = ""
-    return shell or "/bin/bash"
+    return shell if Path(shell).name in {"bash", "zsh", "sh", "dash", "ksh"} else "/bin/bash"
 
 
 def _reauth_shell_argv(command_argv: list[str]) -> list[str]:
@@ -195,7 +195,7 @@ def _reauth_shell_argv(command_argv: list[str]) -> list[str]:
     command = shlex.join(command_argv)
     script = (
         f"{command}; status=$?; "
-        "printf '\\nReauth command exited with status %s.\\nPress Enter to close...' \"$status\"; "
+        "printf '\\nReauth command exited with status %s.\\nPress Enter to close...' $status; "
         "read -r"
     )
     return [_reauth_login_shell(), "-lic", script]
@@ -265,6 +265,8 @@ def _launch_reauth_terminal(profile_id: str) -> tuple[bool, Optional[str]]:
     reason = None
 
     if _is_wsl():
+        if shlex.join(command_argv) != " ".join(command_argv):
+            return False, "The interpreter path cannot be passed through Windows safely; use the copy command."
         distro = _wsl_distro()
         if not distro:
             return False, "Could not determine the WSL distribution."
