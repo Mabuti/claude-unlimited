@@ -146,14 +146,17 @@ def backend_for(auth_mode: Optional[str], base_url: Optional[str]) -> str:
 def window_for(model: Optional[str], auth_mode: Optional[str] = None,
                base_url: Optional[str] = None) -> WindowInfo:
     """The window and budget for `model` on the backend a codex Profile with
-    this auth_mode/base_url is served from. Never raises: an unknown id or
-    backend is `assumed` at UNKNOWN_WINDOW."""
-    backend = backend_for(auth_mode, base_url)
+    this auth_mode/base_url is served from. A known local variant is explicit
+    on every backend; an unknown id or backend is `assumed` at UNKNOWN_WINDOW."""
     key = (model or "").strip().lower()
+    variant = CODEX_MODEL_VARIANTS.get(key)
     real_key = upstream_slug(key)
+    backend = backend_for(auth_mode, base_url)
+    if variant is not None:
+        window = variant[1]
+        return WindowInfo(key, backend, window, budget_for(window), assumed=False)
     if backend == BACKEND_SUBSCRIPTION and real_key in CODEX_BACKEND_WINDOWS:
-        variant = CODEX_MODEL_VARIANTS.get(key)
-        window = variant[1] if variant is not None else CODEX_BACKEND_WINDOWS[real_key][0]
+        window = CODEX_BACKEND_WINDOWS[real_key][0]
         return WindowInfo(key, backend, window, budget_for(window), assumed=False)
     if backend == BACKEND_OPENAI_API and key in OPENAI_API_MAX_INPUT:
         window = OPENAI_API_MAX_INPUT[key]

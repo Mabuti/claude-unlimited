@@ -1235,6 +1235,22 @@ def test_an_api_key_codex_profile_is_budgeted_at_the_public_api_window(pool_env,
     assert guard.windows["c"].window == 922_000 and not guard.fit.over_capacity
 
 
+def test_an_api_key_gpt_6_1_sol_assumption_names_the_unpublished_api_window(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex_profile(priority=1, auth_mode="api_key",
+                                           codex_model="gpt-6.1-sol"), _oauth()]))
+    _codex_recorder(monkeypatch)
+    gw = Gateway(transport=_anthropic_ok)
+    body = _big_body(tokens_over=400_000)
+    guard = gateway_module._request_guard(body, None, load_pool())
+    info = guard.windows["c"]
+    assert info.assumed is True and info.assumption_reason == "no_published_api_window"
+    _drain(gw.handle("POST", "/v1/messages", {}, body))
+    lines = _activity_lines()
+    assumed = [line for line in lines if "no published API window for gpt-6.1-sol yet" in line]
+    assert len(assumed) == 1, lines
+    assert "not in gpt_windows.py" not in assumed[0]
+
+
 def test_a_failing_estimator_degrades_to_todays_routing(pool_env, monkeypatch):
     """Anything going wrong inside the guard must mean "not sized", never a
     blocked request: codex serves exactly as it did before the guard."""

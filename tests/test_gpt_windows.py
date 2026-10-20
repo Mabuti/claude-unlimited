@@ -73,9 +73,19 @@ def test_api_key_profiles_get_the_public_api_window():
     assert info.budget == 922_000 * 95 // 100 - 32_000
 
 
-@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-6.1-sol-272k", "GPT-6.1-SOL-272K"])
-def test_api_key_profiles_keep_both_gpt_6_1_sol_variants_at_the_assumed_floor(model):
-    info = gw.window_for(model, auth_mode="api_key")
+@pytest.mark.parametrize("auth_mode,base_url", [
+    ("chatgpt_subscription", None),
+    ("api_key", None),
+    ("api_key", "http://localhost:11434/v1"),
+])
+def test_known_variant_cap_applies_before_backend_assumption(auth_mode, base_url):
+    info = gw.window_for("GPT-6.1-SOL-272K", auth_mode=auth_mode, base_url=base_url)
+    assert (info.window, info.budget, info.assumed) == (272_000, 226_400, False)
+    assert info.assumption_reason is None
+
+
+def test_api_key_profiles_keep_plain_gpt_6_1_sol_at_the_assumed_floor():
+    info = gw.window_for("gpt-6.1-sol", auth_mode="api_key")
     assert (info.window, info.budget, info.assumed) == (272_000, 226_400, True)
     assert info.assumption_reason == "no_published_api_window"
 

@@ -105,9 +105,11 @@ its backend cannot hold.** Concretely:
 * **No new setting for the guard**: it is part of `context_1m` and inert
   under `prefer_200k`/`client_default` (a 200K conversation never trips it).
   Under `auto` a mixed pool now decides `enabled_1m_guarded`; a route with
-  nothing but codex accounts decides `codex_only_route` (1M there would only
-  mean compacting at ~226K instead of 200K). A non-Anthropic api gateway stays
-  `custom_gateway_unknown`. `mixed_backend_capacity` no longer exists.
+  nothing but codex accounts decides `codex_only_route` (ordinary 272K rows
+  compact around ~226K estimated input; a user-selected 500K `gpt-6.1-sol` on
+  a ChatGPT subscription holds around ~443K; 1M would still mean compacting
+  sooner). A non-Anthropic api gateway stays `custom_gateway_unknown`.
+  `mixed_backend_capacity` no longer exists.
 * **A fourth `context_1m` value, `force_1m`**: sets the
   variable on every session whatever the route or client version. The guard
   stays active under it; the user's own `CLAUDE_CODE_DISABLE_1M_CONTEXT` and a

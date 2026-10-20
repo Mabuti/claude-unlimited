@@ -326,6 +326,13 @@ def test_the_launch_note_names_each_codex_account_and_its_window():
     [line] = cli._codex_guard_lines(Pool(profiles=[unknown], settings=Settings()), [unknown], None)
     assert "assumed" in line and "gpt-99-nova" in line
 
+    api_variant = Profile(id="k", name="K", kind="codex", automatic=True,
+                          auth_mode="api_key", codex_model="gpt-6.1-sol")
+    [line] = cli._codex_guard_lines(Pool(profiles=[api_variant], settings=Settings()),
+                                    [api_variant], None)
+    assert "no published API window for gpt-6.1-sol yet" in line
+    assert "not in gpt_windows.py" not in line
+
 
 def test_the_launch_note_shows_each_distinct_resolved_budget():
     import claude_unlimited.cli as cli

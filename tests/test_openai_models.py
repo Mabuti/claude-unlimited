@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 from claude_unlimited import gpt_windows
 from claude_unlimited.model_catalogue import Catalogue, ModelInfo
 from claude_unlimited.openai_models import (
@@ -147,6 +150,19 @@ def test_the_dashboard_does_not_restate_the_mapping():
         for alias, (real_slug, _) in gpt_windows.CODEX_MODEL_VARIANTS.items():
             assert alias not in page, f"{alias} is hardcoded in {filename} again"
             assert real_slug not in page, f"{real_slug} is hardcoded in {filename} again"
+
+
+def test_locale_values_do_not_restate_gpt_variant_ids():
+    locales = Path(__file__).resolve().parent.parent / "claude_unlimited" / "locales"
+    model_ids = set(gpt_windows.CODEX_MODEL_VARIANTS)
+    model_ids.update(real_slug for real_slug, _ in gpt_windows.CODEX_MODEL_VARIANTS.values())
+    for filename in ("en.json", "de.json", "es.json", "ro.json"):
+        strings = json.loads((locales / filename).read_text(encoding="utf-8"))
+        for key, value in strings.items():
+            if not isinstance(value, str) or key.startswith(("models.note.", "models.label.")):
+                continue
+            for model_id in model_ids:
+                assert model_id.lower() not in value.lower(), f"{model_id} is in {filename}:{key}"
 
 
 def test_selectable_variant_pair_uses_the_first_unique_catalogue_index():

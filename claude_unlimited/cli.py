@@ -1236,6 +1236,28 @@ def _codex_budget_summary(summary: dict) -> str:
                       for model, budget in zip(models, budgets))
 
 
+def _codex_assumption_summary(summary: dict) -> str:
+    """Explain why a resolved GPT window was assumed, per model."""
+    if not summary.get("assumed"):
+        return ""
+    assumptions = summary.get("assumptions") or []
+    if not assumptions:
+        return " (window assumed — not in gpt_windows.py)"
+    details = []
+    for entry in assumptions:
+        model = str(entry.get("model") or "?")
+        reason = entry.get("reason")
+        if reason == "no_published_api_window":
+            details.append(f"no published API window for {model} yet; budgeted at the assumed 272K floor")
+        elif reason == "no_published_subscription_window":
+            details.append(f"no published ChatGPT subscription window for {model} yet; budgeted at the assumed 272K floor")
+        elif reason == "unknown_backend":
+            details.append(f"{model} uses an unverified backend; budgeted at the assumed 272K floor")
+        else:
+            details.append(f"{model} is not in gpt_windows.py; budgeted at the assumed 272K floor")
+    return f" (window assumed — {'; '.join(details)})"
+
+
 def _codex_guard_lines(pool, enabled_profiles, forced_profile) -> list:
     """One line per ChatGPT/Codex account the session can reach, with the
     window the gateway's capacity guard holds it to (docs/adr/0009) — so a
@@ -1249,7 +1271,7 @@ def _codex_guard_lines(pool, enabled_profiles, forced_profile) -> list:
     lines = []
     for p in codex:
         summary = openai_models.codex_profile_windows(p, parity)
-        assumed = " (window assumed — not in gpt_windows.py)" if summary["assumed"] else ""
+        assumed = _codex_assumption_summary(summary)
         budget_summary = _codex_budget_summary(summary)
         lines.append(f"  {p.name}: {budget_summary} estimated input tokens per turn{assumed}; "
                      f"longer turns go to a Claude account, "
@@ -1266,7 +1288,12 @@ _ONE_M_REASON_NOTES = {
                         "500K GPT-6.1 Sol subscription choice keeps a long conversation on the "
                         "account to about 443K estimated input tokens, while the 272K cap rotates "
                         "at about 226K. An API-key profile for this model is still budgeted at the "
-                        "assumed 272K floor. Add a Claude account "
+                        "assumed 272K floor. OpenAI's published API pricing bills prompts over "
+                        "272K input tokens at 2× input / 1.5× output for the whole request; on a "
+                        "ChatGPT subscription, the quota meter has been observed to track reasoning "
+                        "output rather than input size (docs/adr/0007), so subscription cost of long "
+                        "input is unmeasured. The certain effect is rotation around ~443K versus "
+                        "~226K. Add a Claude account "
                         "to the rotation (long turns then go there) — or choose Force 1M in Settings "
                         "to set it anyway.",
     "custom_gateway_unknown": "an API profile points somewhere other than Anthropic, and we "

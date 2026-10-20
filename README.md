@@ -636,9 +636,11 @@ about 226K estimated input tokens, leaving room for the reply and its reasoning,
 turns go to a Claude account. The capped choice aims to keep requests under OpenAI's 272K
 long-context threshold, but the estimate cannot see replayed reasoning, so that is a target,
 not a guarantee; long conversations move to another account sooner. OpenAI's published API
-pricing lists prompts over 272K input tokens at 2× input and 1.5× output for the whole API
-request, so long turns can cost more; this does not claim that a ChatGPT subscription quota
-meter uses that multiplier. On an API-key profile there is no published window for this model
+pricing bills prompts over 272K input tokens at 2× input and 1.5× output for the whole request,
+so long turns can cost more. On a ChatGPT subscription, the quota meter has been observed to
+track reasoning output rather than input size (docs/adr/0007), so subscription cost of long input
+is unmeasured; the certain effect is rotation around **443K versus 226K** estimated input tokens.
+On an API-key profile there is no published window for this model
 yet, so whichever variant you choose is budgeted at the assumed 272K floor. The alias is
 translated to `gpt-6.1-sol` before it reaches OpenAI.
 

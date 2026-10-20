@@ -3781,10 +3781,21 @@ class Gateway:
             if not info.assumed or info.model in self._window_assumed_noted:
                 continue
             self._window_assumed_noted.add(info.model)
+            if info.assumption_reason == "no_published_api_window":
+                meta = (f"There is no published API window for {info.model} yet; it is budgeted "
+                        "at the assumed 272K floor.")
+            elif info.assumption_reason == "no_published_subscription_window":
+                meta = (f"{info.model} has no published ChatGPT subscription window yet; it is "
+                        "budgeted at the assumed 272K floor.")
+            elif info.assumption_reason == "unknown_backend":
+                meta = (f"{info.model} uses an unverified backend; it is budgeted at the "
+                        "assumed 272K floor.")
+            else:
+                meta = (f"{info.model} is not in gpt_windows.py ({info.backend} backend); "
+                        "add it there and re-run scripts/check_gpt_windows.py")
             activity.record("config", f"{self._profile_name(pool, profile_id)} — assuming a {info.window:,}-token "
                                       f"window for {info.model}",
-                             meta=f"{info.model} is not in gpt_windows.py ({info.backend} backend); "
-                                  f"add it there and re-run scripts/check_gpt_windows.py")
+                             meta=meta)
 
     # Re-announce the same session's "prompt is too long" at most this often.
     _CAPACITY_NOTE_INTERVAL_SECONDS = 600.0
