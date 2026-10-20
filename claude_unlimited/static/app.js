@@ -1633,13 +1633,17 @@ function renderReauthAction(p) {
   const command = reauthCommand(p.id);
   const state = _reauthUi.get(p.id);
   const status = state && state.mode === 'opened' ? t('profile.reauth_opened')
-    : state && state.mode === 'fallback' ? t('profile.reauth_fallback') : '';
-  const reason = state && state.reason ? `<span class="p-reauth-reason">${esc(state.reason)}</span>` : '';
+    : '';
+  const fallbackTitle = state && state.mode === 'fallback' && state.reason
+    ? ` title="${esc(state.reason)}"` : '';
+  const commandCaption = state && state.mode === 'fallback'
+    ? `<span class="p-reauth-note"${fallbackTitle}>${esc(t('profile.reauth_fallback'))}</span>`
+    : `<span class="p-reauth-command-caption">${esc(t('profile.reauth_command_caption'))}</span>`;
   return `<div class="p-reauth" data-reauth-container>
     ${status ? `<span class="p-reauth-note">${esc(status)}</span>` : ''}
     <button type="button" class="btn danger p-reauth-btn" data-action="reauth">${esc(t('profile.reauth'))}</button>
     <div class="p-reauth-command">
-      <span class="p-reauth-command-caption">${esc(t('profile.reauth_command_caption'))}</span>
+      ${commandCaption}
       <div class="p-reauth-command-row">
         <code>${esc(command)}</code>
         <button type="button" class="copy-btn" data-action="copy-reauth" data-command="${esc(command)}">
@@ -1648,7 +1652,6 @@ function renderReauthAction(p) {
         </button>
       </div>
     </div>
-    ${reason}
   </div>`;
 }
 

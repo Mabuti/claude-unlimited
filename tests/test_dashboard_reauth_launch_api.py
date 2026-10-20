@@ -377,23 +377,29 @@ def test_wsl_uses_fixed_cmd_path_when_cmd_is_not_on_path(monkeypatch):
 
 def test_wsl_cmd_uses_wslpath_for_custom_automount_root(monkeypatch):
     wslpath_meta = {}
-    monkeypatch.setattr(daemon.shutil, "which", lambda name: {
-        "wslpath": "/usr/bin/wslpath",
-    }.get(name))
-
-    def fake_run(argv, **kwargs):
-        wslpath_meta.update(argv=argv, kwargs=kwargs)
-        return SimpleNamespace(stdout="/custom/windows/System32/cmd.exe\n")
-
-    monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+    spawn_meta = {}
     monkeypatch.setattr(daemon.os.path, "isfile",
                         lambda path: path == "/custom/windows/System32/cmd.exe")
+    monkeypatch.setattr(daemon.os.path, "isdir",
+                        lambda path: path == "/custom/windows")
 
-    assert daemon._wsl_cmd_executable() == "/custom/windows/System32/cmd.exe"
+    argv = _capture_terminal(
+        monkeypatch,
+        platform="linux",
+        wsl=True,
+        distro="Ubuntu",
+        available={"wslpath": "/usr/bin/wslpath"},
+        wslpath_output="/custom/windows/System32/cmd.exe\n",
+        wslpath_meta=wslpath_meta,
+        spawn_meta=spawn_meta,
+    )
+
+    assert argv[0] == "/custom/windows/System32/cmd.exe"
     assert wslpath_meta == {
         "argv": ["/usr/bin/wslpath", "-u", r"C:\Windows\System32\cmd.exe"],
         "kwargs": {"capture_output": True, "text": True, "timeout": 2, "check": True},
     }
+    assert spawn_meta == {"cwd": "/custom/windows"}
 
 
 def test_linux_launcher_uses_the_login_interactive_shell_and_keeps_window_open(monkeypatch):

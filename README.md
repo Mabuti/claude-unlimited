@@ -1167,7 +1167,7 @@ Every command below also works under the short alias **`cu`** — e.g. `cu code`
 | `claude-unlimited doctor` | Checks your install, credential storage, and config. Run it first, and whenever something seems off. |
 | `claude-unlimited add-account` | Adds a Claude subscription via browser login. Isolated — never disturbs your existing `claude` login. |
 | `claude-unlimited add-codex-account` | Same, for a ChatGPT/Codex subscription. |
-| `claude-unlimited reauth [--profile <id>]` | Re-authenticates a Claude OAuth (subscription) Profile that needs it. Without `--profile`, it offers a picker; with it, use the Profile's **id**, not its display name. Clicking **Reauth** on an **Overview** profile card opens a terminal running the command, and the same command is on the card to copy if no window appears. |
+| `claude-unlimited reauth [--profile <id>]` | The **Reauth** button and command appear on **Overview** cards of Claude OAuth (subscription) Profiles that need re-auth. Without `--profile`, it offers a picker; with it, use the Profile's **id**, not its display name. Clicking **Reauth** opens a terminal running this install's reauth in a login shell, so `claude` is on `PATH`; the command on the card is the one to paste into your own terminal if no window appears. |
 
 </details>
 
@@ -1245,10 +1245,12 @@ message *No eligible Profile is available*, because that one is a configuration 
 <summary><b>An account says "needs re-auth"</b></summary>
 <br>
 
-Usually it fixes itself — tokens are refreshed in the background whether or not an account
-is currently in rotation. If it doesn't, click **Reauth** on the **Overview** profile card:
-that opens a terminal running the command. The same command is on the card to copy if no
-window appears. You can also run `claude-unlimited reauth --profile <id>` to target one OAuth
+The **Reauth** button and command appear on **Overview** cards of Claude OAuth (subscription)
+Profiles that need re-auth. Tokens are normally refreshed in the background whether or not an
+account is currently in rotation. If they don't, clicking **Reauth** opens a terminal running
+this install's reauth in a login shell, so `claude` is on `PATH`; the command on the card is
+the one to paste into your own terminal if no window appears. You can also run
+`claude-unlimited reauth --profile <id>` to target one OAuth
 Profile directly. Without the flag, it lists whichever accounts actually need it, so there's
 no guessing.
 Once it is signed back in, its usage is read straight away, so the Dashboard and the HUD

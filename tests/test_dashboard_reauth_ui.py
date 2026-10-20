@@ -41,15 +41,25 @@ def test_reauth_action_keeps_button_command_and_copy_control_in_every_mode():
     assert body.count('data-action="copy-reauth"') == 1
     assert "${esc(command)}" in body
     assert "profile.reauth_command_caption" in body
+    assert "profile.reauth_fallback" in body
     assert "p-reauth-command-caption" in body
 
 
-def test_reauth_fallback_reason_is_escaped_and_rendered_under_command():
+def test_reauth_fallback_reason_is_escaped_in_note_title_not_visible_text():
     body = _function_body(_APP_JS, "renderReauthAction")
     assert "state.reason" in body
     assert "esc(state.reason)" in body
-    assert "p-reauth-reason" in body
-    assert ".p-reauth-reason" in _INDEX_HTML
+    assert 'title="${esc(state.reason)}"' in body
+    assert "p-reauth-reason" not in body
+    assert ".p-reauth-reason" not in _INDEX_HTML
+
+
+def test_reauth_fallback_uses_one_caption_and_default_opened_keep_command_caption():
+    body = _function_body(_APP_JS, "renderReauthAction")
+    assert "const commandCaption" in body
+    assert "state && state.mode === 'fallback'" in body
+    assert "p-reauth-note" in body
+    assert "p-reauth-command-caption" in body
 
 
 def test_profile_refresh_removes_stale_reauth_ui_state():

@@ -200,7 +200,7 @@ def _reauth_login_shell() -> str:
 
 
 def _reauth_shell_argv(command_argv: list[str]) -> list[str]:
-    """Wrap the fixed re-auth argv in a login interactive shell command."""
+    """Wrap fixed re-auth argv in a login shell so ``claude`` is on PATH."""
     command = shlex.join(command_argv)
     script = (
         f"{command}; status=$?; "
@@ -305,7 +305,9 @@ def _launch_reauth_terminal(profile_id: str) -> tuple[bool, Optional[str]]:
             # directly and let wsl.exe create the terminal window.
             launch_argv = [cmd, "/c", "start", "", "wsl.exe", "-d", distro,
                            "--exec", *shell_argv]
-            launch_cwd = "/mnt/c/Windows"
+            launch_cwd = str(Path(cmd).parent.parent)
+            if not os.path.isdir(launch_cwd):
+                launch_cwd = None
         else:
             reason = "cmd.exe is not available."
     elif sys.platform == "win32":
