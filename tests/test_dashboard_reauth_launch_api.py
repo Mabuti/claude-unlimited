@@ -201,9 +201,10 @@ def test_wsl_uses_windows_terminal_and_wsl_distro(monkeypatch):
         available={"cmd.exe": "/mnt/c/Windows/System32/cmd.exe", "wt.exe": "/mnt/c/Windows/wt.exe"},
     )
 
+    # "--" re-parses through the default shell; "--exec" preserves the intended argv.
     assert argv[:10] == [
         "/mnt/c/Windows/System32/cmd.exe", "/c", "start", "", "wt.exe",
-        "wsl.exe", "-d", "Ubuntu-22.04", "--", daemon._reauth_login_shell(),
+        "wsl.exe", "-d", "Ubuntu-22.04", "--exec", daemon._reauth_login_shell(),
     ]
     assert argv[10] == "-lic"
     assert shlex.join([sys.executable, "-m", "claude_unlimited", "reauth", "--profile", "deadbeef"]) in argv[11]
@@ -216,7 +217,7 @@ def test_wsl_falls_back_to_cmd_start(monkeypatch):
     )
 
     assert argv == [
-        "/mnt/c/Windows/System32/cmd.exe", "/c", "start", "", "wsl.exe", "-d", "Ubuntu", "--",
+        "/mnt/c/Windows/System32/cmd.exe", "/c", "start", "", "wsl.exe", "-d", "Ubuntu", "--exec",
         daemon._reauth_login_shell(), "-lic",
         argv[-1],
     ]

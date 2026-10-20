@@ -280,10 +280,10 @@ def _launch_reauth_terminal(profile_id: str) -> tuple[bool, Optional[str]]:
                 # Windows Terminal command-line documentation:
                 # https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments
                 launch_argv = [cmd, "/c", "start", "", "wt.exe", "wsl.exe", "-d", distro,
-                               "--", *shell_argv]
+                               "--exec", *shell_argv]
             else:
                 launch_argv = [cmd, "/c", "start", "", "wsl.exe", "-d", distro,
-                               "--", *shell_argv]
+                               "--exec", *shell_argv]
             launch_cwd = "/mnt/c/Windows"
         else:
             reason = "cmd.exe is not available."
