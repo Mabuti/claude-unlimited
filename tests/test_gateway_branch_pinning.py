@@ -413,7 +413,7 @@ def test_transient_429_branch_retry_allows_manual_only_forced_subagent(pool_env,
     assert moves == [("a", "f", "transient_429")]
 
 
-def test_transient_429_branch_failover_does_not_capture_manual_only_current(pool_env):
+def test_transient_429_branch_failover_uses_selector_which_skips_manual_only_profiles(pool_env):
     save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2),
                              prof("manual", priority=3, automatic=False)]))
     served = []
@@ -751,6 +751,7 @@ def test_pin_cap_keeps_all_open_pins_routable_when_every_pin_is_open(pool_env, m
     for result in (*responses.values(), *followups.values()):
         result.body_chunks.close()
     assert gw._branch_open_responses == {}
+    assert len(gw._branch_pins) <= 2
 
 
 def test_open_response_idle_past_pin_ttl_still_counts_until_close(pool_env, monkeypatch):
@@ -836,8 +837,8 @@ def test_open_response_stays_visible_when_next_request_reroutes_after_retention(
 
     old_response = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
     assert old_response.profile_id == "a"
-    # The pin will expire at the one-hour retention boundary, but a byte
-    # shortly before then keeps the still-open response's activity fresh.
+    # The pin will expire at the one-hour retention boundary. A byte shortly
+    # before then refreshes five-minute activity, not routing-pin retention.
     clock[0] = start + gateway_module.BRANCH_PIN_TTL_SECONDS - 60
     assert next(old_response.body_chunks) == b"ok"
     clock[0] = start + gateway_module.BRANCH_PIN_TTL_SECONDS + 1

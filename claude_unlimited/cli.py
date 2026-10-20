@@ -2694,7 +2694,8 @@ def main(argv=None) -> int:
                            help="pin this session to one Profile by name or id, skipping the interactive picker")
     code_pin.add_argument("--distribute", action="store_true",
                            help="balance this session across accounts: the main agent and each subagent start "
-                                "on the Profile with fewest agents active in the last 5 minutes and stay there, "
+                                "on the Profile with fewest agents active in the last 5 minutes (an open response "
+                                "or recent activity) and stay there, "
                                 "each keeping its own prompt cache warm")
     # Deliberately no positional for claude's own args: nargs=REMAINDER
     # fails as soon as the first passthrough token looks like a flag (e.g.

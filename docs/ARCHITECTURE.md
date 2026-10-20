@@ -337,10 +337,12 @@ entries). It evicts the oldest closed pin first; a pin with an open response is 
 evicted. If every pin is open, the cap may be exceeded temporarily, bounded by the number
 of concurrent open requests. Upstream connect/read stalls raise through the transport socket
 timeouts; a downstream client that stops reading remains open and counted until it
-disconnects or the body is closed/finalized. The one-hour retention cutoff applies only to
-pins with no open response. An open response counts as active and protects its pin until
-it closes/finalizes or its transport raises, with no staleness exception. It is a routing
-preference, never a guarantee
+disconnects or the body is closed/finalized. The one-hour retention cutoff is based on
+`last_touch` and applies even when a response is open. An open response counts as active and
+protects its branch entry from cap eviction until it closes/finalizes or its transport raises.
+It does not refresh `last_touch` or prevent routing-pin expiry: after the cutoff, a next request
+may move the branch while the old response is still open, and that response keeps counting on
+its original Profile until it ends. It is a routing preference, never a guarantee
 — a pin whose Profile went ineligible, was already attempted this request, or was deleted
 is dropped, and the request falls through to normal rotation.
 
@@ -393,7 +395,8 @@ Because that traffic never moves `current_profile_id`, the Dashboard reads
 which accounts have agents active in the last five minutes (an open response or recent
 activity). This is the same five-minute meaning shown by the HUD detail card's session line;
 it is separate from the `in_use_now` recent-use grace signal and the `agents_since` age of the
-oldest retained pin (retention expires after one hour of inactivity when no response is open).
+oldest retained pin (retention expires after one hour of inactivity, regardless of whether a
+response is open).
 A silent open response
 counts for the badge and balancer, but does not by itself keep "Used now"
 (`_IN_FLIGHT_MAX_SECONDS`). An open response remains in `live_agents` even if that pin has

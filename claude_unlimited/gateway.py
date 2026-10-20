@@ -1740,17 +1740,6 @@ class Gateway:
             # transient_failover: the attempt still belongs to the branch and
             # must open/close its branch response count.
             branch_routed = decision.reason in _BRANCH_ROUTED_REASONS
-            transient_exclude = attempted
-            if (branch_routed and may_create_pin
-                    and snapshot.current_profile_id is not None
-                    and any(rt.profile_id == snapshot.current_profile_id and not rt.automatic
-                            for rt in snapshot.profiles)):
-                # A manual-only current Profile is eligible for global
-                # choose() during Take over, but never for branch routing.
-                # Keep it available only to the request that explicitly
-                # selected it; do not let a transient retry capture a
-                # branch pin on it.
-                transient_exclude = attempted | {snapshot.current_profile_id}
             if decision.reason == "fable_limit_no_alternative" and decision.profile_id is not None:
                 self._note_fable_limit_served_anyway(pool, decision.profile_id, now,
                                                      "no other account can take the session — served anyway")
@@ -1771,7 +1760,7 @@ class Gateway:
                     # _branch_decision above, which excludes every Profile
                     # in `attempted` and applies forced-subagent routing plus
                     # the least-loaded branch tie-break.
-                    decision = choose(snapshot, now, fit=fit, exclude=transient_exclude)
+                    decision = choose(snapshot, now, fit=fit, exclude=attempted)
                 if decision.profile_id is not None:
                     if branch_routed and branch is not None:
                         # _branch_decision already re-pinned message traffic
@@ -2141,7 +2130,7 @@ class Gateway:
                     else:
                         branch_retry_available = (
                             choose(snapshot, now, fit=fit,
-                                   exclude=transient_exclude).profile_id is not None)
+                                   exclude=attempted).profile_id is not None)
 
                 if (isinstance(observation, Unknown) and observation.status_code == 429
                         and forced_profile_id is None
@@ -3955,28 +3944,34 @@ class Gateway:
             existing.last_touch = now
             existing.last_active = now
             return
-        while len(self._branch_pins) >= BRANCH_PIN_CAP:
+        self._trim_closed_branch_pins_locked(BRANCH_PIN_CAP - 1)
+        self._branch_pins[key] = BranchPin(profile_id=profile_id, last_touch=now, created_at=now,
+                                            agent_id=key[1], parent_agent_id=parent_agent_id,
+                                            last_active=now)
+
+    def _trim_closed_branch_pins_locked(self, target_count: int) -> None:
+        """Evict oldest non-open pins until the map reaches ``target_count``.
+
+        Caller holds ``self._lock``. Open pins are never evicted; if every
+        remaining pin has an open response, temporary cap overflow remains.
+        """
+        while len(self._branch_pins) > target_count:
             eviction_pool = [
                 k for k in self._branch_pins
                 if not self._branch_has_open_response_locked(k)
             ]
             if not eviction_pool:
-                # Every retained pin has an open response. Keep all of them
-                # routable until a body closes; the map may exceed its cap
-                # temporarily rather than moving an active branch.
-                break
+                return
             oldest = min(eviction_pool, key=lambda k: self._branch_pins[k].last_touch)
             del self._branch_pins[oldest]
-        self._branch_pins[key] = BranchPin(profile_id=profile_id, last_touch=now, created_at=now,
-                                            agent_id=key[1], parent_agent_id=parent_agent_id,
-                                            last_active=now)
 
     def _touch_branch_pin(self, key: tuple, profile_id: str) -> None:
-        """Refresh a branch pin only while its response still belongs to it.
+        """Refresh five-minute branch activity only while the response belongs to it.
 
         A response can finish after another request has moved the branch to a
         different Profile. Checking the profile id prevents that old response
-        from making the replacement pin look active for the wrong account.
+        from making the replacement pin look active for the wrong account;
+        this does not refresh the pin's one-hour retention timestamp.
         """
         with self._lock:
             now = _pin_clock()
@@ -3987,12 +3982,14 @@ class Gateway:
     def _branch_response_is_open_locked(self, response_key: tuple) -> bool:
         """Whether a response remains open; caller holds ``self._lock``.
 
-        Open responses count and protect their pins until close/finalize or a
-        transport exception, with no staleness exception. The socket timeouts
-        bound upstream connect/read stalls (including a pre-header wait or an
-        upstream stream read). They do not bound a downstream client that
-        stops reading: that response stays open and counted until the client
-        disconnects, the body is closed/finalized, or the transport raises.
+        Open responses count and protect their branch entries from cap
+        eviction until close/finalize or a transport exception. They do not
+        refresh pin retention or prevent a stale routing pin from expiring.
+        The socket timeouts bound upstream connect/read stalls (including a
+        pre-header wait or an upstream stream read). They do not bound a
+        downstream client that stops reading: that response stays open and
+        counted until the client disconnects, the body is closed/finalized, or
+        the transport raises.
         """
         return self._branch_open_responses.get(response_key, 0) > 0
 
@@ -4038,6 +4035,7 @@ class Gateway:
         else:
             self._branch_open_responses.pop(response_key, None)
             self._branch_open_response_details.pop(response_key, None)
+            self._trim_closed_branch_pins_locked(BRANCH_PIN_CAP)
 
     def _branch_counts(self) -> dict:
         """Agents active in the shared five-minute load window per Profile.
@@ -4477,8 +4475,8 @@ class Gateway:
         closed with it. Branch-routed responses count for the whole open
         response, including a silent one, and remain counted until the client
         disconnects, the body is closed/finalized, or the transport raises.
-        Bytes flowing and the final touch refresh recent pin activity; the
-        one-hour retention cutoff applies only when no response is open."""
+        Bytes flowing and the final touch refresh five-minute activity; the
+        open response does not refresh one-hour routing-pin retention."""
         def touch() -> None:
             self._touch_in_flight(profile_id)
             if branch_key is not None:

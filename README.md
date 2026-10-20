@@ -680,11 +680,13 @@ its own prompt cache warm instead of paying a cache miss on every rotation.
 
 > **Balancing happens only when an agent starts — never mid-session.** An agent moves only
 > if its account reaches its switch threshold or a usage limit, becomes unavailable (turned
-> off, cooling down, needs re-auth), or its branch pin has had no request activity for an hour
-> and no response is open. An open response counts in **Agents: N** and protects its pin until
-> the client disconnects, the body is closed/finalized, or the transport raises, even when silent; the one-hour
-> retention cutoff does not apply while a response is open. It does not extend the routing pin;
-> once it closes, the next request may be assigned again. It balances by how many agents have
+> off, cooling down, needs re-auth), or its branch pin has had no request activity for an hour.
+> A request also moves the branch when it gets a transient 429 and another account can take it.
+> An open response counts in **Agents: N** and protects its branch entry from pin-cap eviction
+> until the client disconnects, the body is closed/finalized, or the transport raises, even when
+> silent. It does not refresh the one-hour routing-pin retention: after that hour, a next request
+> may move the branch while the response is still open, and that response keeps counting on its
+> original account until it closes. It balances by how many agents have
 > been active on each account in the last 5 minutes, not by usage percentage, so usage
 > evens out roughly over many sessions rather than exactly.
 
