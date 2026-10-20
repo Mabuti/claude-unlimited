@@ -113,6 +113,12 @@ ACTIVE_AGENT_WINDOW_SECONDS = 300.0
 # downstream client that stops reading remains open and counted until it
 # disconnects or the response body is closed/finalized.
 BRANCH_PIN_CAP = 512
+# A newly selected pin is reserved until the request can register its open
+# response. Credential lookup and request construction happen outside the
+# gateway lock; this grace prevents cap trim in that short window from
+# treating the pin as closed. It is only a reservation: last_active still
+# supplies the normal five-minute activity count.
+BRANCH_PIN_PENDING_GRACE_SECONDS = 120.0
 
 
 def _pin_clock() -> float:
@@ -975,6 +981,7 @@ class BranchPin:
     agent_id: str
     parent_agent_id: Optional[str] = None
     last_active: Optional[float] = None  # recent activity for the 5-minute load window
+    pending_since: Optional[float] = None  # pre-registration reservation, not activity
 
 
 def _blocked_models_for(profile: Profile, model_usage, settings, now: datetime,
@@ -2121,7 +2128,10 @@ class Gateway:
                         # the next loop's retry. It includes a forced subagent
                         # Profile even when automatic routing is disabled,
                         # without creating or moving the pin during this
-                        # availability check.
+                        # availability check. `_live_pin` may lazily drop an
+                        # expired pin or refresh `last_touch` while checking;
+                        # neither effect creates a pin because `may_create_pin`
+                        # is false here.
                         with self._lock:
                             branch_retry_available = self._branch_decision(
                                 pool, snapshot, now, branch, is_subagent, parent_agent_id,
@@ -3943,22 +3953,34 @@ class Gateway:
             existing.profile_id = profile_id
             existing.last_touch = now
             existing.last_active = now
+            existing.pending_since = now
             return
         self._trim_closed_branch_pins_locked(BRANCH_PIN_CAP - 1)
         self._branch_pins[key] = BranchPin(profile_id=profile_id, last_touch=now, created_at=now,
                                             agent_id=key[1], parent_agent_id=parent_agent_id,
-                                            last_active=now)
+                                            last_active=now, pending_since=now)
+
+    @staticmethod
+    def _branch_pin_is_pending_locked(pin: BranchPin, now: Optional[float] = None) -> bool:
+        """Whether a pin is in the short pre-registration reservation window."""
+        if pin.pending_since is None:
+            return False
+        checked_at = _pin_clock() if now is None else now
+        return checked_at - pin.pending_since < BRANCH_PIN_PENDING_GRACE_SECONDS
 
     def _trim_closed_branch_pins_locked(self, target_count: int) -> None:
         """Evict oldest non-open pins until the map reaches ``target_count``.
 
-        Caller holds ``self._lock``. Open pins are never evicted; if every
-        remaining pin has an open response, temporary cap overflow remains.
+        Caller holds ``self._lock``. Open or freshly reserved pins are never
+        evicted; if every remaining pin has an open response or fresh
+        reservation, temporary cap overflow remains.
         """
+        now = _pin_clock()
         while len(self._branch_pins) > target_count:
             eviction_pool = [
                 k for k in self._branch_pins
-                if not self._branch_has_open_response_locked(k)
+                if (not self._branch_has_open_response_locked(k)
+                    and not self._branch_pin_is_pending_locked(self._branch_pins[k], now))
             ]
             if not eviction_pool:
                 return
@@ -4016,6 +4038,8 @@ class Gateway:
             return False
         pin = self._branch_pins.get(key)
         response_key = (key, profile_id)
+        if pin is not None and pin.profile_id == profile_id:
+            pin.pending_since = None
         if self._branch_open_responses.get(response_key, 0) <= 0:
             if pin is not None and pin.profile_id == profile_id:
                 details = (pin.agent_id, pin.parent_agent_id)

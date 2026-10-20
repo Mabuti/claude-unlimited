@@ -334,15 +334,19 @@ Branches matter because the prompt cache is per-account. Rotating a branch to a 
 account costs a full cache miss; keeping a branch on one account keeps it warm. So the
 gateway holds `_branch_pins`: a bounded, TTL'd `branch key → profile` map (1 h, 512
 entries). It evicts the oldest closed pin first; a pin with an open response is never
-evicted. If every pin is open, the cap may be exceeded temporarily, bounded by the number
-of concurrent open requests. Upstream connect/read stalls raise through the transport socket
+evicted by the cap/trim. Pins for a disabled or deleted Profile are still removed by
+`_sync_snapshot`; the open response keeps counting until it ends. If every pin is open,
+the cap may be exceeded temporarily, bounded by the number of concurrent open requests.
+Upstream connect/read stalls raise through the transport socket
 timeouts; a downstream client that stops reading remains open and counted until it
 disconnects or the body is closed/finalized. The one-hour retention cutoff is based on
 `last_touch` and applies even when a response is open. An open response counts as active and
 protects its branch entry from cap eviction until it closes/finalizes or its transport raises.
 It does not refresh `last_touch` or prevent routing-pin expiry: after the cutoff, a next request
 may move the branch while the old response is still open, and that response keeps counting on
-its original Profile until it ends. It is a routing preference, never a guarantee
+its original Profile until it ends. While an old response is still open after a move, both the
+old and new pins count, so the sum of **Agents: N** can briefly exceed the number of branches.
+It is a routing preference, never a guarantee
 — a pin whose Profile went ineligible, was already attempted this request, or was deleted
 is dropped, and the request falls through to normal rotation.
 

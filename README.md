@@ -678,15 +678,17 @@ with the **fewest agents active in the last 5 minutes**, counted across all your
 (ties go to your priority order, then to the least-used account). It then *stays* there, so it keeps
 its own prompt cache warm instead of paying a cache miss on every rotation.
 
-> **Balancing happens only when an agent starts — never mid-session.** An agent moves only
-> if its account reaches its switch threshold or a usage limit, becomes unavailable (turned
-> off, cooling down, needs re-auth), or its branch pin has had no request activity for an hour.
-> A request also moves the branch when it gets a transient 429 and another account can take it.
+> **Balancing happens when an agent starts.** A branch stays on its account until that account
+> reaches its switch threshold or a usage limit, becomes unavailable (turned off, cooling down,
+> needs re-auth), the branch has had no new request for an hour, or a request gets a transient
+> 429 and another account can take it.
 > An open response counts in **Agents: N** and protects its branch entry from pin-cap eviction
 > until the client disconnects, the body is closed/finalized, or the transport raises, even when
 > silent. It does not refresh the one-hour routing-pin retention: after that hour, a next request
 > may move the branch while the response is still open, and that response keeps counting on its
-> original account until it closes. It balances by how many agents have
+> original account until it closes. While an old response is still open after a move, both the
+> old and new pins count, so the sum of **Agents: N** can briefly exceed the number of branches.
+> It balances by how many agents have
 > been active on each account in the last 5 minutes, not by usage percentage, so usage
 > evens out roughly over many sessions rather than exactly.
 
@@ -720,7 +722,7 @@ Which one wins, in order:
 |---|---|
 | `cu code --profile <name>` | That terminal's main agent uses that account, never rotated. Its subagents do too — unless a profile is marked "Force in subagents", in which case they go there, just as strictly. |
 | "Force in subagents" on a profile | Every subagent goes there; the main agent rotates normally (or stays pinned, with `--profile`). |
-| `cu code --distribute` | Main agent and each subagent start on the account with fewest agents active in the last 5 minutes (an open response or recent activity) and stay there for that session; the pin is retained for up to one hour. |
+| `cu code --distribute` | Main agent and each subagent start on the account with fewest agents active in the last 5 minutes (an open response or recent activity). Each branch stays there until its account reaches its switch threshold or a usage limit, becomes unavailable, the branch has had no new request for an hour, or a transient 429 lets another account take it; the pin is retained for up to one hour. |
 | Settings → "Balance sessions and subagents across accounts" | Same as above, for every session, no flag needed. |
 | *nothing set (default)* | Normal rotation — everyone shares one account until it's spent. |
 

@@ -722,6 +722,121 @@ def test_pin_cap_evicts_closed_pins_before_open_responses(pool_env, monkeypatch)
     assert gw._branch_open_responses == {}
 
 
+def test_pending_pin_survives_close_time_trim_before_response_registration(pool_env, monkeypatch):
+    monkeypatch.setattr(gateway_module, "BRANCH_PIN_CAP", 2)
+    save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2), prof("c", priority=3)]))
+    start = real_time.monotonic()
+    clock = [start]
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: clock[0])
+    gw = healthy_gateway()
+
+    old_a = gw.handle("POST", "/v1/messages", hdrs(agent="A"), b"{}", distribute=True)
+    clock[0] = start + gateway_module.BRANCH_PIN_TTL_SECONDS + 1
+    new_a = gw.handle("POST", "/v1/messages", hdrs(agent="A"), b"{}", distribute=True)
+    branch_b = gw.handle("POST", "/v1/messages", hdrs(agent="B"), b"{}", distribute=True)
+    assert new_a.profile_id != old_a.profile_id
+    assert {new_a.profile_id, branch_b.profile_id} == {"b", "c"}
+
+    key_c = ("s1", "C")
+    pre_registration_started = threading.Event()
+    allow_registration = threading.Event()
+    result_holder = []
+    error_holder = []
+    original_build = gateway_module.build_upstream_request
+
+    def delay_c_build(profile, credential, method, path, headers, *args, **kwargs):
+        if headers.get("x-claude-code-agent-id") == "C":
+            pre_registration_started.set()
+            allow_registration.wait(2)
+        return original_build(profile, credential, method, path, headers, *args, **kwargs)
+
+    monkeypatch.setattr(gateway_module, "build_upstream_request", delay_c_build)
+
+    def start_c():
+        try:
+            result_holder.append(
+                gw.handle("POST", "/v1/messages", hdrs(agent="C"), b"{}", distribute=True))
+        except BaseException as exc:
+            error_holder.append(exc)
+
+    worker = threading.Thread(target=start_c)
+    worker.start()
+    try:
+        assert pre_registration_started.wait(2)
+        with gw._lock:
+            assert key_c in gw._branch_pins
+            c_profile = gw._branch_pins[key_c].profile_id
+            assert gw._branch_pins[key_c].pending_since == clock[0]
+            a_open_profiles = {
+                profile_id for (key, profile_id), count in gw._branch_open_responses.items()
+                if key == ("s1", "A") and count > 0
+            }
+            assert a_open_profiles == {old_a.profile_id, new_a.profile_id}
+            assert gw._branch_open_responses[(("s1", "B"), branch_b.profile_id)] > 0
+
+        # A's old response closes while A's replacement, B, and C's pending
+        # pin occupy the cap-overflow map. C must remain reserved.
+        old_a.body_chunks.close()
+        with gw._lock:
+            assert key_c in gw._branch_pins
+    finally:
+        allow_registration.set()
+        worker.join(2)
+
+    assert not worker.is_alive()
+    assert error_holder == []
+    assert len(result_holder) == 1
+    c_result = result_holder[0]
+    assert c_result.profile_id == c_profile
+    with gw._lock:
+        assert gw._branch_pins[key_c].pending_since is None
+
+    c_result.body_chunks.close()
+    new_a.body_chunks.close()
+    branch_b.body_chunks.close()
+
+
+def test_insertion_trim_skips_fresh_pending_pin(pool_env, monkeypatch):
+    monkeypatch.setattr(gateway_module, "BRANCH_PIN_CAP", 2)
+    save_pool(Pool(profiles=[prof("a"), prof("b"), prof("c")]))
+    start = real_time.monotonic()
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: start)
+    gw = healthy_gateway()
+    pending_key = ("s1", "pending")
+    closed_key = ("s1", "closed")
+    new_key = ("s1", "new")
+
+    with gw._lock:
+        gw._branch_pins[pending_key] = gateway_module.BranchPin(
+            "a", start - 20, start - 20, "pending", pending_since=start)
+        gw._branch_pins[closed_key] = gateway_module.BranchPin(
+            "b", start - 10, start - 10, "closed")
+        gw._remember_pin(new_key, "c", None)
+
+    assert set(gw._branch_pins) == {pending_key, new_key}
+
+
+def test_expired_pending_pin_is_evictable(pool_env, monkeypatch):
+    monkeypatch.setattr(gateway_module, "BRANCH_PIN_CAP", 2)
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    start = real_time.monotonic()
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: start)
+    gw = healthy_gateway()
+    expired_key = ("s1", "expired")
+    other_key = ("s1", "other")
+
+    with gw._lock:
+        gw._branch_pins[expired_key] = gateway_module.BranchPin(
+            "a", start - 20, start - 20, "expired",
+            pending_since=start - gateway_module.BRANCH_PIN_PENDING_GRACE_SECONDS - 1)
+        gw._branch_pins[other_key] = gateway_module.BranchPin(
+            "b", start - 10, start - 10, "other")
+        gw._trim_closed_branch_pins_locked(1)
+
+    assert expired_key not in gw._branch_pins
+    assert other_key in gw._branch_pins
+
+
 def test_pin_cap_keeps_all_open_pins_routable_when_every_pin_is_open(pool_env, monkeypatch):
     monkeypatch.setattr(gateway_module, "BRANCH_PIN_CAP", 2)
     save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2),
@@ -751,7 +866,9 @@ def test_pin_cap_keeps_all_open_pins_routable_when_every_pin_is_open(pool_env, m
     for result in (*responses.values(), *followups.values()):
         result.body_chunks.close()
     assert gw._branch_open_responses == {}
-    assert len(gw._branch_pins) <= 2
+    assert {pin["agent_id"] for pin in gw.branch_pins()} == {"second", "third"}
+    for agent in ("second", "third"):
+        assert serve(gw, hdrs(agent=agent), distribute=True).profile_id == responses[agent].profile_id
 
 
 def test_open_response_idle_past_pin_ttl_still_counts_until_close(pool_env, monkeypatch):
