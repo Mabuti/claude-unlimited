@@ -54,10 +54,13 @@ estimator cannot see replayed reasoning, so that target is not a guarantee.
 OpenAI's published API pricing lists prompts over 272K input tokens at 2×
 input and 1.5× output for the whole API request; that pricing reference does
 not claim that a ChatGPT subscription quota meter uses the same multiplier.
-On an API-key profile no published window exists for this model yet, so either
-choice is budgeted at the assumed 272K floor. The alias is translated to
-`gpt-6.1-sol` before it reaches the backend, and the Dashboard explains the
-quota trade-off beside both choices.
+On an API-key profile no published API window exists for the 500K model yet, so
+that id is budgeted at the assumed 272K floor. The local `gpt-6.1-sol-272k`
+alias is an explicit 272K cap on every profile kind. Both variants are chosen
+in a profile's Codex model override or a Settings → Models parity Codex cell;
+neither is used unless chosen there. The alias is translated to `gpt-6.1-sol`
+before it reaches the backend, and the Dashboard explains the quota trade-off
+beside both choices.
 
 ## Decision
 

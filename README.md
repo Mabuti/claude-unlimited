@@ -382,6 +382,10 @@ Claude Code asks for a Claude model. When the request lands on a Codex account, 
 has to decide which GPT model actually answers — and how hard it thinks. That's the
 **parity list** in **Settings → Models parity**, and it's yours to edit:
 
+The two `gpt-6.1-sol` variants are explicit choices: select one in a profile's Codex model
+override or in a Codex cell under **Settings → Models parity**. Neither variant is used unless
+you choose it there.
+
 Each model has one base **Any** row (`source_effort: "*"`, also the default when
 omitted). Optional override rows use `source_effort: low|medium|high|xhigh|max`
 to choose a different Codex target or effort for that requested level. A row stores
@@ -640,9 +644,9 @@ pricing bills prompts over 272K input tokens at 2× input and 1.5× output for t
 so long turns can cost more. On a ChatGPT subscription, the quota meter has been observed to
 track reasoning output rather than input size (docs/adr/0007), so subscription cost of long input
 is unmeasured; the certain effect is rotation around **443K versus 226K** estimated input tokens.
-On an API-key profile there is no published window for this model
-yet, so whichever variant you choose is budgeted at the assumed 272K floor. The alias is
-translated to `gpt-6.1-sol` before it reaches OpenAI.
+On an API-key profile there is no published API window for the 500K model yet, so that id is
+budgeted at the assumed 272K floor. The 272K alias is an explicit cap on every profile kind and
+is translated to `gpt-6.1-sol` before it reaches OpenAI.
 
 When no account that may take the request can hold it — say the Claude accounts are out of
 capacity and a 400K conversation arrives — the daemon answers exactly the "prompt is too long"

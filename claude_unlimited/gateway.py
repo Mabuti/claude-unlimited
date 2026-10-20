@@ -3774,9 +3774,12 @@ class Gateway:
         return RoutingDecision(profile_id=forced_profile_id, reason="forced")
 
     def _note_assumed_windows(self, pool: Pool, guard: "RequestGuard") -> None:
-        """One Activity line per GPT id the guard had to ASSUME a window for,
-        so an id missing from gpt_windows' table is never a silent guess.
-        Safe without self._lock: a set add and an Activity write."""
+        """One Activity line per model/backend combination with no known window,
+        such as `gpt-6.1-sol` on an API-key profile. The
+        `assumption_reason` selects the explanation, so a known subscription
+        slug without a published API window is not described as missing from
+        `gpt_windows`. Safe without self._lock: a set add and an Activity
+        write."""
         for profile_id, info in guard.windows.items():
             if not info.assumed or info.model in self._window_assumed_noted:
                 continue

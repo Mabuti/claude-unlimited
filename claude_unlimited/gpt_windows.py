@@ -29,9 +29,10 @@ from typing import Optional
 # pages, 2026-09). This does not claim that a subscription quota meter applies
 # that API-pricing multiplier.
 # gpt-6.1-sol's listed 500K window is above that threshold: budgeting it is an
-# explicit user choice, and the local -272k variant targets the 272K line. The
-# byte estimate cannot see replayed reasoning, so that target is not a
-# guarantee that every upstream request stays below the pricing threshold.
+# explicit user choice, and the local -272k variant is an explicit 272K cap on
+# every profile kind that targets the 272K line. The byte estimate cannot see
+# replayed reasoning, so that target is not a guarantee that every upstream
+# request stays below the pricing threshold.
 # `max_context_window` is the server ceiling a user can raise Codex CLI's own
 # budget to; it is recorded for the freshness check only, never budgeted
 # against. Changing a row is a spending decision.
@@ -146,8 +147,9 @@ def backend_for(auth_mode: Optional[str], base_url: Optional[str]) -> str:
 def window_for(model: Optional[str], auth_mode: Optional[str] = None,
                base_url: Optional[str] = None) -> WindowInfo:
     """The window and budget for `model` on the backend a codex Profile with
-    this auth_mode/base_url is served from. A known local variant is explicit
-    on every backend; an unknown id or backend is `assumed` at UNKNOWN_WINDOW."""
+    this auth_mode/base_url is served from. A known local variant is an explicit
+    cap on every profile kind; an unknown id or backend is `assumed` at
+    UNKNOWN_WINDOW."""
     key = (model or "").strip().lower()
     variant = CODEX_MODEL_VARIANTS.get(key)
     real_key = upstream_slug(key)
