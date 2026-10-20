@@ -1632,23 +1632,20 @@ function reauthCommand(profileId) {
 function renderReauthAction(p) {
   const command = reauthCommand(p.id);
   const state = _reauthUi.get(p.id);
-  if (state && state.mode === 'opened') {
-    return `<div class="p-reauth" data-reauth-container><span class="p-reauth-note">${esc(t('profile.reauth_opened'))}</span></div>`;
-  }
-  if (state && state.mode === 'fallback') {
-    return `<div class="p-reauth" data-reauth-container>
-      <span class="p-reauth-note">${esc(t('profile.reauth_fallback'))}</span>
-      <div class="p-reauth-command">
-        <code>${esc(command)}</code>
-        <button type="button" class="copy-btn" data-action="copy-reauth" data-command="${esc(command)}">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
-          <span>${esc(t('settings.network.copy'))}</span>
-        </button>
-      </div>
-    </div>`;
-  }
+  const status = state && state.mode === 'opened' ? t('profile.reauth_opened')
+    : state && state.mode === 'fallback' ? t('profile.reauth_fallback') : '';
+  const reason = state && state.reason ? `<span class="p-reauth-reason">${esc(state.reason)}</span>` : '';
   return `<div class="p-reauth" data-reauth-container>
+    ${status ? `<span class="p-reauth-note">${esc(status)}</span>` : ''}
     <button type="button" class="btn danger p-reauth-btn" data-action="reauth">${esc(t('profile.reauth'))}</button>
+    <div class="p-reauth-command">
+      <code>${esc(command)}</code>
+      <button type="button" class="copy-btn" data-action="copy-reauth" data-command="${esc(command)}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+        <span>${esc(t('settings.network.copy'))}</span>
+      </button>
+    </div>
+    ${reason}
   </div>`;
 }
 
@@ -1788,7 +1785,10 @@ async function launchReauth(profileId, button) {
   button.disabled = true;
   try {
     const result = await api(`/api/profiles/${profileId}/reauth/launch`, { method: 'POST', body: '{}' });
-    _reauthUi.set(profileId, { mode: result.launched ? 'opened' : 'fallback' });
+    _reauthUi.set(profileId, {
+      mode: result.launched ? 'opened' : 'fallback',
+      reason: result.launched ? '' : (result.reason || ''),
+    });
   } catch (err) {
     // A dead/old daemon is the same user outcome as a launcher failure: show
     // the exact command without making the user hunt through a terminal.

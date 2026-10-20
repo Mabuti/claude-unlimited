@@ -1167,7 +1167,7 @@ Every command below also works under the short alias **`cu`** — e.g. `cu code`
 | `claude-unlimited doctor` | Checks your install, credential storage, and config. Run it first, and whenever something seems off. |
 | `claude-unlimited add-account` | Adds a Claude subscription via browser login. Isolated — never disturbs your existing `claude` login. |
 | `claude-unlimited add-codex-account` | Same, for a ChatGPT/Codex subscription. |
-| `claude-unlimited reauth [--profile <id>]` | Re-authenticates an account that needs it. Logs back into the *same* account, never a new one. The Dashboard shows a Reauth button on profiles that need it; `--profile` targets one OAuth Profile directly. |
+| `claude-unlimited reauth [--profile <id>]` | Re-authenticates a Claude OAuth (subscription) Profile that needs it. Without `--profile`, it offers a picker; with it, use the Profile's **id**, not its display name. The Dashboard profile-card **Reauth** button shows the full command with the id filled in and targets that Profile directly. |
 
 </details>
 
@@ -1251,6 +1251,9 @@ is currently in rotation. If it doesn't, click the Dashboard's Reauth button, or
 flag, it lists whichever accounts actually need it, so there's no guessing.
 Once it is signed back in, its usage is read straight away, so the Dashboard and the HUD
 show real numbers for it within seconds instead of at the next scheduled read.
+
+The Dashboard card button is for Claude OAuth (subscription) Profiles. It is separate from
+the HUD's **Reauth** status word, which only reports that an account needs attention.
 </details>
 
 <details>

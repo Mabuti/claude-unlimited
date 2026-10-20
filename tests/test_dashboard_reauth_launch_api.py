@@ -4,6 +4,7 @@ import json
 import shlex
 import sys
 import threading
+from types import SimpleNamespace
 import urllib.error
 import urllib.request
 
@@ -70,7 +71,8 @@ def _oauth_profile():
     )
 
 
-def _capture_terminal(monkeypatch, *, platform, available, wsl=False, distro=None):
+def _capture_terminal(monkeypatch, *, platform, available, wsl=False, distro=None,
+                      wslpath_output=None, wslpath_meta=None, spawn_meta=None):
     monkeypatch.setattr(daemon.sys, "platform", platform)
     monkeypatch.setattr(daemon, "_is_wsl", lambda: wsl)
     monkeypatch.setattr(daemon.shutil, "which", lambda name: available.get(name))
@@ -78,8 +80,24 @@ def _capture_terminal(monkeypatch, *, platform, available, wsl=False, distro=Non
         monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
     else:
         monkeypatch.setenv("WSL_DISTRO_NAME", distro)
+    if wslpath_output is not None:
+        def fake_wslpath(argv, **kwargs):
+            if wslpath_meta is not None:
+                wslpath_meta.update(argv=argv, kwargs=kwargs)
+            return SimpleNamespace(stdout=wslpath_output)
+
+        monkeypatch.setattr(
+            daemon.subprocess,
+            "run",
+            fake_wslpath,
+        )
     calls = []
-    monkeypatch.setattr(daemon, "_spawn_detached", lambda argv: calls.append(argv))
+    def capture(argv, **kwargs):
+        calls.append(argv)
+        if spawn_meta is not None:
+            spawn_meta.update(kwargs)
+
+    monkeypatch.setattr(daemon, "_spawn_detached", capture)
     launched, reason = daemon._launch_reauth_terminal("deadbeef")
     assert launched is True
     assert reason is None
@@ -153,10 +171,11 @@ def test_endpoint_builds_fixed_argv_ignoring_request_fields(running_server, monk
 
     assert status == 200
     assert body["launched"] is True
-    assert terminal_argv == [
-        "/usr/bin/x-terminal-emulator", "-e", sys.executable, "-m", "claude_unlimited",
-        "reauth", "--profile", profile.id,
-    ]
+    assert terminal_argv[:2] == ["/usr/bin/x-terminal-emulator", "-e"]
+    assert terminal_argv[2] == daemon._reauth_login_shell()
+    assert terminal_argv[3] == "-lic"
+    assert shlex.join([sys.executable, "-m", "claude_unlimited", "reauth", "--profile", profile.id]) in terminal_argv[4]
+    assert "read -r" in terminal_argv[4]
     assert "attacker-command" not in terminal_argv
 
 
@@ -179,13 +198,15 @@ def test_spawn_failure_returns_copyable_fallback(running_server, monkeypatch):
 def test_wsl_uses_windows_terminal_and_wsl_distro(monkeypatch):
     argv = _capture_terminal(
         monkeypatch, platform="linux", wsl=True, distro="Ubuntu-22.04",
-        available={"wt.exe": "/mnt/c/Windows/wt.exe"},
+        available={"cmd.exe": "/mnt/c/Windows/System32/cmd.exe", "wt.exe": "/mnt/c/Windows/wt.exe"},
     )
 
-    assert argv == [
-        "/mnt/c/Windows/wt.exe", "wsl.exe", "-d", "Ubuntu-22.04", "--",
-        sys.executable, "-m", "claude_unlimited", "reauth", "--profile", "deadbeef",
+    assert argv[:10] == [
+        "/mnt/c/Windows/System32/cmd.exe", "/c", "start", "", "wt.exe",
+        "wsl.exe", "-d", "Ubuntu-22.04", "--", daemon._reauth_login_shell(),
     ]
+    assert argv[10] == "-lic"
+    assert shlex.join([sys.executable, "-m", "claude_unlimited", "reauth", "--profile", "deadbeef"]) in argv[11]
 
 
 def test_wsl_falls_back_to_cmd_start(monkeypatch):
@@ -196,8 +217,10 @@ def test_wsl_falls_back_to_cmd_start(monkeypatch):
 
     assert argv == [
         "/mnt/c/Windows/System32/cmd.exe", "/c", "start", "", "wsl.exe", "-d", "Ubuntu", "--",
-        sys.executable, "-m", "claude_unlimited", "reauth", "--profile", "deadbeef",
+        daemon._reauth_login_shell(), "-lic",
+        argv[-1],
     ]
+    assert shlex.join([sys.executable, "-m", "claude_unlimited", "reauth", "--profile", "deadbeef"]) in argv[-1]
 
 
 def test_native_windows_uses_wt_when_available(monkeypatch):
@@ -229,9 +252,9 @@ def test_linux_uses_first_available_desktop_terminal(monkeypatch):
     )
 
     assert argv == [
-        "/usr/bin/gnome-terminal", "--", sys.executable, "-m", "claude_unlimited",
-        "reauth", "--profile", "deadbeef",
+        "/usr/bin/gnome-terminal", "--", daemon._reauth_login_shell(), "-lic", argv[-1],
     ]
+    assert shlex.join([sys.executable, "-m", "claude_unlimited", "reauth", "--profile", "deadbeef"]) in argv[-1]
 
 
 def test_spawn_error_is_reported_as_launcher_failure(monkeypatch):
@@ -249,3 +272,124 @@ def test_spawn_error_is_reported_as_launcher_failure(monkeypatch):
 
     assert launched is False
     assert reason == "permission denied"
+
+
+@pytest.mark.parametrize(
+    ("wslpath_output", "expected_distro"),
+    [
+        ("\\\\wsl.localhost\\Ubuntu\\", "Ubuntu"),
+        ("\\\\wsl$\\Ubuntu-22.04\\", "Ubuntu-22.04"),
+    ],
+)
+def test_wsl_resolves_distro_from_wslpath_when_environment_is_missing(
+    monkeypatch, wslpath_output, expected_distro
+):
+    wslpath_meta = {}
+    spawn_meta = {}
+    argv = _capture_terminal(
+        monkeypatch,
+        platform="linux",
+        wsl=True,
+        available={
+            "wslpath": "/usr/bin/wslpath",
+            "cmd.exe": "/mnt/c/Windows/System32/cmd.exe",
+            "wt.exe": "/mnt/c/Users/test/AppData/Local/Microsoft/WindowsApps/wt.exe",
+        },
+        distro=None,
+        wslpath_output=wslpath_output,
+        wslpath_meta=wslpath_meta,
+        spawn_meta=spawn_meta,
+    )
+
+    assert argv[5:8] == ["wsl.exe", "-d", expected_distro]
+    assert "-d" in argv
+    assert wslpath_meta == {
+        "argv": ["/usr/bin/wslpath", "-w", "/"],
+        "kwargs": {"capture_output": True, "text": True, "timeout": 2, "check": True},
+    }
+    assert spawn_meta == {"cwd": "/mnt/c/Windows"}
+
+
+def test_wsl_without_a_distro_falls_back_without_spawning(monkeypatch):
+    monkeypatch.setattr(daemon.sys, "platform", "linux")
+    monkeypatch.setattr(daemon, "_is_wsl", lambda: True)
+    monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
+    monkeypatch.setattr(daemon.shutil, "which", lambda name: {
+        "wslpath": "/usr/bin/wslpath",
+        "cmd.exe": "/mnt/c/Windows/System32/cmd.exe",
+        "wt.exe": "/mnt/c/Windows/wt.exe",
+    }.get(name))
+    monkeypatch.setattr(daemon.subprocess, "run", lambda argv, **kwargs: SimpleNamespace(stdout="not-a-wsl-path"))
+    spawned = []
+    monkeypatch.setattr(daemon, "_spawn_detached", lambda *args, **kwargs: spawned.append((args, kwargs)))
+
+    launched, reason = daemon._launch_reauth_terminal("deadbeef")
+
+    assert launched is False
+    assert reason == "Could not determine the WSL distribution."
+    assert spawned == []
+
+
+def test_wsl_uses_fixed_cmd_path_when_cmd_is_not_on_path(monkeypatch):
+    monkeypatch.setattr(daemon.os.path, "isfile",
+                        lambda path: path == "/mnt/c/Windows/System32/cmd.exe")
+    argv = _capture_terminal(
+        monkeypatch,
+        platform="linux",
+        wsl=True,
+        distro="Ubuntu",
+        available={
+            "wt.exe": "/mnt/c/Users/test/AppData/Local/Microsoft/WindowsApps/wt.exe",
+        },
+    )
+
+    assert argv[0] == "/mnt/c/Windows/System32/cmd.exe"
+    assert argv[4] == "wt.exe"
+
+
+def test_linux_launcher_uses_the_login_interactive_shell_and_keeps_window_open(monkeypatch):
+    monkeypatch.setattr(daemon, "pwd", SimpleNamespace(
+        getpwuid=lambda uid: SimpleNamespace(pw_shell="/bin/zsh"),
+    ))
+    monkeypatch.setattr(daemon.os, "getuid", lambda: 123)
+    argv = _capture_terminal(
+        monkeypatch,
+        platform="linux",
+        available={"x-terminal-emulator": "/usr/bin/x-terminal-emulator"},
+    )
+
+    assert argv[:4] == ["/usr/bin/x-terminal-emulator", "-e", "/bin/zsh", "-lic"]
+    assert shlex.join([sys.executable, "-m", "claude_unlimited", "reauth", "--profile", "deadbeef"]) in argv[4]
+    assert "status=$?" in argv[4]
+    assert "read -r" in argv[4]
+    assert "attacker" not in argv[4]
+
+
+def test_native_windows_replaces_pythonw_with_sibling_python(monkeypatch, tmp_path):
+    pythonw = tmp_path / "pythonw.exe"
+    python = tmp_path / "python.exe"
+    pythonw.touch()
+    python.touch()
+    monkeypatch.setattr(daemon.sys, "platform", "win32")
+    monkeypatch.setattr(daemon.sys, "executable", str(pythonw))
+    monkeypatch.setattr(daemon.shutil, "which", lambda name: r"C:\\Windows\\wt.exe" if name == "wt.exe" else None)
+    calls = []
+    monkeypatch.setattr(daemon, "_spawn_detached", lambda argv: calls.append(argv))
+
+    launched, reason = daemon._launch_reauth_terminal("deadbeef")
+
+    assert launched is True
+    assert reason is None
+    assert calls == [[r"C:\\Windows\\wt.exe", str(python), "-m", "claude_unlimited",
+                      "reauth", "--profile", "deadbeef"]]
+
+
+def test_native_windows_pythonw_without_sibling_falls_back(monkeypatch, tmp_path):
+    monkeypatch.setattr(daemon.sys, "platform", "win32")
+    monkeypatch.setattr(daemon.sys, "executable", str(tmp_path / "pythonw.exe"))
+    monkeypatch.setattr(daemon, "_spawn_detached", lambda argv: pytest.fail("must not spawn"))
+
+    launched, reason = daemon._launch_reauth_terminal("deadbeef")
+
+    assert launched is False
+    assert reason == "pythonw.exe has no sibling python.exe for terminal re-auth."

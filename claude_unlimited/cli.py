@@ -2702,11 +2702,14 @@ def main(argv=None) -> int:
     sub.add_parser("add-codex-account", aliases=["aca"],
                     help="log into a ChatGPT/Codex subscription via an isolated "
                          "session and add it as a codex-kind Profile")
-    reauth_p = sub.add_parser("reauth", help="re-authenticate an OAuth Profile that needs it "
-                                              "(defaults to whichever ones the daemon reports as needing it)")
+    reauth_p = sub.add_parser(
+        "reauth",
+        help="re-authenticate an OAuth subscription Profile; `claude-unlimited reauth` without "
+             "--profile offers a picker; the Dashboard card shows the full command with its id filled in",
+    )
     reauth_p.add_argument("--port", type=int, default=None)
     reauth_p.add_argument("--profile", metavar="ID", default=None,
-                          help="target this OAuth Profile id directly, without the picker")
+                          help="target this OAuth Profile's id (not its display name) directly, without the picker")
     desktop_p = sub.add_parser("desktop", help="configure the Claude desktop app to use the pool, then launch it")
     desktop_p.add_argument("--port", type=int, default=None)
     desktop_p.add_argument("--revert", action="store_true",

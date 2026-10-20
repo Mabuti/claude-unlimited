@@ -35,6 +35,11 @@ import sys
 import threading
 import time
 
+try:
+    import pwd
+except ImportError:  # pragma: no cover - only Windows lacks pwd
+    pwd = None
+
 if platform.system() != "Windows":
     import resource  # POSIX-only stdlib module, absent on Windows
 from dataclasses import asdict
@@ -138,7 +143,8 @@ def _is_wsl() -> bool:
 
 def _reauth_command(profile_id: str) -> list[str]:
     """The only command the Dashboard is allowed to launch for re-auth."""
-    return [sys.executable, "-m", "claude_unlimited", "reauth", "--profile", profile_id]
+    executable = _reauth_interpreter() or sys.executable
+    return [executable, "-m", "claude_unlimited", "reauth", "--profile", profile_id]
 
 
 def _reauth_display_command(profile_id: str) -> str:
@@ -146,7 +152,7 @@ def _reauth_display_command(profile_id: str) -> str:
     return f"claude-unlimited reauth --profile {profile_id}"
 
 
-def _spawn_detached(argv: list[str]) -> None:
+def _spawn_detached(argv: list[str], *, cwd: Optional[str] = None) -> None:
     """Start a terminal launcher without inheriting the daemon's stdio."""
     kwargs = {
         "stdin": subprocess.DEVNULL,
@@ -161,7 +167,81 @@ def _spawn_detached(argv: list[str]) -> None:
         )
     else:
         kwargs["start_new_session"] = True
+    if cwd is not None:
+        kwargs["cwd"] = cwd
     subprocess.Popen(argv, **kwargs)
+
+
+def _reauth_interpreter() -> Optional[str]:
+    """Return a console-capable interpreter for the terminal re-auth command."""
+    executable = sys.executable
+    if sys.platform != "win32" or Path(executable).name.lower() != "pythonw.exe":
+        return executable
+    console_executable = Path(executable).with_name("python.exe")
+    return str(console_executable) if console_executable.is_file() else None
+
+
+def _reauth_login_shell() -> str:
+    """The current user's login shell, with a portable POSIX fallback."""
+    try:
+        shell = pwd.getpwuid(os.getuid()).pw_shell if pwd is not None else ""
+    except (AttributeError, KeyError, OSError):
+        shell = ""
+    return shell or "/bin/bash"
+
+
+def _reauth_shell_argv(command_argv: list[str]) -> list[str]:
+    """Wrap the fixed re-auth argv in a login interactive shell command."""
+    command = shlex.join(command_argv)
+    script = (
+        f"{command}; status=$?; "
+        "printf '\\nReauth command exited with status %s.\\nPress Enter to close...' \"$status\"; "
+        "read -r"
+    )
+    return [_reauth_login_shell(), "-lic", script]
+
+
+def _wsl_distro_from_wslpath() -> Optional[str]:
+    """Resolve the current WSL distro without relying on service environment."""
+    wslpath = shutil.which("wslpath")
+    if not wslpath:
+        return None
+    try:
+        result = subprocess.run(
+            [wslpath, "-w", "/"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    output = result.stdout
+    if not isinstance(output, str):
+        return None
+    output = output.strip()
+    parts = output.split("\\")
+    if len(parts) < 4 or parts[0] != "" or parts[1] != "":
+        return None
+    if parts[2].lower() not in {"wsl.localhost", "wsl$"}:
+        return None
+    distro = parts[3].strip()
+    return distro or None
+
+
+def _wsl_distro() -> Optional[str]:
+    """Use the service environment when present, otherwise query wslpath."""
+    distro = os.environ.get("WSL_DISTRO_NAME", "").strip()
+    return distro or _wsl_distro_from_wslpath()
+
+
+def _wsl_cmd_executable() -> Optional[str]:
+    """Find cmd.exe from PATH, then from WSL's fixed Windows system path."""
+    cmd = shutil.which("cmd.exe")
+    if cmd:
+        return cmd
+    fixed_cmd = "/mnt/c/Windows/System32/cmd.exe"
+    return fixed_cmd if os.path.isfile(fixed_cmd) else None
 
 
 def _applescript_string(value: str) -> str:
@@ -176,23 +256,35 @@ def _launch_reauth_terminal(profile_id: str) -> tuple[bool, Optional[str]]:
     ``(False, reason)`` when this machine cannot open one. The caller never
     supplies an executable, shell string, or argument list.
     """
+    interpreter = _reauth_interpreter()
+    if interpreter is None:
+        return False, "pythonw.exe has no sibling python.exe for terminal re-auth."
     command_argv = _reauth_command(profile_id)
     launch_argv = None
+    launch_cwd = None
     reason = None
 
     if _is_wsl():
-        distro = os.environ.get("WSL_DISTRO_NAME")
+        distro = _wsl_distro()
         if not distro:
-            return False, "WSL_DISTRO_NAME is not set."
-        wt = shutil.which("wt.exe")
-        if wt:
-            launch_argv = [wt, "wsl.exe", "-d", distro, "--", *command_argv]
-        else:
-            cmd = shutil.which("cmd.exe")
-            if cmd:
-                launch_argv = [cmd, "/c", "start", "", "wsl.exe", "-d", distro, "--", *command_argv]
+            return False, "Could not determine the WSL distribution."
+        cmd = _wsl_cmd_executable()
+        if cmd:
+            shell_argv = _reauth_shell_argv(command_argv)
+            if shutil.which("wt.exe"):
+                # Windows Terminal's `wsl.exe` is a subcommand here. Keeping
+                # `-d` after it prevents wt.exe from treating the distro as
+                # its own starting-directory argument. See Microsoft's
+                # Windows Terminal command-line documentation:
+                # https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments
+                launch_argv = [cmd, "/c", "start", "", "wt.exe", "wsl.exe", "-d", distro,
+                               "--", *shell_argv]
             else:
-                reason = "Neither wt.exe nor cmd.exe is available."
+                launch_argv = [cmd, "/c", "start", "", "wsl.exe", "-d", distro,
+                               "--", *shell_argv]
+            launch_cwd = "/mnt/c/Windows"
+        else:
+            reason = "cmd.exe is not available."
     elif sys.platform == "win32":
         wt = shutil.which("wt.exe")
         if wt:
@@ -212,6 +304,7 @@ def _launch_reauth_terminal(profile_id: str) -> tuple[bool, Optional[str]]:
         else:
             reason = "osascript is not available."
     elif sys.platform == "linux":
+        shell_argv = _reauth_shell_argv(command_argv)
         for name, prefix in (
             ("x-terminal-emulator", ("-e",)),
             ("gnome-terminal", ("--",)),
@@ -220,7 +313,7 @@ def _launch_reauth_terminal(profile_id: str) -> tuple[bool, Optional[str]]:
         ):
             terminal = shutil.which(name)
             if terminal:
-                launch_argv = [terminal, *prefix, *command_argv]
+                launch_argv = [terminal, *prefix, *shell_argv]
                 break
         if launch_argv is None:
             reason = "No supported desktop terminal launcher is available."
@@ -231,7 +324,10 @@ def _launch_reauth_terminal(profile_id: str) -> tuple[bool, Optional[str]]:
         return False, reason or "No terminal launcher is available."
 
     try:
-        _spawn_detached(launch_argv)
+        if launch_cwd is None:
+            _spawn_detached(launch_argv)
+        else:
+            _spawn_detached(launch_argv, cwd=launch_cwd)
     except Exception as exc:  # noqa: BLE001 - the Dashboard must receive a fallback
         return False, str(exc) or exc.__class__.__name__
     return True, None

@@ -33,6 +33,23 @@ def test_reauth_action_posts_only_to_fixed_profile_endpoint_and_has_fallback():
     assert "Terminal opened" not in _APP_JS  # rendered through the locale key
 
 
+def test_reauth_action_keeps_button_command_and_copy_control_in_every_mode():
+    body = _function_body(_APP_JS, "renderReauthAction")
+    assert "state.mode === 'opened'" in body
+    assert "state.mode === 'fallback'" in body
+    assert body.count('data-action="reauth"') == 1
+    assert body.count('data-action="copy-reauth"') == 1
+    assert "${esc(command)}" in body
+
+
+def test_reauth_fallback_reason_is_escaped_and_rendered_under_command():
+    body = _function_body(_APP_JS, "renderReauthAction")
+    assert "state.reason" in body
+    assert "esc(state.reason)" in body
+    assert "p-reauth-reason" in body
+    assert ".p-reauth-reason" in _INDEX_HTML
+
+
 def test_profile_refresh_removes_stale_reauth_ui_state():
     body = _function_body(_APP_JS, "loadProfiles")
     assert "liveReauthIds" in body

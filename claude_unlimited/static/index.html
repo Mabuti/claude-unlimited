@@ -352,6 +352,7 @@
                       background: var(--bg-field); border: 1px solid var(--bad-border); border-radius: 8px; padding: 7px 10px; }
   .p-reauth-command code { min-width: 0; flex: 1; overflow-x: auto; white-space: nowrap; color: var(--bad);
                            font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: var(--fs-micro); }
+  .p-reauth-reason { width: 100%; font-size: var(--fs-micro); color: var(--text-faint); overflow-wrap: anywhere; }
 
   .empty { color: var(--text-faint); font-size: var(--fs-body); padding: 24px; text-align: center;
            border: 1px dashed var(--border); border-radius: 12px; }
@@ -2026,7 +2027,7 @@
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.reauth">Re-authenticates a Profile that needs it — defaults to whichever ones the daemon reports as "needs re-auth", and lets you pick if there's more than one. Pass --profile &lt;id&gt; to target one OAuth Profile directly without the picker. Logs back into the exact same account, never a new one. Once it is back, its usage is read straight away.</div>
+          <div class="field-sub" data-i18n="help.cmd.reauth">Re-authenticates a Claude OAuth (subscription) Profile that needs it — `claude-unlimited reauth` without --profile offers a picker among Profiles that need re-auth. Pass --profile &lt;id&gt; with the Profile's id, not its display name, to target one directly. The Dashboard card's Reauth control shows the full command with the id filled in. Logs back into the exact same account, never a new one. Once it is back, its usage is read straight away.</div>
         </div>
         <div class="divider"></div>
         <div class="cmd-row">
