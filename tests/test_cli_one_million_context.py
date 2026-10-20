@@ -338,7 +338,7 @@ def test_the_codex_only_launch_note_names_the_variant_selection_widgets():
     import claude_unlimited.cli as cli
 
     note = cli._ONE_M_REASON_NOTES["codex_only_route"]
-    assert "Ordinary GPT/Codex models" in note
+    assert "ordinary GPT/Codex models" in note
     assert "profile's Model override widget" in note
     assert "Settings → Models parity Codex cell" in note
     assert "a normal choice" not in note

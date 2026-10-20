@@ -634,7 +634,8 @@ so on your behalf, and you get the million back:
 **A ChatGPT/Codex account in the pool no longer costs you the window.** The certain effect of
 the two `gpt-6.1-sol` choices is simple: the 500K subscription choice keeps a long
 conversation on the account until about **443K estimated input tokens**, while the 272K cap
-rotates at about **226K estimated input tokens**. Ordinary GPT/Codex models have about **272K**
+rotates at about **226K estimated input tokens**. On ChatGPT-subscription profiles, ordinary
+GPT/Codex models have about **272K**
 windows, so the daemon sizes every turn before routing it: ordinary GPT/Codex models take turns up
 to about 226K estimated input tokens after the same headroom and reply/reasoning reserve documented
 in ADR 0009, and longer
@@ -645,6 +646,8 @@ pricing bills prompts over 272K input tokens at 2× input and 1.5× output for t
 so long turns can cost more. On a ChatGPT subscription, the quota meter has been observed to
 track reasoning output rather than input size (docs/adr/0007), so subscription cost of long input
 is unmeasured; the certain effect is rotation around **443K versus 226K** estimated input tokens.
+API-key profiles use each model's published API window; the per-profile guard line shows the actual
+budget.
 On an API-key profile there is no published API window for the 500K model yet, so that id uses an
 assumed 272K window, yielding about 226K estimated input tokens after the guard reserve. The
 `gpt-6.1-sol-272k` alias (the **GPT-6.1 Sol (272K cap)** choice in a profile's **Model override**
@@ -666,7 +669,8 @@ GPT window this build cannot verify is assumed at 272K and said so, in the Activ
 Settings — never excluded on a guess.
 
 **Auto is the cautious alternative** — it stays quiet when it cannot be sure: when only ChatGPT/Codex accounts can take the
-session (ordinary GPT/Codex models are about 272K; only a user-selected 500K gpt-6.1-sol on a
+session (on ChatGPT-subscription profiles, ordinary GPT/Codex models are about 272K; only a
+user-selected 500K gpt-6.1-sol on a
 ChatGPT-subscription profile budgets past that, while an API-key profile for this model uses an
 assumed 272K window and yields about 226K estimated input tokens after the guard reserve), when an
 API profile points somewhere other than Anthropic, or when your Claude Code version has not

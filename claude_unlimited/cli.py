@@ -1288,14 +1288,15 @@ def _codex_guard_lines(pool, enabled_profiles, forced_profile) -> list:
 # "user_forced_200k" and "user_already_set" are the user's own doing and need
 # no commentary; "no_profiles" already fails louder elsewhere.
 _ONE_M_REASON_NOTES = {
-    "codex_only_route": "only ChatGPT/Codex accounts can take this session. Ordinary GPT/Codex "
-                        "models are about 272K (about 226K estimated input tokens); the selected "
+    "codex_only_route": "only ChatGPT/Codex accounts can take this session. On ChatGPT-subscription profiles, "
+                        "ordinary GPT/Codex models are about 272K (about 226K estimated input tokens); the selected "
                         "500K GPT-6.1 Sol subscription choice keeps a long conversation on the "
                         "account to about 443K estimated input tokens, while the explicit 272K cap "
                         "on every profile kind rotates at about 226K. On an API-key profile there is "
                         "no published API window for the 500K model yet, so that id uses an assumed "
                         "272K window, yielding about 226K estimated input tokens after the guard "
-                        "reserve. OpenAI's published API pricing bills prompts over "
+                        "reserve. API-key profiles use each model's published API window; the per-profile "
+                        "guard line shows the actual budget. OpenAI's published API pricing bills prompts over "
                         "272K input tokens at 2× input / 1.5× output for the whole request; on a "
                         "ChatGPT subscription, the quota meter has been observed to track reasoning "
                         "output rather than input size (docs/adr/0007), so subscription cost of long "
