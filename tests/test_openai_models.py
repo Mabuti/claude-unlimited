@@ -6,6 +6,7 @@ from claude_unlimited.openai_models import (
     advertised_models,
     fallback_models,
     map_model,
+    selectable_models,
 )
 
 
@@ -26,6 +27,14 @@ def test_no_tier_reaches_the_expensive_model_by_default():
     expensive = "gpt-6-astra"
     assert [c for c, t in _MODEL_MAP.items() if t.model == expensive] == []
     assert expensive in _MODEL_LADDER
+
+
+def test_gpt_6_1_sol_variants_are_selectable_without_entering_default_routing():
+    models = selectable_models(catalogue=None)
+    assert "gpt-6.1-sol" in models
+    assert "gpt-6.1-sol-272k" in models
+    assert "gpt-6.1-sol" not in _MODEL_LADDER
+    assert "gpt-6.1-sol-272k" not in _MODEL_LADDER
 
 
 def test_unknown_model_falls_back_to_the_balanced_default():

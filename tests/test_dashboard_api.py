@@ -67,6 +67,17 @@ def test_get_profiles_empty_list(running_server):
     assert body["profiles"] == []
 
 
+def test_codex_model_map_exposes_gpt_6_1_sol_variants_and_notes(running_server):
+    base, _ = running_server
+    status, body = _request(f"{base}/api/codex/model-map")
+    assert status == 200
+    assert {"gpt-6.1-sol", "gpt-6.1-sol-272k"}.issubset(body["selectable_models"])
+    assert body["model_notes"] == {
+        "gpt-6.1-sol": "models.note.gpt_6_1_sol_500k",
+        "gpt-6.1-sol-272k": "models.note.gpt_6_1_sol_272k",
+    }
+
+
 def test_post_profile_without_csrf_token_is_rejected(running_server):
     base, _ = running_server
     status, body = _request(f"{base}/api/profiles", "POST", {"name": "X", "kind": "oauth", "credential": "sk-ant-12345678"})

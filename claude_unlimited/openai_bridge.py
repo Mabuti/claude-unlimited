@@ -34,6 +34,7 @@ from . import codex_state, openai_credential, openai_login, usage_tracking
 from . import openai_translate
 from .openai_translate import user_turn_index
 from .config import Profile
+from .gpt_windows import upstream_slug
 from .openai_models import fallback_models, map_model, requested_effort
 from . import wire_formats
 
@@ -556,6 +557,7 @@ def run(profile: Profile, stored_credential: str, body: bytes,
     )
     fmt = wire_formats.get(getattr(profile, "wire_format", None))
     parts = _backend_parts(profile, is_subscription, fmt.endpoint_path)
+    upstream_model = upstream_slug(target.model)
 
     # Start from whatever this backend last accepted in place of the mapped
     # model, then walk the ladder if that is rejected too. A Profile override
@@ -566,7 +568,7 @@ def run(profile: Profile, stored_credential: str, body: bytes,
     # keyed by model name alone, so a substitution learned against the Codex
     # backend would otherwise be applied to a same-named model on a completely
     # different server.
-    first_choice = _substitute_model(target.model) if fmt.uses_model_ladder else target.model
+    first_choice = _substitute_model(upstream_model) if fmt.uses_model_ladder else upstream_model
     candidates = [first_choice]
     if fmt.uses_model_ladder:
         # Scoped to formats served by the Codex backend, whose lineup the
@@ -589,7 +591,7 @@ def run(profile: Profile, stored_credential: str, body: bytes,
         # sending a fresh random session-id — which is what left 400k+ tokens
         # uncached on a fan-out of small, same-system requests.
         ids = codex_state.identity_from_prompt(
-            target.model, openai_translate._extract_system_text(anthropic_body.get("system")))
+            upstream_model, openai_translate._extract_system_text(anthropic_body.get("system")))
     turn = user_turn_index(anthropic_body)
     turn_token = (codex_state.turn_state(context.claude_session_id, context.agent_id, turn)
                   if ids and context else None)
@@ -623,7 +625,7 @@ def run(profile: Profile, stored_credential: str, body: bytes,
             raise OpenAIBridgeError(f"Could not reach {parts.hostname}: {exc}") from exc
 
         if resp.status < 400:
-            _remember_substitution(target.model, model)
+            _remember_substitution(upstream_model, model)
             served_model = model
             break
 

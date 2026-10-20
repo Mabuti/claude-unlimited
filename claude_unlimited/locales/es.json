@@ -732,5 +732,7 @@
   "settings.parity.follow_hint": "El mismo nivel cuando Claude Code envía uno; de lo contrario, el esfuerzo predefinido para ese modelo.",
   "settings.parity.fixed_hint": "fijo — ignora el esfuerzo solicitado",
   "settings.parity.curated_title": "Valores predefinidos cuando no se envía esfuerzo",
-  "settings.parity.curated_family": "Nivel de Claude"
+  "settings.parity.curated_family": "Nivel de Claude",
+  "models.note.gpt_6_1_sol_500k": "Ventana completa de 500K (predeterminada por el backend). Las solicitudes con más de 272K tokens de entrada se facturan a 2× los tokens de entrada y 1.5× los de salida durante toda la solicitud, por lo que las sesiones largas consumen más cuota.",
+  "models.note.gpt_6_1_sol_272k": "Mismo modelo, limitado a 272K para que ninguna solicitud cruce el umbral de precio de contexto largo de 272K. Las conversaciones largas pasan antes a otra cuenta."
 }

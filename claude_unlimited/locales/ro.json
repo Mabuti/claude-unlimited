@@ -732,5 +732,7 @@
   "settings.parity.follow_hint": "Același nivel când Claude Code trimite unul; altfel, efortul predefinit pentru modelul respectiv.",
   "settings.parity.fixed_hint": "fix — ignoră efortul solicitat",
   "settings.parity.curated_title": "Valori predefinite când nu este trimis niciun efort",
-  "settings.parity.curated_family": "Nivel Claude"
+  "settings.parity.curated_family": "Nivel Claude",
+  "models.note.gpt_6_1_sol_500k": "Fereastră completă de 500K (valoarea implicită a backendului). Prompturile cu peste 272K de tokeni de intrare sunt taxate la 2× pentru intrare și 1.5× pentru ieșire pe întreaga cerere, astfel încât sesiunile lungi consumă mai multă cotă.",
+  "models.note.gpt_6_1_sol_272k": "Același model, limitat la 272K pentru ca nicio cerere să nu treacă pragul de preț pentru context lung de 272K. Conversațiile lungi trec mai devreme la alt cont."
 }

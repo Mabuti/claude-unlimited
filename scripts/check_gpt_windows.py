@@ -48,6 +48,7 @@ def main() -> int:
     fetched = cache.get("fetched_at", "?") if isinstance(cache, dict) else "?"
     problems: list[str] = []
     seen = 0
+    listed_windows: dict[str, tuple[object, object]] = {}
     for entry in models:
         if not isinstance(entry, dict):
             continue
@@ -57,6 +58,7 @@ def main() -> int:
         seen += 1
         window = entry.get("context_window")
         ceiling = entry.get("max_context_window")
+        listed_windows[slug] = (window, ceiling)
         row = gpt_windows.CODEX_BACKEND_WINDOWS.get(slug)
         if row is None:
             problems.append(f"  {slug}: missing from CODEX_BACKEND_WINDOWS "
@@ -67,6 +69,15 @@ def main() -> int:
         if isinstance(pct, (int, float)) and abs(pct / 100.0 - gpt_windows.CODEX_BACKEND_EFFECTIVE) > 1e-9:
             problems.append(f"  {slug}: effective_context_window_percent is {pct}, "
                             f"table assumes {gpt_windows.CODEX_BACKEND_EFFECTIVE * 100:g}")
+
+    for alias, (real_slug, cap) in gpt_windows.CODEX_MODEL_VARIANTS.items():
+        listed = listed_windows.get(real_slug.lower())
+        if listed is None:
+            problems.append(f"  {alias}: real slug {real_slug} is not a visible listed model in the cache")
+            continue
+        context_window, _ = listed
+        if not isinstance(context_window, (int, float)) or cap > context_window:
+            problems.append(f"  {alias}: cap {cap} exceeds listed {real_slug} context_window {context_window}")
 
     if problems:
         print(f"check_gpt_windows: claude_unlimited/gpt_windows.py is OUT OF SYNC with {CACHE} "

@@ -479,10 +479,22 @@ def parity_grid(rows, catalogue: Optional[Catalogue] = None) -> list[dict]:
 # label the /v1/models listing a codex Profile serves — never sent upstream.
 _OPENAI_DISPLAY_NAMES: dict[str, str] = {
     "gpt-6-astra": "GPT-6 Astra",
+    "gpt-6.1-sol": "GPT-6.1 Sol (500K)",
+    "gpt-6.1-sol-272k": "GPT-6.1 Sol (272K cap)",
     "gpt-5.6-sol": "GPT-5.6 Sol",
     "gpt-5.6-terra": "GPT-5.6 Terra",
     "gpt-5.6-luna": "GPT-5.6 Luna",
 }
+
+_OPENAI_MODEL_NOTE_KEYS: dict[str, str] = {
+    "gpt-6.1-sol": "models.note.gpt_6_1_sol_500k",
+    "gpt-6.1-sol-272k": "models.note.gpt_6_1_sol_272k",
+}
+
+
+def model_notes() -> dict[str, str]:
+    """Locale keys for selectable model explanations shown by the Dashboard."""
+    return dict(_OPENAI_MODEL_NOTE_KEYS)
 
 
 # Ordered most- to least-capable. A model id is a moving target: OpenAI
@@ -587,8 +599,9 @@ def automatic_mapping(parity=None,
 
 
 # Older ids that remain selectable for a Profile pinned to one, even though
-# nothing maps to them by default.
-_LEGACY_SELECTABLE: tuple[str, ...] = ("gpt-5.5", "gpt-5.2")
+# nothing maps to them by default, plus the explicit gpt-6.1-sol choices.
+_CURATED_SELECTABLE: tuple[str, ...] = ("gpt-6.1-sol", "gpt-6.1-sol-272k")
+_LEGACY_SELECTABLE: tuple[str, ...] = ("gpt-5.5", "gpt-5.2") + _CURATED_SELECTABLE
 
 
 def selectable_models(catalogue: Optional[Catalogue] = None) -> list[str]:

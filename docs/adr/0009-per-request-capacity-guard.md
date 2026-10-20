@@ -18,15 +18,16 @@ Three facts, read out of the installed Codex CLI, the ChatGPT backend's model
 listing it caches, and the installed Claude Code 2.1.278 binary, made a
 per-request guard possible:
 
-1. **The ChatGPT/Codex backend's windows are small, uniform and published.**
-   Every slug the backend lists (`gpt-6-astra`, `gpt-5.6-sol/terra/luna`,
-   `gpt-5.5`, …) has `context_window = 272,000` and
-   `effective_context_window_percent = 95`; `max_context_window` (872K for the
-   5.6 line) is a ceiling a user can raise the CLI's budget to, **and the
-   boundary of OpenAI's higher-usage band** — above 272K input a request is
-   charged at a higher rate for the whole request. LiteLLM's figures (922K) are
-   the public API's and are wrong for this backend by ~3.4x, so the model
-   catalogue cannot be the source.
+1. **The ChatGPT/Codex backend's windows are published, but not uniform.**
+   Every listed slug except `gpt-6.1-sol` (`gpt-6-astra`,
+   `gpt-5.6-sol/terra/luna`, `gpt-5.5`, …) has `context_window = 272,000` and
+   `effective_context_window_percent = 95`; `gpt-6.1-sol` lists a 500K
+   `context_window` and an 872K `max_context_window`. The 272K value is
+   OpenAI's long-context price threshold — above 272K input a request is
+   charged at a higher rate for the whole request — while `context_window` is
+   normally the backend's default budget. LiteLLM's figures (922K) are the
+   public API's and are wrong for this backend by ~3.4x, so the model catalogue
+   cannot be the source.
 2. **Claude Code reactively compacts on exactly one error.** A 400/413 whose
    message matches `/prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)/i`
    in Anthropic's error envelope makes it compact by the parsed gap and
@@ -38,18 +39,30 @@ per-request guard possible:
    fact composed into both choosers; the capacity fit is a per-*request* fact
    that composes the same way, without touching `ProfileRuntime.state`.
 
+### Update — 2026-10-20
+
+`gpt-6.1-sol` is the first listed slug whose 500K `context_window` exceeds the
+272K long-context price threshold. The owner chose to offer both the backend's
+500K variant and a local `gpt-6.1-sol-272k` variant capped at 272K. The 500K
+choice is explicit and carries a 443K estimated-input budget; the capped choice
+keeps the 226.4K budget used by the other 272K rows. The alias is translated to
+`gpt-6.1-sol` before it reaches the backend, and the Dashboard explains the
+quota trade-off beside both choices.
+
 ## Decision
 
 **Size every real turn in the gateway and keep a codex Profile out of any turn
 its backend cannot hold.** Concretely:
 
 * `gpt_windows.py` (new, pure) hardcodes the windows, keyed by backend:
-  ChatGPT subscription (`context_window`, the higher-usage boundary) and the
-  public OpenAI API (max input) for `api_key` codex Profiles. A custom
+  ChatGPT subscription (`context_window`, normally the backend default) and
+  the public OpenAI API (max input) for `api_key` codex Profiles. A custom
   `base_url` is an unknown backend. **Budget = floor(window × 0.95) − 32,000**
-  output/reasoning reserve: **226,400** estimated input tokens on a
-  subscription. The table is maintained by hand: `scripts/check_gpt_windows.py`
-  diffs it against the Codex CLI's cache before a push, outside pytest.
+  output/reasoning reserve: **226,400** estimated input tokens on a 272K
+  subscription row, or **443,000** for the explicitly selected 500K
+  `gpt-6.1-sol` variant. The table is maintained by hand:
+  `scripts/check_gpt_windows.py` diffs it against the Codex CLI's cache before
+  a push, outside pytest.
 * **Unknown GPT id → assumed at 272K, said once in Activity, shown as
   "assumed" in Settings** — never excluded on a guess.
 * **Estimate** (`gpt_windows.estimate_input_tokens`): stage 1 is free — a body
@@ -110,10 +123,11 @@ Decision table, replacing ADR 0008's:
 * A mixed pool runs at 1M. The one visible sign of the guard is a compaction
   that comes earlier than it would on Claude accounts alone — only when
   nothing but a ChatGPT account is left to take a long turn.
-* The budget line is **272K, not 872K**: budgeting past it would walk a
-  subscription into the higher-usage band silently, which is exactly what
-  ADR 0007's quota concern forbids. Raising it would be a per-Profile opt-in,
-  not a default, and the server's behaviour above 872K is unverified.
+* The budget line is **272K by default, not 872K**: that is the floor and the
+  long-context price threshold, so budgeting past it would walk a subscription
+  into the higher-usage band silently. `gpt-6.1-sol` is the user-chosen
+  exception: the selector offers its backend-default 500K window as well as a
+  local 272K-capped alias, and explains the quota cost of the former.
 * Two Claude Code internals are now depended on: the underscore variable
   (ADR 0008) and the prompt-too-long parser. Both are read out of 2.1.278 and
   both fail soft — the window returns to 200K, or the client surfaces the

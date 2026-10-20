@@ -628,16 +628,21 @@ so on your behalf, and you get the million back:
 | Sonnet 5 | 200,000 | **1,000,000** |
 
 **A ChatGPT/Codex account in the pool no longer costs you the window.** A ChatGPT account
-answers with a GPT model whose own window is about **272K** tokens, so the daemon sizes every
-turn before routing it: a ChatGPT account takes the turns that fit its window (about 226K
-estimated input tokens, leaving room for the reply and its reasoning), and longer turns go to
-a Claude account. When no account that may take the request can hold it — say the Claude
-accounts are out of capacity and a 400K conversation arrives — the daemon answers exactly the
-"prompt is too long" error Claude Code reacts to, and Claude Code compacts and carries on.
-The one visible sign of this in a mixed pool is a compaction that comes earlier than it would
-on Claude accounts alone. The budget is 272K rather than the backend's 872K ceiling because
-past 272K a ChatGPT subscription is charged at a higher usage rate for the whole request, and
-this daemon does not spend that silently.
+answers with a GPT model whose ordinary window is about **272K** tokens, so the daemon sizes
+every turn before routing it: a normal ChatGPT choice takes turns up to about 226K estimated
+input tokens, leaving room for the reply and its reasoning, and longer turns go to a Claude
+account. `gpt-6.1-sol` is the explicit exception: its selector offers the backend-default
+500K window (about 443K estimated input tokens) and a local `gpt-6.1-sol-272k` alias capped at
+272K (about 226K estimated input tokens). The selector explains that only the 500K choice
+crosses the 272K long-context price threshold, where input is billed at 2× and output at
+1.5× for the whole request; the capped alias keeps long conversations under that threshold
+and moves them to another account sooner. The alias is translated to `gpt-6.1-sol` before it
+reaches OpenAI.
+
+When no account that may take the request can hold it — say the Claude accounts are out of
+capacity and a 400K conversation arrives — the daemon answers exactly the "prompt is too long"
+error Claude Code reacts to, and Claude Code compacts and carries on. The one visible sign of
+this in a mixed pool is a compaction that comes earlier than it would on Claude accounts alone.
 
 The rules the guard follows: an explicit choice — `cu code --profile <ChatGPT account>` or
 **Take over** — is honoured and never substituted, but an oversized turn gets that same
@@ -648,7 +653,8 @@ GPT model this build has not met is assumed at 272K and said so, in the Activity
 Settings — never excluded on a guess.
 
 **Auto is the cautious alternative** — it stays quiet when it cannot be sure: when only ChatGPT/Codex accounts can take the
-session (nothing there holds more than 272K, so 1M would only mean compacting sooner), when an
+session (the usual 272K choices only hold about 272K; a user-selected 500K gpt-6.1-sol choice
+is called out separately above, and 1M still would not enlarge it), when an
 API profile points somewhere other than Anthropic, or when your Claude Code version has not
 been checked for it. The launch prints why, and Settings shows the same verdict together with
 each ChatGPT account's window.

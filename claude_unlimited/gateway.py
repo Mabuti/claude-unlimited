@@ -1073,7 +1073,7 @@ def _blocked_models_for(profile: Profile, model_usage, settings, now: datetime,
                     if claude_model in (requested_model, requested_group) else None))
         except Exception:
             continue
-        if target.model and target.model.strip().lower() in unavailable:
+        if target.model and gpt_windows.upstream_slug(target.model) in unavailable:
             blocked.add(base_id(claude_model).lower())
     return frozenset(blocked)
 

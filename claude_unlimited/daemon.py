@@ -781,6 +781,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 # unset) — the editable table AND exactly what /model advertises.
                 "mapping": openai_models.automatic_mapping(load_pool().settings.model_parity),
                 "selectable_models": openai_models.selectable_models(),        # OpenAI dropdown, cost desc
+                "model_notes": openai_models.model_notes(),                    # locale keys for selector explanations
                 "claude_selectable_models": openai_models.selectable_claude_models(),  # Claude dropdown, cost desc
                 "reasoning_efforts": list(openai_models.VALID_REASONING_EFFORTS),     # Codex side
                 "claude_efforts": list(openai_models.CLAUDE_REASONING_EFFORTS),       # Claude side

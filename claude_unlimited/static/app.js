@@ -4576,8 +4576,10 @@ function updateCodexModelHelp(prefix) {
   const select = document.getElementById(`${prefix}_codex_model`);
   if (!help || !select) return;
   const model = select.dataset.value;
+  const noteKey = model ? _codexModelNoteKey(model) : null;
+  const note = noteKey ? `<div class="field-sub">${esc(t(noteKey))}</div>` : '';
   help.innerHTML = model
-    ? `${esc(t('modal.add_profile.codex_model_help_manual_prefix'))} <code class="mono">${esc(model)}</code> ${esc(t('modal.add_profile.codex_model_help_manual_suffix'))}`
+    ? `${esc(t('modal.add_profile.codex_model_help_manual_prefix'))} <code class="mono">${esc(model)}</code> ${esc(t('modal.add_profile.codex_model_help_manual_suffix'))}${note}`
     : esc(t('modal.add_profile.codex_model_help_auto'));
 }
 
@@ -4602,9 +4604,18 @@ function _claudeModelOptionsFor(current) {
   if (current && !opts.some((o) => o.value === current)) opts.unshift({ value: current, label: current });
   return opts;  // catalogue order = most expensive/capable first
 }
+function _codexModelNoteKey(model) {
+  return typeof _modelNotes === 'object' && _modelNotes ? _modelNotes[model] : null;
+}
+function _codexModelOption(model) {
+  const option = { value: model, label: model };
+  const noteKey = _codexModelNoteKey(model);
+  if (noteKey) option.title = t(noteKey);
+  return option;
+}
 function _codexModelOptionsFor(current) {
-  const opts = _selectableModels.map((m) => ({ value: m, label: m }));  // cost desc
-  if (current && !opts.some((o) => o.value === current)) opts.unshift({ value: current, label: current });
+  const opts = _selectableModels.map(_codexModelOption);  // cost desc
+  if (current && !opts.some((o) => o.value === current)) opts.unshift(_codexModelOption(current));
   return opts;
 }
 function _codexEffortOptions() {
@@ -4835,6 +4846,7 @@ async function loadModelParity() {
     return;
   }
   _selectableModels = data.selectable_models || _selectableModels;
+  _modelNotes = data.model_notes || {};
   _reasoningEfforts = data.reasoning_efforts || _reasoningEfforts;
   _parityMeta = {
     defaults: data.defaults || [],
@@ -4850,6 +4862,8 @@ async function loadModelParity() {
   _parityUnmapped = data.unmapped || [];
   _codexMappingRows = null;
   refreshCodexSelectOptions();
+  updateCodexModelHelp('f');
+  updateCodexModelHelp('pd');
   section.style.display = '';
   renderParityCuratedDefaults();
   renderParityRows();
@@ -4910,10 +4924,11 @@ async function resetModelParity() {
 // the lineup changed. A test asserts no model id appears literally in this
 // file.
 let _selectableModels = [];
+let _modelNotes = {};
 let _reasoningEfforts = [];
 const CODEX_MODEL_OPTIONS = () => [
   { value: '', label: t('modal.add_profile.automatic_option') },
-  ..._selectableModels.map((m) => ({ value: m, label: m })),
+  ..._selectableModels.map(_codexModelOption),
 ];
 // A flat union of every model's reasoning-effort levels, not gated by the
 // model select above — the cheaper tiers and the older ids stop short of the

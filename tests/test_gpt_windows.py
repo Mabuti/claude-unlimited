@@ -37,7 +37,16 @@ def test_the_subscription_rows_are_window_then_ceiling():
 def test_gpt_6_1_sol_uses_the_listed_500k_subscription_window():
     assert gw.CODEX_BACKEND_WINDOWS["gpt-6.1-sol"] == (500_000, 872_000)
     info = gw.window_for("gpt-6.1-sol", auth_mode="chatgpt_subscription")
-    assert info.window == 500_000 and info.assumed is False
+    assert (info.window, info.budget, info.assumed) == (500_000, 443_000, False)
+
+
+def test_gpt_6_1_sol_272k_variant_is_capped_but_uses_the_real_slug_upstream():
+    assert gw.CODEX_MODEL_VARIANTS["gpt-6.1-sol-272k"] == ("gpt-6.1-sol", 272_000)
+    assert gw.upstream_slug("GPT-6.1-SOL-272K") == "gpt-6.1-sol"
+    assert gw.upstream_slug(" gpt-6.1-sol ") == "gpt-6.1-sol"
+    info = gw.window_for("GPT-6.1-SOL-272K", auth_mode="chatgpt_subscription")
+    assert (info.model, info.window, info.budget, info.assumed) == \
+        ("gpt-6.1-sol-272k", 272_000, 226_400, False)
 
 
 def test_budget_is_the_cli_headroom_minus_the_output_reserve():

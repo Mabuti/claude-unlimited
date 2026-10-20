@@ -22,14 +22,15 @@ from typing import Optional
 # Tokens. Source: the ChatGPT backend's /models listing as cached by Codex CLI
 # (~/.codex/models_cache.json, fetched 2026-10-20 by client 0.163.0) and the
 # Codex CLI 0.149.0 bundled fallback catalogue. Value = (context_window,
-# max_context_window). `context_window` is what Codex CLI budgets by default
-# AND the boundary of OpenAI's higher-usage band ("prompts with >272K input
-# tokens are priced at 2x input and 1.5x output for the full request",
-# developers.openai.com model pages, 2026-09). `max_context_window` is the
-# server ceiling a user can raise Codex CLI's own budget to; it is recorded
-# for the freshness check only, never budgeted against: silently walking a
-# subscription into the 2x band is the spending ADR 0007 exists to prevent.
-# Changing a row is a spending decision.
+# max_context_window). `context_window` is the backend's default budget. For
+# every row except gpt-6.1-sol it equals OpenAI's 272K long-context price
+# threshold (prompts over 272K input tokens are priced at 2x input and 1.5x
+# output for the full request, developers.openai.com model pages, 2026-09).
+# gpt-6.1-sol's listed 500K window is above that threshold: budgeting it is an
+# explicit user choice, and the local -272k variant exists to stay under it.
+# `max_context_window` is the server ceiling a user can raise Codex CLI's own
+# budget to; it is recorded for the freshness check only, never budgeted
+# against. Changing a row is a spending decision.
 CODEX_BACKEND_WINDOWS: dict[str, tuple[int, int]] = {
     "gpt-6.1-sol": (500_000, 872_000),    # cache 2026-10-20, visibility list
     "gpt-6-astra": (272_000, 872_000),      # cache 2026-09-21, visibility list
@@ -42,6 +43,13 @@ CODEX_BACKEND_WINDOWS: dict[str, tuple[int, int]] = {
     "gpt-5.4": (272_000, 1_000_000),        # 0.149.0 bundled catalogue
     "gpt-5.4-mini": (272_000, 272_000),     # 0.149.0 bundled catalogue
     "gpt-5.2": (272_000, 272_000),          # 0.149.0 bundled catalogue
+}
+
+# User-selectable local aliases. The alias is capped here for quota safety and
+# is translated back to the real backend slug before any request, substitution
+# memo, ladder lookup, or Codex conversation key leaves this process.
+CODEX_MODEL_VARIANTS: dict[str, tuple[str, int]] = {
+    "gpt-6.1-sol-272k": ("gpt-6.1-sol", 272_000),
 }
 
 # effective_context_window_percent from the same listing: the headroom the
@@ -101,6 +109,17 @@ def budget_for(window: int) -> int:
 MIN_BUDGET = budget_for(UNKNOWN_WINDOW)
 
 
+def upstream_slug(model: Optional[str]) -> str:
+    """Return the backend slug for a model id, resolving local aliases.
+
+    Model ids are normalized the same way as :func:`window_for`: surrounding
+    whitespace is ignored and comparisons are case-insensitive.
+    """
+    key = (model or "").strip().lower()
+    variant = CODEX_MODEL_VARIANTS.get(key)
+    return variant[0] if variant is not None else key
+
+
 def backend_for(auth_mode: Optional[str], base_url: Optional[str]) -> str:
     """Which window table a codex Profile is served from. Subscription
     profiles (the ones add-codex-account creates) talk to the ChatGPT backend;
@@ -124,8 +143,10 @@ def window_for(model: Optional[str], auth_mode: Optional[str] = None,
     backend is `assumed` at UNKNOWN_WINDOW."""
     backend = backend_for(auth_mode, base_url)
     key = (model or "").strip().lower()
-    if backend == BACKEND_SUBSCRIPTION and key in CODEX_BACKEND_WINDOWS:
-        window = CODEX_BACKEND_WINDOWS[key][0]
+    real_key = upstream_slug(key)
+    if backend == BACKEND_SUBSCRIPTION and real_key in CODEX_BACKEND_WINDOWS:
+        variant = CODEX_MODEL_VARIANTS.get(key)
+        window = variant[1] if variant is not None else CODEX_BACKEND_WINDOWS[real_key][0]
         return WindowInfo(key, backend, window, budget_for(window), assumed=False)
     if backend == BACKEND_OPENAI_API and key in OPENAI_API_MAX_INPUT:
         window = OPENAI_API_MAX_INPUT[key]

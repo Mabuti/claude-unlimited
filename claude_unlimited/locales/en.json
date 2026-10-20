@@ -732,5 +732,7 @@
   "settings.parity.follow_hint": "Same level when Claude Code sends one; otherwise the curated effort for that model.",
   "settings.parity.fixed_hint": "fixed — ignores requested effort",
   "settings.parity.curated_title": "Curated defaults when no effort is sent",
-  "settings.parity.curated_family": "Claude tier"
+  "settings.parity.curated_family": "Claude tier",
+  "models.note.gpt_6_1_sol_500k": "Full 500K window (the backend default). Prompts over 272K input tokens are billed at 2× input and 1.5× output for the whole request, so long turns cost more quota.",
+  "models.note.gpt_6_1_sol_272k": "Same model, capped at 272K so no request crosses the 272K long-context price threshold. Long conversations move to another account sooner."
 }

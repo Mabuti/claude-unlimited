@@ -731,5 +731,7 @@
   "settings.parity.follow_hint": "Dieselbe Stufe, wenn Claude Code eine sendet; andernfalls der festgelegte Aufwand für dieses Modell.",
   "settings.parity.fixed_hint": "fest — ignoriert den angeforderten Aufwand",
   "settings.parity.curated_title": "Festgelegte Standardwerte, wenn kein Aufwand gesendet wird",
-  "settings.parity.curated_family": "Claude-Stufe"
+  "settings.parity.curated_family": "Claude-Stufe",
+  "models.note.gpt_6_1_sol_500k": "Volles 500K-Fenster (der Backend-Standard). Prompts mit mehr als 272K Eingabetoken werden für die gesamte Anfrage mit 2× Eingabe- und 1.5× Ausgabetoken abgerechnet, daher kosten lange Züge mehr Kontingent.",
+  "models.note.gpt_6_1_sol_272k": "Dasselbe Modell, auf 272K begrenzt, damit keine Anfrage die Preisgrenze für lange Kontexte von 272K überschreitet. Lange Unterhaltungen wechseln früher zu einem anderen Konto."
 }

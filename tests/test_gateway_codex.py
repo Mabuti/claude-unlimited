@@ -802,6 +802,17 @@ def test_a_per_profile_codex_model_override_is_respected(pool_env):
     assert "gpt-5.6-sol" not in blocked
 
 
+def test_a_capped_gpt_variant_is_blocked_by_the_real_backend_model(pool_env):
+    """The local 272K alias must follow the backend's real availability key."""
+    from datetime import datetime, timezone
+
+    profile = _codex_profile(codex_model="gpt-6.1-sol-272k")
+    blocked = gateway_module._blocked_models_for(
+        profile, _unavailable("gpt-6.1-sol"), Settings(), datetime.now(timezone.utc))
+    assert "claude-fable-5" in blocked
+    assert blocked
+
+
 def test_blocked_models_survives_the_per_tick_runtime_rebuild(pool_env):
     """_sync_snapshot reconstructs ProfileRuntime field by field on EVERY poll
     tick. A field missing from that constructor is silently dropped a second
