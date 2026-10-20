@@ -305,6 +305,7 @@ def _launch_reauth_terminal(profile_id: str) -> tuple[bool, Optional[str]]:
             # directly and let wsl.exe create the terminal window.
             launch_argv = [cmd, "/c", "start", "", "wsl.exe", "-d", distro,
                            "--exec", *shell_argv]
+            # Must be a Windows-side directory (the Windows install dir); cmd.exe cannot use a Linux cwd.
             launch_cwd = str(Path(cmd).parent.parent)
             if not os.path.isdir(launch_cwd):
                 launch_cwd = None

@@ -2027,7 +2027,7 @@
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.reauth">The Reauth button and command appear on Overview cards of Claude OAuth (subscription) Profiles that need re-auth. `claude-unlimited reauth` without --profile offers a picker among Profiles that need re-auth. Pass --profile &lt;id&gt; with the Profile's id, not its display name, to target one directly. Clicking Reauth opens a terminal running this install's reauth in a login shell, so `claude` is on PATH; the command on the card is the one to paste into your own terminal. Logs back into the exact same account, never a new one. Once it is back, its usage is read straight away.</div>
+          <div class="field-sub" data-i18n="help.cmd.reauth">The Reauth button and command appear on Overview cards of Claude OAuth (subscription) Profiles that need re-auth. `claude-unlimited reauth` without --profile offers a picker among Profiles that need re-auth. Pass --profile &lt;id&gt; with the Profile's id, not its display name, to target one directly. Clicking Reauth opens a terminal: on WSL and Linux desktops it runs this install's reauth in a login shell, so `claude` is on PATH; on Windows and macOS it opens a new terminal running this install's interpreter. The command on the card is the one to paste into your own terminal on every platform. Logs back into the exact same account, never a new one. Once it is back, its usage is read straight away.</div>
         </div>
         <div class="divider"></div>
         <div class="cmd-row">
