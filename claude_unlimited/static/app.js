@@ -1615,8 +1615,46 @@ function healthyUsageOverride(p) {
   };
 }
 
+const _reauthUi = new Map();
+
+function profileNeedsReauth(p) {
+  return p.state === 'auth_invalid' || p.status_word === 'needs re-auth';
+}
+
+function profileCanReauth(p) {
+  return p.kind === 'oauth' && profileNeedsReauth(p);
+}
+
+function reauthCommand(profileId) {
+  return `claude-unlimited reauth --profile ${profileId}`;
+}
+
+function renderReauthAction(p) {
+  const command = reauthCommand(p.id);
+  const state = _reauthUi.get(p.id);
+  if (state && state.mode === 'opened') {
+    return `<div class="p-reauth" data-reauth-container><span class="p-reauth-note">${esc(t('profile.reauth_opened'))}</span></div>`;
+  }
+  if (state && state.mode === 'fallback') {
+    return `<div class="p-reauth" data-reauth-container>
+      <span class="p-reauth-note">${esc(t('profile.reauth_fallback'))}</span>
+      <div class="p-reauth-command">
+        <code>${esc(command)}</code>
+        <button type="button" class="copy-btn" data-action="copy-reauth" data-command="${esc(command)}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+          <span>${esc(t('settings.network.copy'))}</span>
+        </button>
+      </div>
+    </div>`;
+  }
+  return `<div class="p-reauth" data-reauth-container>
+    <button type="button" class="btn danger p-reauth-btn" data-action="reauth">${esc(t('profile.reauth'))}</button>
+  </div>`;
+}
+
 function renderProfileCard(p) {
   const isActive = (_lastStatus && _lastStatus.current_profile_id === p.id) || p.live_agents > 0;
+  const needsReauth = profileNeedsReauth(p);
   const usageOverride = healthyUsageOverride(p);
   const statusColors = usageOverride || STATUS_COLORS[p.status_word] || { color: 'var(--good)', bg: 'var(--good-soft)' };
   // The plan badge already names the tier, so this carries only the detail
@@ -1660,9 +1698,10 @@ function renderProfileCard(p) {
 
   const tagStyle = p.tag_color ? ` style="--tag-color:${esc(p.tag_color)}"` : '';
   const tagClass = p.tag_color ? ' has-tag' : '';
+  const reauthClass = needsReauth ? ' needs-reauth' : '';
 
   return `
-    <div class="p-card ${isActive ? 'active-card' : ''}${tagClass}" data-id="${esc(p.id)}"${tagStyle}>
+    <div class="p-card ${isActive ? 'active-card' : ''}${tagClass}${reauthClass}" data-id="${esc(p.id)}"${tagStyle}>
       <div class="p-top">
         <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
         <span class="p-name">${esc(p.name)}</span>
@@ -1679,6 +1718,7 @@ function renderProfileCard(p) {
           : `<span class="p-disabled-badge">${esc(t('profile.disabled'))}</span>`}
       </div>
       <div class="p-bars">${usageBlock}</div>
+      ${profileCanReauth(p) ? renderReauthAction(p) : ''}
       <div class="p-foot">
         <div class="p-foot-spacer"></div>
         <span>${p.automatic ? esc(t('profile.auto_rotation_on')) : esc(t('profile.manual_only'))}</span>
@@ -1695,6 +1735,26 @@ function renderProfileCard(p) {
 // across updates, so a per-node listener would stack a duplicate on every
 // poll for any card that survives.
 document.getElementById('profiles').addEventListener('click', async (e) => {
+  const reauthBtn = e.target.closest('[data-action="reauth"]');
+  if (reauthBtn) {
+    e.stopPropagation();
+    await launchReauth(reauthBtn.closest('.p-card').dataset.id, reauthBtn);
+    return;
+  }
+  const copyReauthBtn = e.target.closest('[data-action="copy-reauth"]');
+  if (copyReauthBtn) {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(copyReauthBtn.dataset.command);
+      const label = copyReauthBtn.querySelector('span');
+      const original = label.textContent;
+      label.textContent = t('settings.network.copied');
+      setTimeout(() => { label.textContent = original; }, 1200);
+    } catch (err) {
+      // Clipboard access is optional; the command remains visible to copy manually.
+    }
+    return;
+  }
   const kebabBtn = e.target.closest('[data-action="kebab"]');
   if (kebabBtn) {
     e.stopPropagation();
@@ -1714,11 +1774,38 @@ document.getElementById('profiles').addEventListener('click', async (e) => {
 
 let _lastProfiles = [];
 
+function updateReauthCard(profileId) {
+  const card = Array.from(document.querySelectorAll('.p-card')).find((node) => node.dataset.id === profileId);
+  const profile = _lastProfiles.find((p) => p.id === profileId);
+  if (!card || !profile || !profileCanReauth(profile)) return;
+  const action = card.querySelector('[data-reauth-container]');
+  if (action) action.outerHTML = renderReauthAction(profile);
+}
+
+async function launchReauth(profileId, button) {
+  const profile = _lastProfiles.find((p) => p.id === profileId);
+  if (!profileCanReauth(profile || {})) return;
+  button.disabled = true;
+  try {
+    const result = await api(`/api/profiles/${profileId}/reauth/launch`, { method: 'POST', body: '{}' });
+    _reauthUi.set(profileId, { mode: result.launched ? 'opened' : 'fallback' });
+  } catch (err) {
+    // A dead/old daemon is the same user outcome as a launcher failure: show
+    // the exact command without making the user hunt through a terminal.
+    _reauthUi.set(profileId, { mode: 'fallback' });
+  }
+  updateReauthCard(profileId);
+}
+
 async function loadProfiles() {
   const el = document.getElementById('profiles');
   try {
     const { profiles } = await api('/api/profiles');
     _lastProfiles = profiles;
+    const liveReauthIds = new Set(profiles.filter(profileNeedsReauth).map((p) => p.id));
+    for (const id of _reauthUi.keys()) {
+      if (!liveReauthIds.has(id)) _reauthUi.delete(id);
+    }
     refreshCodexCreditsVisibility();
     renderStatStrip(profiles);
     if (!profiles.length) {

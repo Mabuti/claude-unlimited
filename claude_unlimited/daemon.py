@@ -24,7 +24,10 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import secrets
+import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -121,6 +124,117 @@ _CHARTS_CSS = (_STATIC_DIR / "vendor" / "charts.css").read_text(encoding="utf-8"
 
 # Regenerated every daemon start; lives only in this process's memory.
 _CSRF_TOKEN = secrets.token_urlsafe(32)
+
+
+def _is_wsl() -> bool:
+    """True when this daemon is running inside Windows Subsystem for Linux."""
+    if sys.platform != "linux":
+        return False
+    try:
+        return "microsoft" in Path("/proc/version").read_text(encoding="utf-8").lower()
+    except OSError:
+        return False
+
+
+def _reauth_command(profile_id: str) -> list[str]:
+    """The only command the Dashboard is allowed to launch for re-auth."""
+    return [sys.executable, "-m", "claude_unlimited", "reauth", "--profile", profile_id]
+
+
+def _reauth_display_command(profile_id: str) -> str:
+    """The copyable command shown when no terminal can be opened."""
+    return f"claude-unlimited reauth --profile {profile_id}"
+
+
+def _spawn_detached(argv: list[str]) -> None:
+    """Start a terminal launcher without inheriting the daemon's stdio."""
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen(argv, **kwargs)
+
+
+def _applescript_string(value: str) -> str:
+    """Quote one fixed shell command as an AppleScript string literal."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _launch_reauth_terminal(profile_id: str) -> tuple[bool, Optional[str]]:
+    """Open a terminal for the fixed, already-validated reauth command.
+
+    Returns ``(True, None)`` after the launcher process is spawned, or
+    ``(False, reason)`` when this machine cannot open one. The caller never
+    supplies an executable, shell string, or argument list.
+    """
+    command_argv = _reauth_command(profile_id)
+    launch_argv = None
+    reason = None
+
+    if _is_wsl():
+        distro = os.environ.get("WSL_DISTRO_NAME")
+        if not distro:
+            return False, "WSL_DISTRO_NAME is not set."
+        wt = shutil.which("wt.exe")
+        if wt:
+            launch_argv = [wt, "wsl.exe", "-d", distro, "--", *command_argv]
+        else:
+            cmd = shutil.which("cmd.exe")
+            if cmd:
+                launch_argv = [cmd, "/c", "start", "", "wsl.exe", "-d", distro, "--", *command_argv]
+            else:
+                reason = "Neither wt.exe nor cmd.exe is available."
+    elif sys.platform == "win32":
+        wt = shutil.which("wt.exe")
+        if wt:
+            launch_argv = [wt, *command_argv]
+        else:
+            cmd = shutil.which("cmd.exe")
+            if cmd:
+                launch_argv = [cmd, "/c", "start", "", *command_argv]
+            else:
+                reason = "Neither wt.exe nor cmd.exe is available."
+    elif sys.platform == "darwin":
+        osascript = shutil.which("osascript")
+        if osascript:
+            command = shlex.join(command_argv)
+            script = f'tell application "Terminal" to do script {_applescript_string(command)}'
+            launch_argv = [osascript, "-e", script]
+        else:
+            reason = "osascript is not available."
+    elif sys.platform == "linux":
+        for name, prefix in (
+            ("x-terminal-emulator", ("-e",)),
+            ("gnome-terminal", ("--",)),
+            ("konsole", ("-e",)),
+            ("xterm", ("-e",)),
+        ):
+            terminal = shutil.which(name)
+            if terminal:
+                launch_argv = [terminal, *prefix, *command_argv]
+                break
+        if launch_argv is None:
+            reason = "No supported desktop terminal launcher is available."
+    else:
+        reason = "Terminal launching is unsupported on this platform."
+
+    if launch_argv is None:
+        return False, reason or "No terminal launcher is available."
+
+    try:
+        _spawn_detached(launch_argv)
+    except Exception as exc:  # noqa: BLE001 - the Dashboard must receive a fallback
+        return False, str(exc) or exc.__class__.__name__
+    return True, None
 
 
 class _RefusesNonLoopbackBind(RuntimeError):
@@ -1075,6 +1189,30 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if not self._check_csrf():
+            return
+
+        if path.startswith("/api/profiles/") and path.endswith("/reauth/launch"):
+            profile_id = path.removeprefix("/api/profiles/").removesuffix("/reauth/launch")
+            if re.fullmatch(r"[0-9a-fA-F]+", profile_id) is None:
+                self._send_json(400, {"error": "bad_request", "message": "Invalid profile id."})
+                return
+            profile = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
+            if profile is None:
+                self._send_json(404, {"error": "not_found", "message": "No profile with that id."})
+                return
+            if profile.kind != "oauth":
+                self._send_json(400, {"error": "not_oauth",
+                                      "message": "Re-authentication is only available for OAuth Profiles."})
+                return
+            launched, reason = _launch_reauth_terminal(profile_id)
+            if launched:
+                self._send_json(200, {"launched": True})
+            else:
+                self._send_json(200, {
+                    "launched": False,
+                    "command": _reauth_display_command(profile_id),
+                    "reason": reason or "The daemon could not open a terminal.",
+                })
             return
 
         if path == "/api/widget/launch":
