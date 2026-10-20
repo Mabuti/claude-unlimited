@@ -20,7 +20,7 @@ from typing import Optional
 # --- ChatGPT/Codex subscription backend (chatgpt.com/backend-api/codex) -----
 #
 # Tokens. Source: the ChatGPT backend's /models listing as cached by Codex CLI
-# (~/.codex/models_cache.json, fetched 2026-09-21 by client 0.154.0) and the
+# (~/.codex/models_cache.json, fetched 2026-10-20 by client 0.163.0) and the
 # Codex CLI 0.149.0 bundled fallback catalogue. Value = (context_window,
 # max_context_window). `context_window` is what Codex CLI budgets by default
 # AND the boundary of OpenAI's higher-usage band ("prompts with >272K input
@@ -31,6 +31,7 @@ from typing import Optional
 # subscription into the 2x band is the spending ADR 0007 exists to prevent.
 # Changing a row is a spending decision.
 CODEX_BACKEND_WINDOWS: dict[str, tuple[int, int]] = {
+    "gpt-6.1-sol": (500_000, 872_000),    # cache 2026-10-20, visibility list
     "gpt-6-astra": (272_000, 872_000),      # cache 2026-09-21, visibility list
     "gpt-6-sol": (272_000, 872_000),        # cache 2026-10-14, visibility list
     "gpt-6-luna": (272_000, 872_000),       # cache 2026-10-14, visibility list
@@ -47,9 +48,9 @@ CODEX_BACKEND_WINDOWS: dict[str, tuple[int, int]] = {
 # Codex CLI itself keeps below the window.
 CODEX_BACKEND_EFFECTIVE = 0.95
 
-# Every slug the ChatGPT backend has ever listed has had exactly this
-# context_window, so it is the honest floor for an id the table has not met
-# yet — the account is not idled on a guess, the guess is
+# 272K is the smallest context_window any listed slug has had, so it stays the
+# honest, conservative floor for an id the table has not met yet — the account
+# is not idled on a guess, the guess is
 # just made visible ("assumed") wherever the window is shown.
 UNKNOWN_WINDOW = 272_000
 

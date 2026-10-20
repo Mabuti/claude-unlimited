@@ -34,6 +34,12 @@ def test_the_subscription_rows_are_window_then_ceiling():
         assert gw.window_for(model).window == window
 
 
+def test_gpt_6_1_sol_uses_the_listed_500k_subscription_window():
+    assert gw.CODEX_BACKEND_WINDOWS["gpt-6.1-sol"] == (500_000, 872_000)
+    info = gw.window_for("gpt-6.1-sol", auth_mode="chatgpt_subscription")
+    assert info.window == 500_000 and info.assumed is False
+
+
 def test_budget_is_the_cli_headroom_minus_the_output_reserve():
     assert gw.budget_for(272_000) == 258_400 - 32_000 == 226_400
     assert gw.MIN_BUDGET == 226_400
@@ -63,8 +69,8 @@ def test_a_custom_base_url_is_an_unknown_backend_at_the_floor():
 
 @pytest.mark.parametrize("model", ["gpt-99-nova", "", None, "  "])
 def test_an_unknown_id_is_assumed_at_the_floor_never_excluded(model):
-    """D5: every slug the ChatGPT backend has ever listed had exactly 272K, so
-    that is the honest floor; the guess is flagged, the account is not idled."""
+    """D5: 272K is the smallest listed context window, so it is the honest
+    floor; the guess is flagged, the account is not idled."""
     info = gw.window_for(model, auth_mode="chatgpt_subscription")
     assert info.window == gw.UNKNOWN_WINDOW and info.budget == gw.MIN_BUDGET
     assert info.assumed is True
