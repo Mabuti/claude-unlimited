@@ -333,10 +333,11 @@ by the whole lineage. Together they form a **branch key**: `(session_id, agent_i
 Branches matter because the prompt cache is per-account. Rotating a branch to a different
 account costs a full cache miss; keeping a branch on one account keeps it warm. So the
 gateway holds `_branch_pins`: a bounded, TTL'd `branch key → profile` map (1 h, 512
-entries). It evicts the oldest closed pin first; a pin with an open response is never
-evicted by the cap/trim. Pins for a disabled or deleted Profile are still removed by
+entries). It evicts the oldest pin without an open response or pending request first;
+open or pending pins are never evicted by the cap/trim. Pins for a disabled or deleted Profile are still removed by
 `_sync_snapshot`; the open response keeps counting until it ends. If every pin is open,
-the cap may be exceeded temporarily, bounded by the number of concurrent open requests.
+pending, or both, the cap may be exceeded temporarily, bounded by open responses plus
+requests currently being set up.
 Upstream connect/read stalls raise through the transport socket
 timeouts; a downstream client that stops reading remains open and counted until it
 disconnects or the body is closed/finalized. The one-hour retention cutoff is based on

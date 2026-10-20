@@ -579,13 +579,13 @@ struct DetailCard: View {
         if profile.needsReauth { return "needs re-auth · sign in from the Dashboard" }
         let n = profile.liveAgents ?? 0
         if n > 0 {
-            var line = "\(n) active (open or last 5 min)"
-            if let since = Fmt.elapsed(since: profile.agentsSince) { line += " · on account \(since)" }
+            var line = "\(n) Claude Code agents active (open or last 5 min)"
+            if let since = Fmt.elapsed(since: profile.agentsSince) { line += " · oldest pin \(since)" }
             return line
         }
         if profile.isServing {
             var line = "used recently"
-            if let since = Fmt.elapsed(since: profile.agentsSince) { line += " · on account \(since)" }
+            if let since = Fmt.elapsed(since: profile.agentsSince) { line += " · oldest pin \(since)" }
             return line
         }
         var line = profile.statusWord ?? "idle"

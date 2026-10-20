@@ -277,9 +277,12 @@ class Settings:
     # Make `code --distribute` the default for every session (UI: "Balance
     # sessions and subagents across accounts"): each new agent starts on the
     # account with fewest agents active in the last 5 minutes (an open response
-    # or recent activity) and stays there. OFF by default — it changes how
-    # accounts are consumed, so it must be chosen, never inherited. The flag
-    # stays available per-session either way; the two are OR-ed, so this
+    # or recent activity) and keeps that account while it can serve. It moves
+    # when the account reaches its switch threshold or a usage limit, becomes
+    # unavailable, has no new request for an hour, or returns a transient 429
+    # another account can take. OFF by default — it changes how accounts are
+    # consumed, so it must be chosen, never inherited. The flag stays available
+    # per-session either way; the two are OR-ed, so this
     # setting can only ever turn distribution ON, never override a `--profile`
     # pin (which outranks both).
     distribute_sessions_default: bool = False
