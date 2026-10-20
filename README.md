@@ -692,8 +692,9 @@ it can serve, preserving its own prompt cache instead of paying a cache miss on 
 > been active on each account in the last 5 minutes, not by usage percentage, so usage
 > evens out roughly over many sessions rather than exactly.
 
-While agents are spread out, each profile on the dashboard shows how many agents were
-active in the last 5 minutes (**Agents: N**), and every agent moved off an unavailable
+While agents are spread out, each profile on the dashboard shows how many Claude Code
+main agents and subagents, plus any app session that sends `x-claude-unlimited-session`,
+were active in the last 5 minutes (**Agents: N**), and every agent moved off an unavailable
 account is logged in Activity. Codex CLI sessions are outside this count.
 
 **Settings → Session routing → "Balance sessions and subagents across accounts"** makes that
@@ -1077,12 +1078,13 @@ the old `CapacityWidget.app`, the name it had before, keeping your saved positio
   (Dark otherwise). Anything you change in the cog menu is kept.
 - It refreshes every 5 seconds (every 2 while the pointer is over it).
 - Hover a profile for its detail card: plan, usage windows, reset times, today's spend, and a
-  session line — the number of agents active in the last 5 minutes; if that is zero but the
+  session line — the number of agents and sessions routed through branch pinning (Claude
+  Code agents, or apps sending a session id) active in the last 5 minutes; if that is zero but the
   account is in its 15-minute recent-use grace, it says **used recently**; otherwise it shows
-  when the account was last used. A separate **oldest pin** duration, when a retained pin is
+  when the account was last used. A separate **oldest pin age**, when a retained pin is
   still inside its one-hour inactivity window, gives the age of the oldest retained branch pin;
   an open response past that pin's retention cutoff can still count as active without an
-  **on account** age, and remains counted while silent until the client disconnects or the body
+  **oldest pin age**, and remains counted while silent until the client disconnects or the body
   is closed/finalized, or the transport raises.
   Under that, the model and project of its latest request (a Codex account
   shows the Claude model it translated, e.g. `opus-5 → gpt-5.6-terra`).

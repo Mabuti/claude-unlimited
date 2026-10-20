@@ -4442,7 +4442,7 @@ class Gateway:
 
     def agents_on_account_seconds(self) -> dict:
         """Profile id -> seconds since the oldest retained pin was
-        assigned to it. "On account 42m" in the widget remains a retained-pin
+        assigned to it. "Oldest pin age 42m" in the widget remains a retained-pin
         age whose one-hour inactivity expiry is separate from the five-minute
         active-agent count and from how long one request ran. Accounts with no
         retained pin are absent."""
