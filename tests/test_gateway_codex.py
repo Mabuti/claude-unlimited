@@ -813,6 +813,16 @@ def test_a_capped_gpt_variant_is_blocked_by_the_real_backend_model(pool_env):
     assert blocked
 
 
+def test_a_case_preserving_gpt_override_is_blocked_case_insensitively(pool_env):
+    """The payload keeps a user's casing, but availability keys are folded."""
+    from datetime import datetime, timezone
+
+    profile = _codex_profile(codex_model="GPT-6-Astra")
+    blocked = gateway_module._blocked_models_for(
+        profile, _unavailable("gpt-6-astra"), Settings(), datetime.now(timezone.utc))
+    assert "claude-fable-5" in blocked
+
+
 def test_blocked_models_survives_the_per_tick_runtime_rebuild(pool_env):
     """_sync_snapshot reconstructs ProfileRuntime field by field on EVERY poll
     tick. A field missing from that constructor is silently dropped a second

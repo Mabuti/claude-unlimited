@@ -1223,6 +1223,19 @@ def _apply_one_million_context(pool, enabled_profiles, forced_profile) -> None:
         print(f"Context window stays at 200K: {note}")
 
 
+def _codex_budget_summary(summary: dict) -> str:
+    """Format all resolved model budgets without hiding a larger choice."""
+    entries = summary.get("model_budgets") or []
+    if not entries:
+        return f"~{summary['budget'] // 1000}K (smallest of these)"
+    budgets = [int(entry["budget"]) for entry in entries]
+    models = [str(entry["model"]) for entry in entries]
+    if len(set(budgets)) == 1:
+        return f"~{budgets[0] // 1000}K (smallest of these) on {', '.join(models)}"
+    return ", ".join(f"~{budget // 1000}K on {model}"
+                      for model, budget in zip(models, budgets))
+
+
 def _codex_guard_lines(pool, enabled_profiles, forced_profile) -> list:
     """One line per ChatGPT/Codex account the session can reach, with the
     window the gateway's capacity guard holds it to (docs/adr/0009) — so a
@@ -1237,8 +1250,9 @@ def _codex_guard_lines(pool, enabled_profiles, forced_profile) -> list:
     for p in codex:
         summary = openai_models.codex_profile_windows(p, parity)
         assumed = " (window assumed — not in gpt_windows.py)" if summary["assumed"] else ""
-        lines.append(f"  {p.name}: up to ~{summary['budget'] // 1000}K estimated tokens per turn on "
-                     f"{'/'.join(summary['models'])}{assumed}; longer turns go to a Claude account, "
+        budget_summary = _codex_budget_summary(summary)
+        lines.append(f"  {p.name}: {budget_summary} estimated input tokens per turn{assumed}; "
+                     f"longer turns go to a Claude account, "
                      f"or Claude Code is asked to compact when none can take them.")
     return lines
 
@@ -1248,9 +1262,11 @@ def _codex_guard_lines(pool, enabled_profiles, forced_profile) -> list:
 # no commentary; "no_profiles" already fails louder elsewhere.
 _ONE_M_REASON_NOTES = {
     "codex_only_route": "only ChatGPT/Codex accounts can take this session. Ordinary GPT/Codex "
-                        "models are about 272K; only a user-selected 500K gpt-6.1-sol on a "
-                        "ChatGPT-subscription profile budgets past that, while an API-key profile "
-                        "for it is still budgeted at the assumed 272K floor. Add a Claude account "
+                        "models are about 272K (about 226K estimated input tokens); the selected "
+                        "500K GPT-6.1 Sol subscription choice keeps a long conversation on the "
+                        "account to about 443K estimated input tokens, while the 272K cap rotates "
+                        "at about 226K. An API-key profile for this model is still budgeted at the "
+                        "assumed 272K floor. Add a Claude account "
                         "to the rotation (long turns then go there) — or choose Force 1M in Settings "
                         "to set it anyway.",
     "custom_gateway_unknown": "an API profile points somewhere other than Anthropic, and we "

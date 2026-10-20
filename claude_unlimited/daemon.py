@@ -262,9 +262,9 @@ def _context_1m_preview(pool) -> dict:
 
     `guard` is present whenever a codex Profile is in the route: one entry per
     such account with the window the per-request capacity guard (docs/adr/
-    0009) budgets it at, so the dashboard can say "up to ~226K on this one;
-    longer turns go to a Claude account" — and flag any GPT id whose window
-    is ASSUMED rather than known."""
+    0009) budgets it at, so the dashboard can show each resolved model's
+    budget (and label the numeric minimum as the smallest of these) — and flag
+    any GPT id whose window is ASSUMED rather than known."""
     mode = getattr(pool.settings, "context_1m", "force_1m")
     version = _cached_client_version() if mode == "auto" else None
     profiles = pool.enabled_profiles()
@@ -780,10 +780,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 # The saved parity list, normalized to full rows (defaults when
                 # unset) — the editable table AND exactly what /model advertises.
                 "mapping": openai_models.automatic_mapping(load_pool().settings.model_parity),
-                "selectable_models": openai_models.selectable_models(),        # OpenAI dropdown, cost desc
+                "selectable_models": openai_models.selectable_models(),        # OpenAI dropdown, catalogue order
                 "model_labels": openai_models.model_labels(),                  # display labels for those ids
                 "model_notes": openai_models.model_notes(),                    # locale keys for selector explanations
-                "claude_selectable_models": openai_models.selectable_claude_models(),  # Claude dropdown, cost desc
+                "claude_selectable_models": openai_models.selectable_claude_models(),  # Claude dropdown, catalogue order
                 "reasoning_efforts": list(openai_models.VALID_REASONING_EFFORTS),     # Codex side
                 "claude_efforts": list(openai_models.CLAUDE_REASONING_EFFORTS),       # Claude side
                 "defaults": openai_models.default_parity_rows(),  # for [+] prefill / Reset preview

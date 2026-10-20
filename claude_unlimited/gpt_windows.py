@@ -23,9 +23,11 @@ from typing import Optional
 # (~/.codex/models_cache.json, fetched 2026-10-20 by client 0.163.0) and the
 # Codex CLI 0.149.0 bundled fallback catalogue. Value = (context_window,
 # max_context_window). `context_window` is the backend's default budget. For
-# every row except gpt-6.1-sol it equals OpenAI's 272K long-context price
-# threshold (prompts over 272K input tokens are priced at 2x input and 1.5x
-# output for the full request, developers.openai.com model pages, 2026-09).
+# every row except gpt-6.1-sol it equals the 272K long-context threshold in
+# OpenAI's published API pricing (API prompts over 272K input tokens are priced
+# at 2× input and 1.5× output for the full request, developers.openai.com model
+# pages, 2026-09). This does not claim that a subscription quota meter applies
+# that API-pricing multiplier.
 # gpt-6.1-sol's listed 500K window is above that threshold: budgeting it is an
 # explicit user choice, and the local -272k variant targets the 272K line. The
 # byte estimate cannot see replayed reasoning, so that target is not a
@@ -92,12 +94,14 @@ BACKEND_UNKNOWN = "unknown"   # an api_key Profile pointed at a custom base_url
 class WindowInfo:
     """One GPT id's window on one backend, and the per-request input budget
     derived from it. `assumed` is True when the id (or the backend) is not in
-    the table and UNKNOWN_WINDOW was used instead."""
+    the table and UNKNOWN_WINDOW was used instead. `assumption_reason` explains
+    why the floor was used for the Settings summary."""
     model: str
     backend: str
     window: int
     budget: int
     assumed: bool
+    assumption_reason: Optional[str] = None
 
 
 def budget_for(window: int) -> int:
@@ -154,7 +158,16 @@ def window_for(model: Optional[str], auth_mode: Optional[str] = None,
     if backend == BACKEND_OPENAI_API and key in OPENAI_API_MAX_INPUT:
         window = OPENAI_API_MAX_INPUT[key]
         return WindowInfo(key, backend, window, budget_for(window), assumed=False)
-    return WindowInfo(key or "?", backend, UNKNOWN_WINDOW, budget_for(UNKNOWN_WINDOW), assumed=True)
+    if backend == BACKEND_OPENAI_API and real_key in CODEX_BACKEND_WINDOWS:
+        reason = "no_published_api_window"
+    elif backend == BACKEND_SUBSCRIPTION and real_key in OPENAI_API_MAX_INPUT:
+        reason = "no_published_subscription_window"
+    elif backend == BACKEND_UNKNOWN:
+        reason = "unknown_backend"
+    else:
+        reason = "unknown_model"
+    return WindowInfo(key or "?", backend, UNKNOWN_WINDOW, budget_for(UNKNOWN_WINDOW),
+                      assumed=True, assumption_reason=reason)
 
 
 # --- the estimate -----------------------------------------------------------

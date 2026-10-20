@@ -23,9 +23,11 @@ per-request guard possible:
    `gpt-5.6-sol/terra/luna`, `gpt-5.5`, …) has `context_window = 272,000` and
    `effective_context_window_percent = 95`; `gpt-6.1-sol` lists a 500K
    `context_window` and an 872K `max_context_window`. The 272K value is
-   OpenAI's long-context price threshold — above 272K input a request is
-   charged at a higher rate for the whole request — while `context_window` is
-   normally the backend's default budget. LiteLLM's figures (922K) are the
+   OpenAI's published API long-context price threshold — API prompts above
+   272K input tokens use higher pricing for the whole request — while
+   `context_window` is normally the backend's default budget. The 2× input /
+   1.5× output figures are OpenAI's published API pricing for prompts over 272K input tokens; they
+   are not a claim about a subscription quota meter. LiteLLM's figures (922K) are the
    public API's and are wrong for this backend by ~3.4x, so the model catalogue
    cannot be the source.
 2. **Claude Code reactively compacts on exactly one error.** A 400/413 whose
@@ -41,15 +43,19 @@ per-request guard possible:
 
 ### Update — 2026-10-20
 
-`gpt-6.1-sol` is the first listed slug whose 500K `context_window` exceeds the
-272K long-context price threshold. The owner chose to offer both the backend's
-500K variant and a local `gpt-6.1-sol-272k` variant capped at 272K. On a
-ChatGPT-subscription profile the 500K choice is explicit and carries a 443K
-estimated-input budget; the capped choice uses the 226.4K budget used by the
-other 272K rows and targets requests below the price threshold. The estimator
-cannot see replayed reasoning, so that target is not a guarantee. On an
-API-key profile no published window exists for this model yet, so either choice
-is budgeted at the assumed 272K floor. The alias is translated to
+The 500K `gpt-6.1-sol` subscription choice keeps a long conversation on that
+account until about 443K estimated input tokens; the local
+`gpt-6.1-sol-272k` cap rotates at about 226K. This is the certain routing
+effect of the two choices. `gpt-6.1-sol` is the first listed slug whose 500K
+`context_window` exceeds the 272K long-context price threshold, so the owner
+chose to offer both the backend's 500K subscription window and the capped
+variant. The capped choice targets requests below the threshold, but the
+estimator cannot see replayed reasoning, so that target is not a guarantee.
+OpenAI's published API pricing lists prompts over 272K input tokens at 2×
+input and 1.5× output for the whole API request; that pricing reference does
+not claim that a ChatGPT subscription quota meter uses the same multiplier.
+On an API-key profile no published window exists for this model yet, so either
+choice is budgeted at the assumed 272K floor. The alias is translated to
 `gpt-6.1-sol` before it reaches the backend, and the Dashboard explains the
 quota trade-off beside both choices.
 
@@ -124,14 +130,20 @@ Decision table, replacing ADR 0008's:
 
 ## Consequences
 
+* The 500K `gpt-6.1-sol` subscription choice keeps a long conversation on
+  the account until about 443K estimated input tokens; its local 272K cap
+  rotates at about 226K. Those are the two explicit selector outcomes.
 * A mixed pool runs at 1M. The one visible sign of the guard is a compaction
   that comes earlier than it would on Claude accounts alone — only when
   nothing but a ChatGPT account is left to take a long turn.
 * The budget line is **272K by default, not 872K**: that is the floor and the
-  long-context price threshold, so budgeting past it would walk a subscription
-  into the higher-usage band silently. `gpt-6.1-sol` is the user-chosen
-  exception: the selector offers its backend-default 500K window as well as a
-  local 272K-capped alias, and explains the quota cost of the former.
+  long-context price threshold. `gpt-6.1-sol` is the user-chosen exception:
+  its 500K subscription choice keeps a conversation on the account until
+  about 443K estimated input tokens, while the local 272K cap rotates at about
+  226K. The 2× input / 1.5× output figures are OpenAI's published API pricing
+  for prompts over 272K input tokens, not a claim that the subscription quota
+  meter applies that multiplier; the selector explains that long turns can
+  cost more.
 * Two Claude Code internals are now depended on: the underscore variable
   (ADR 0008) and the prompt-too-long parser. Both are read out of 2.1.278 and
   both fail soft — the window returns to 200K, or the client surfaces the

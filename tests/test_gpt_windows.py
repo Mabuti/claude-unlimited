@@ -73,6 +73,13 @@ def test_api_key_profiles_get_the_public_api_window():
     assert info.budget == 922_000 * 95 // 100 - 32_000
 
 
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-6.1-sol-272k", "GPT-6.1-SOL-272K"])
+def test_api_key_profiles_keep_both_gpt_6_1_sol_variants_at_the_assumed_floor(model):
+    info = gw.window_for(model, auth_mode="api_key")
+    assert (info.window, info.budget, info.assumed) == (272_000, 226_400, True)
+    assert info.assumption_reason == "no_published_api_window"
+
+
 def test_a_custom_base_url_is_an_unknown_backend_at_the_floor():
     info = gw.window_for("gpt-6-astra", auth_mode="api_key", base_url="http://localhost:11434/v1")
     assert (info.backend, info.window, info.assumed) == (gw.BACKEND_UNKNOWN, 272_000, True)
@@ -87,6 +94,7 @@ def test_an_unknown_id_is_assumed_at_the_floor_never_excluded(model):
     info = gw.window_for(model, auth_mode="chatgpt_subscription")
     assert info.window == gw.UNKNOWN_WINDOW and info.budget == gw.MIN_BUDGET
     assert info.assumed is True
+    assert info.assumption_reason == "unknown_model"
 
 
 def test_ids_are_matched_case_insensitively():
@@ -186,6 +194,23 @@ def test_codex_profile_windows_reports_the_tightest_budget_across_targets():
     assert summary["window"] == 272_000 and summary["budget"] == 226_400
     assert summary["assumed"] is False
     assert "gpt-5.6-terra" in summary["models"]
+    assert summary["model_budgets"]
+    assert summary["assumptions"] == []
+
+
+def test_codex_profile_windows_keeps_a_budget_for_each_resolved_model():
+    from claude_unlimited.config import Profile
+
+    p = Profile(id="c", name="C", kind="codex", auth_mode="chatgpt_subscription")
+    parity = [
+        {"claude_model": "claude-fable-5", "model": "gpt-6.1-sol", "effort": "medium"},
+        {"claude_model": "claude-opus-5-5", "model": "gpt-6-sol", "effort": "high"},
+    ]
+    summary = openai_models.codex_profile_windows(p, parity=parity)
+    budgets = {entry["model"]: entry["budget"] for entry in summary["model_budgets"]}
+    assert budgets["gpt-6.1-sol"] == 443_000
+    assert budgets["gpt-6-sol"] == 226_400
+    assert summary["budget"] == 226_400  # routing keeps the smallest budget
 
 
 def test_codex_profile_windows_flags_an_override_it_has_not_met():

@@ -274,6 +274,7 @@ def test_the_settings_endpoint_publishes_the_decision_reason(monkeypatch, tmp_pa
     assert entry["window"] == 272_000 and entry["budget"] == 226_400
     assert entry["assumed"] is False and preview["guard"]["assumed"] is False
     assert "gpt-5.6-terra" in entry["models"]
+    assert entry["model_budgets"]
 
     claude_only = Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True)],
                         settings=Settings(context_1m="auto"))
@@ -324,6 +325,22 @@ def test_the_launch_note_names_each_codex_account_and_its_window():
                       auth_mode="chatgpt_subscription")
     [line] = cli._codex_guard_lines(Pool(profiles=[unknown], settings=Settings()), [unknown], None)
     assert "assumed" in line and "gpt-99-nova" in line
+
+
+def test_the_launch_note_shows_each_distinct_resolved_budget():
+    import claude_unlimited.cli as cli
+    from claude_unlimited.config import Pool, Profile, Settings
+
+    codex = Profile(id="c", name="Mixed", kind="codex", automatic=True,
+                    auth_mode="chatgpt_subscription")
+    parity = [
+        {"claude_model": "claude-fable-5", "model": "gpt-6.1-sol", "effort": "medium"},
+        {"claude_model": "claude-opus-5-5", "model": "gpt-6-sol", "effort": "high"},
+    ]
+    pool = Pool(profiles=[codex], settings=Settings(model_parity=parity))
+    [line] = cli._codex_guard_lines(pool, pool.profiles, None)
+    assert "~443K on gpt-6.1-sol" in line
+    assert "~226K on gpt-6-sol" in line
 
     # An api_key codex Profile talks to api.openai.com: the public API's window.
     public = Profile(id="k", name="K", kind="codex", automatic=True, auth_mode="api_key")

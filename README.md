@@ -627,20 +627,20 @@ so on your behalf, and you get the million back:
 | Opus 5 | 200,000 | **1,000,000** |
 | Sonnet 5 | 200,000 | **1,000,000** |
 
-**A ChatGPT/Codex account in the pool no longer costs you the window.** A ChatGPT account
-answers with a GPT model whose ordinary window is about **272K** tokens, so the daemon sizes
-every turn before routing it: a normal ChatGPT choice takes turns up to about 226K estimated
-input tokens, leaving room for the reply and its reasoning, and longer turns go to a Claude
-account. `gpt-6.1-sol` is the explicit exception: on a ChatGPT-subscription profile its
-selector offers the backend-default 500K window (about 443K estimated input tokens) and a
-local `gpt-6.1-sol-272k` alias capped at 272K (about 226K estimated input tokens). The capped
-choice aims to keep requests under OpenAI's 272K long-context price threshold, but the
-estimate cannot see replayed reasoning, so that is a target, not a guarantee; long
-conversations move to another account sooner. The 500K choice crosses the threshold, where
-input is billed at 2× and output at 1.5× for the whole request, so long turns can cost more.
-On an API-key profile there is no published window for this model yet, so whichever variant
-you choose is budgeted at the assumed 272K floor. The alias is translated to `gpt-6.1-sol`
-before it reaches OpenAI.
+**A ChatGPT/Codex account in the pool no longer costs you the window.** The certain effect of
+the two `gpt-6.1-sol` choices is simple: the 500K subscription choice keeps a long
+conversation on the account until about **443K estimated input tokens**, while the 272K cap
+rotates at about **226K estimated input tokens**. Ordinary GPT/Codex models have about **272K**
+windows, so the daemon sizes every turn before routing it: a normal choice takes turns up to
+about 226K estimated input tokens, leaving room for the reply and its reasoning, and longer
+turns go to a Claude account. The capped choice aims to keep requests under OpenAI's 272K
+long-context threshold, but the estimate cannot see replayed reasoning, so that is a target,
+not a guarantee; long conversations move to another account sooner. OpenAI's published API
+pricing lists prompts over 272K input tokens at 2× input and 1.5× output for the whole API
+request, so long turns can cost more; this does not claim that a ChatGPT subscription quota
+meter uses that multiplier. On an API-key profile there is no published window for this model
+yet, so whichever variant you choose is budgeted at the assumed 272K floor. The alias is
+translated to `gpt-6.1-sol` before it reaches OpenAI.
 
 When no account that may take the request can hold it — say the Claude accounts are out of
 capacity and a 400K conversation arrives — the daemon answers exactly the "prompt is too long"

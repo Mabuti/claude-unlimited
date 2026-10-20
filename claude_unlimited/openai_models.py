@@ -479,7 +479,7 @@ def parity_grid(rows, catalogue: Optional[Catalogue] = None) -> list[dict]:
 # label the /v1/models listing a codex Profile serves — never sent upstream.
 _OPENAI_DISPLAY_NAMES: dict[str, str] = {
     "gpt-6-astra": "GPT-6 Astra",
-    "gpt-6.1-sol": "GPT-6.1 Sol (500K)",
+    "gpt-6.1-sol": "GPT-6.1 Sol (500K, subscription)",
     "gpt-6.1-sol-272k": "GPT-6.1 Sol (272K cap)",
     "gpt-5.6-sol": "GPT-5.6 Sol",
     "gpt-5.6-terra": "GPT-5.6 Terra",
@@ -545,13 +545,15 @@ def fallback_models(model: str, catalogue: Optional[Catalogue] = None) -> list[s
     model outside the ladder (a Profile override, or a lineup this build has
     never heard of) falls back to the whole ladder. The two explicit
     gpt-6.1-sol choices are terminal: rejection is returned to the caller."""
-    if model.strip().lower() in _CURATED_SELECTABLE:
+    normalized = model.strip().lower()
+    if normalized in _CURATED_SELECTABLE:
         return []
     ladder = model_ladder(catalogue)
-    if model not in ladder:
+    ladder_index = next((index for index, rung in enumerate(ladder)
+                         if rung.strip().lower() == normalized), None)
+    if ladder_index is None:
         return ladder
-    index = ladder.index(model)
-    return ladder[index + 1:] + ladder[:index]
+    return ladder[ladder_index + 1:] + ladder[:ladder_index]
 
 
 _CLAUDE_DISPLAY_NAMES: dict[str, str] = {
@@ -627,13 +629,19 @@ def selectable_models(catalogue: Optional[Catalogue] = None) -> list[str]:
     seen: list[str] = []
     pair_anchor: Optional[int] = None
     if cat is not None:
-        for index, model in enumerate(cat.openai):  # already rank-ordered, cost/generation desc
-            if model.id in _CURATED_SELECTABLE:
-                if pair_anchor is None:
-                    pair_anchor = index
+        catalogue_ids: list[str] = []
+        catalogue_seen: set[str] = set()
+        for model in cat.openai:
+            if model.id in catalogue_seen:
                 continue
-            if model.id not in seen:
-                seen.append(model.id)
+            catalogue_seen.add(model.id)
+            catalogue_ids.append(model.id)
+        pair_anchor = next((index for index, model_id in enumerate(catalogue_ids)
+                            if model_id in _CURATED_SELECTABLE), None)
+        for model_id in catalogue_ids:
+            if model_id in _CURATED_SELECTABLE:
+                continue
+            seen.append(model_id)
     for rung in model_ladder(cat):
         if rung not in seen:
             seen.append(rung)
@@ -651,7 +659,9 @@ def selectable_models(catalogue: Optional[Catalogue] = None) -> list[str]:
         if pair_anchor is None:
             seen.extend(pair)
         else:
-            seen[pair_anchor:min(pair_anchor, len(seen))] = pair
+            pair_anchor = min(pair_anchor, len(seen))
+            # Insert at the first de-duplicated catalogue index where either id appeared.
+            seen[pair_anchor:pair_anchor] = pair
     return seen
 
 
@@ -820,9 +830,11 @@ def codex_profile_windows(profile, parity=None, catalogue: Optional[Catalogue] =
     Profile: the GPT ids its in-force parity rows resolve to (plus the
     default target, since an id outside the rows still maps somewhere), and
     the SMALLEST window/budget among them — the number a session on this
-    account is actually bounded by. `assumed` is True when any of those ids
-    is not in gpt_windows' table. Never raises; a broken parity list simply
-    reports the default target."""
+    account is actually bounded by. `model_budgets` keeps the budget for each
+    resolved model so Settings and the launch note do not misrepresent a
+    mixed profile as having only the smallest number. `assumed` is True when
+    any of those ids is not in gpt_windows' table. Never raises; a broken
+    parity list simply reports the default target."""
     from . import gpt_windows
 
     auth_mode = getattr(profile, "auth_mode", None)
@@ -852,6 +864,9 @@ def codex_profile_windows(profile, parity=None, catalogue: Optional[Catalogue] =
     tightest = min(infos, key=lambda i: i.budget)
     return {
         "models": [i.model for i in infos],
+        "model_budgets": [{"model": i.model, "budget": i.budget} for i in infos],
+        "assumptions": [{"model": i.model, "reason": i.assumption_reason}
+                        for i in infos if i.assumed],
         "backend": tightest.backend,
         "window": tightest.window,
         "budget": tightest.budget,

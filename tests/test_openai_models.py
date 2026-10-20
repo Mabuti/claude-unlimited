@@ -1,3 +1,5 @@
+from claude_unlimited import gpt_windows
+from claude_unlimited.model_catalogue import Catalogue, ModelInfo
 from claude_unlimited.openai_models import (
     _MODEL_LADDER,
     _MODEL_MAP,
@@ -42,8 +44,9 @@ def test_gpt_6_1_sol_variants_are_selectable_without_entering_default_routing():
 def test_gpt_6_1_sol_variants_are_terminal_pins_and_have_server_labels():
     assert fallback_models("gpt-6.1-sol") == []
     assert fallback_models("gpt-6.1-sol-272k") == []
+    assert fallback_models("GPT-6.1-SOL") == []
     labels = model_labels(catalogue=None)
-    assert labels["gpt-6.1-sol"] == "GPT-6.1 Sol (500K)"
+    assert labels["gpt-6.1-sol"] == "GPT-6.1 Sol (500K, subscription)"
     assert labels["gpt-6.1-sol-272k"] == "GPT-6.1 Sol (272K cap)"
 
 
@@ -86,6 +89,7 @@ def test_fallbacks_start_below_the_rejected_model():
     # retry something more capable first — it walks down, then wraps to the
     # rungs above (so a retired mid-tier can still reach a working one).
     assert fallback_models("gpt-5.6-sol") == ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"]
+    assert fallback_models("GPT-5.6-SOL") == fallback_models("gpt-5.6-sol")
 
 
 def test_fallbacks_wrap_around_for_a_mid_tier_model():
@@ -140,6 +144,24 @@ def test_the_dashboard_does_not_restate_the_mapping():
         page = (static / filename).read_text(encoding="utf-8")
         for target in {t.model for t in _MODEL_MAP.values()}:
             assert target not in page, f"{target} is hardcoded in {filename} again"
+        for alias, (real_slug, _) in gpt_windows.CODEX_MODEL_VARIANTS.items():
+            assert alias not in page, f"{alias} is hardcoded in {filename} again"
+            assert real_slug not in page, f"{real_slug} is hardcoded in {filename} again"
+
+
+def test_selectable_variant_pair_uses_the_first_unique_catalogue_index():
+    def info(model_id):
+        return ModelInfo(model_id, model_id, True, 1.0, 1.0, 0)
+
+    catalogue = Catalogue(
+        anthropic=(),
+        openai=(info("gpt-5.6-sol"), info("gpt-5.6-sol"),
+                info("gpt-6.1-sol"), info("gpt-6.1-sol-272k")),
+    )
+    models = selectable_models(catalogue)
+    assert models.count("gpt-5.6-sol") == 1
+    pair_index = models.index("gpt-6.1-sol")
+    assert models[pair_index:pair_index + 2] == ["gpt-6.1-sol", "gpt-6.1-sol-272k"]
 
 
 def test_parity_override_applies_to_the_mapping():

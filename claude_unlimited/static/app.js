@@ -3472,6 +3472,44 @@ async function refreshCodexCreditsVisibility() {
 // What a session launched right now would actually get, and why. The decision
 // is made inside `cu code` in another process; the daemon runs the same pure
 // function over the same pool so this can be answered without launching.
+function _guardBudgetSummary(g) {
+  const entries = Array.isArray(g.model_budgets) ? g.model_budgets : [];
+  if (!entries.length) {
+    return `~${Math.floor((g.budget || 0) / 1000)}K (smallest of these)`;
+  }
+  const budgets = entries.map((entry) => Number(entry.budget) || 0);
+  const models = entries.map((entry) => entry.model || '').filter(Boolean);
+  if (new Set(budgets).size === 1) {
+    return `~${Math.floor(budgets[0] / 1000)}K (smallest of these) on ${models.join(', ')}`;
+  }
+  return entries.map((entry) => `~${Math.floor((Number(entry.budget) || 0) / 1000)}K on ${entry.model || ''}`)
+    .join(', ');
+}
+
+function _guardAssumptionLines(g) {
+  const grouped = new Map();
+  const assumptions = Array.isArray(g.assumptions) ? g.assumptions : [];
+  if (!assumptions.length && g.assumed) {
+    grouped.set('unknown_model', g.models || []);
+  } else {
+    assumptions.forEach((entry) => {
+      const models = grouped.get(entry.reason) || [];
+      models.push(entry.model || '');
+      grouped.set(entry.reason, models);
+    });
+  }
+  const keys = {
+    no_published_api_window: 'settings.context1m.guard_api_window_missing',
+    no_published_subscription_window: 'settings.context1m.guard_subscription_window_missing',
+    unknown_backend: 'settings.context1m.guard_backend_unknown',
+    unknown_model: 'settings.context1m.guard_assumed',
+  };
+  return [...grouped.entries()].map(([reason, models]) => ({
+    key: keys[reason] || keys.unknown_model,
+    models: models.filter(Boolean).join('/'),
+  }));
+}
+
 function renderContext1mVerdict(preview) {
   const el = document.getElementById('context1mVerdict');
   if (!el) return;
@@ -3488,16 +3526,15 @@ function renderContext1mVerdict(preview) {
   // figure or an assumption for a GPT id the built-in table has not met.
   const guardProfiles = (preview.guard && Array.isArray(preview.guard.profiles)) ? preview.guard.profiles : [];
   guardProfiles.forEach((g) => {
-    const models = (g.models || []).join('/');
-    const budgetK = Math.floor((g.budget || 0) / 1000);
     lines.push(t('settings.context1m.guard_line')
       .replace('{name}', g.name || g.id || '')
-      .replace('{budget}', String(budgetK))
-      .replace('{models}', models));
+      .replace('{budget_summary}', _guardBudgetSummary(g)));
     if (g.assumed) {
-      lines.push(t('settings.context1m.guard_assumed')
-        .replace('{name}', g.name || g.id || '')
-        .replace('{models}', models));
+      _guardAssumptionLines(g).forEach((assumption) => {
+        lines.push(t(assumption.key)
+          .replace('{name}', g.name || g.id || '')
+          .replace('{models}', assumption.models));
+      });
     }
   });
   // Morph in place: textContent per line, never innerHTML, and only the
@@ -4619,7 +4656,7 @@ function _codexModelOption(model) {
   return option;
 }
 function _codexModelOptionsFor(current) {
-  const opts = _selectableModels.map(_codexModelOption);  // cost desc
+  const opts = _selectableModels.map(_codexModelOption);  // catalogue order from the server
   if (current && !opts.some((o) => o.value === current)) opts.unshift(_codexModelOption(current));
   return opts;
 }
