@@ -1214,7 +1214,7 @@ function renderStatStrip(profiles) {
 
   // Agents routed per branch (balancing, forced subagents) never move
   // current_profile_id, so the pointer alone would name a stale account.
-  // Profiles serving live agents are what is actually active; busiest first.
+  // Profiles with recently active agents are what the badge reports; busiest first.
   const serving = profiles.filter((p) => p.live_agents > 0).sort((a, b) => b.live_agents - a.live_agents);
   const activeName = serving.length
     ? serving.slice(0, 2).map((p) => p.name).join(', ') + (serving.length > 2 ? ` +${serving.length - 2}` : '')
@@ -1314,8 +1314,9 @@ function fableLeaveTag(p) {
   return `<span class="subagent-tag" title="${esc(t('profiles.leave_fable_tag_title'))}">${FABLE_TAG_ICON}<span>${esc(t('profiles.leave_fable_tag'))}</span></span>`;
 }
 
-// How many Claude Code agents (main agents and subagents) are pinned to this
-// Profile right now. The live counterpart of "active" for per-branch routing.
+// How many Claude Code agents (main agents and subagents) were active on this
+// Profile in the last 5 minutes (an open response or recent activity). The
+// live counterpart of "active" for routing.
 function liveAgentsPill(p) {
   if (!(p.live_agents > 0)) return '';
   return `<span class="live-agents-pill" title="${esc(t('profiles.live_agents_title'))}">${esc(t('profiles.live_agents_tag').replace('{n}', String(p.live_agents)))}</span>`;
@@ -1706,7 +1707,7 @@ function renderProfileCard(p) {
   return `
     <div class="p-card ${isActive ? 'active-card' : ''}${tagClass}${reauthClass}" data-id="${esc(p.id)}"${tagStyle}>
       <div class="p-top">
-        <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
+        <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}${p.kind === 'oauth' ? ' kind-claude' : ''}">${kindIcon(p)}</div>
         <span class="p-name">${esc(p.name)}</span>
         ${planBadge(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}
         ${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}
@@ -1901,7 +1902,7 @@ function renderProfileTableRow(p) {
         <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.4"/><circle cx="9" cy="12" r="1.4"/><circle cx="9" cy="18" r="1.4"/><circle cx="15" cy="6" r="1.4"/><circle cx="15" cy="12" r="1.4"/><circle cx="15" cy="18" r="1.4"/></svg>
       </div>
       <div class="row-name-cell">
-        <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
+        <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}${p.kind === 'oauth' ? ' kind-claude' : ''}">${kindIcon(p)}</div>
         <div class="row-name-text">
           <div class="p-name">${esc(p.name)} ${planBadge(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}${creditsPill(p)}</div>
           <div class="p-kind">${kindLabel}</div>${modelUsageChips(p)}
@@ -2266,6 +2267,7 @@ function openProfileDetailModal(profileId) {
   pdIcon.innerHTML = kindIcon(p);
   pdIcon.classList.toggle('has-tag', !!p.tag_color);
   pdIcon.classList.toggle('kind-codex', p.kind === 'codex');
+  pdIcon.classList.toggle('kind-claude', p.kind === 'oauth');
   pdIcon.style.setProperty('--tag-color', p.tag_color || '');
   document.getElementById('pd_name').firstChild.textContent = p.name + ' ';
   document.getElementById('pd_name_input').value = p.name;

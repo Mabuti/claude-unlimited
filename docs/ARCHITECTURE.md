@@ -333,20 +333,36 @@ by the whole lineage. Together they form a **branch key**: `(session_id, agent_i
 Branches matter because the prompt cache is per-account. Rotating a branch to a different
 account costs a full cache miss; keeping a branch on one account keeps it warm. So the
 gateway holds `_branch_pins`: a bounded, TTL'd `branch key → profile` map (1 h, 512
-entries, LRU). It is a routing preference, never a guarantee — a pin whose Profile went
-ineligible, was already attempted this request, or was deleted is dropped, and the request
-falls through to normal rotation.
+entries). It evicts the oldest pin without an open response or pending request first;
+open or pending pins are never evicted by the cap/trim. Pins for a disabled or deleted Profile are still removed by
+`_sync_snapshot`; the open response keeps counting until it ends. If every pin is open,
+pending, or both, the cap may be exceeded temporarily, bounded by open responses plus
+requests currently being set up.
+Upstream connect/read stalls raise through the transport socket
+timeouts; a downstream client that stops reading remains open and counted until it
+disconnects or the body is closed/finalized. The one-hour retention cutoff is based on
+`last_touch` and applies even when a response is open. An open response counts as active and
+protects its branch entry from cap eviction until it closes/finalizes or its transport raises.
+It does not refresh `last_touch` or prevent routing-pin expiry: after the cutoff, a next request
+may move the branch while the old response is still open, and that response keeps counting on
+its original Profile until it ends. While an old response is still open after a move, both the
+old and new pins count, so the sum of **Agents: N** can briefly exceed the number of branches.
+It is a routing preference, never a guarantee
+— a pin whose Profile went ineligible, was already attempted this request, or was deleted
+is dropped, and the request falls through to normal rotation.
 
 Precedence for one request, first match wins:
 
 1. **Session pin** (`code --profile`) — every request in the terminal, main and subagents
    alike, goes to that one Profile.
-2. **Live branch pin** — this branch already has a warm account. (`branch_pinned`)
+2. **Live branch pin** — this branch already has a warm account; the pin is
+   retained for up to one hour of request inactivity. (`branch_pinned`)
 3. **Forced-for-subagents Profile** — if a subagent sent this and some Profile carries
    `forced_for_subagents`, and it is eligible. (`subagent_forced`)
-4. **New branch assignment** — `router.choose_for_new_branch()` picks the least-loaded
-   eligible Profile and the choice is remembered as this branch's pin. Only in distribute
-   mode, or for a subagent when a forced Profile exists but is not currently eligible.
+4. **New branch assignment** — `router.choose_for_new_branch()` picks the eligible
+   Profile with fewest agents active in the last five minutes (an open response or
+   recent activity), then remembers the choice as this branch's one-hour pin. Only in
+   distribute mode, or for a subagent when a forced Profile exists but is not currently eligible.
    (`branch_assigned`)
 5. **Normal rotation** — `router.choose()`, sticky-until-threshold.
 
@@ -381,7 +397,17 @@ Branch routing bypasses the "Rotated" global-pointer update the way a session pi
 branch choosing its own account must not move the pointer every other session follows.
 Because that traffic never moves `current_profile_id`, the Dashboard reads
 `Gateway.live_agent_counts()` (`live_agents` in `/api/status` and `/api/profiles`) to show
-which accounts are actually serving agents. When a live pin has to be re-assigned because
+which accounts have agents active in the last five minutes (an open response or recent
+activity). This is the same five-minute meaning shown by the HUD detail card's session line;
+it is separate from the `in_use_now` recent-use grace signal and the `agents_since` age of the
+oldest retained pin (retention expires after one hour of inactivity, regardless of whether a
+response is open).
+A silent open response
+counts for the badge and balancer, but does not by itself keep "Used now"
+(`_IN_FLIGHT_MAX_SECONDS`). An open response remains in `live_agents` even if that pin has
+passed the retention cutoff, but closing it does not extend the pin and the next request may
+re-assign the branch. `agents_since` can therefore be absent while an open response is still
+counted. When a retained pin has to be re-assigned because
 its account stopped being eligible, `_record_branch_move` logs every move and fires the
 "rotated" notification at most once per source account every
 `BRANCH_MOVE_NOTIFY_INTERVAL_SECONDS`. The branch key itself — a full JSON parse of the

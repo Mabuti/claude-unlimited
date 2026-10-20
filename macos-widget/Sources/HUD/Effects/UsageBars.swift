@@ -28,11 +28,12 @@ import SwiftUI
 /// the percentage unreadable. The plain rectangles have no such problem, so a
 /// light card gets those and a dark card keeps the effect.
 
-/// The session block's background — the whole "serving now" panel doubles as a
-/// progress bar, so a serving account at 61% is 61% filled rather than a slab.
+/// The session block's background — the whole "recently used" panel doubles as
+/// a progress bar, so a recently used account at 61% is 61% filled rather than a slab.
 struct SessionFillBar: View {
     let percent: Double?
-    /// Only the serving account's block is filled; the others show the track.
+    /// Every recently used account's block is filled; several can be true during
+    /// the 15-minute grace window, while the others show the track.
     let serving: Bool
     /// The card's resolved colours, for the track and for whether the liquid
     /// fill can run at all — see the note above about `.screen`.

@@ -674,18 +674,28 @@ separately.
 
 **`code --distribute`** balances the session across your pool. Each new agent — the main
 agent when the session starts, and each subagent when it's spawned — goes to the account
-with the **fewest agents already working on it**, counted across all your sessions (ties go
-to your priority order, then to the least-used account). It then *stays* there, so it keeps
-its own prompt cache warm instead of paying a cache miss on every rotation.
+with the **fewest agents active in the last 5 minutes**, counted across all your sessions
+(ties go to your priority order, then to the least-used account). It keeps that account while
+it can serve, preserving its own prompt cache instead of paying a cache miss on every rotation.
 
-> **Balancing happens only when an agent starts — never mid-session.** An agent moves only
-> if its account reaches its switch threshold or a usage limit, becomes unavailable (turned
-> off, cooling down, needs re-auth), or the agent sits idle for an hour. It balances by how
-> many agents each account is serving, not by usage percentage, so usage evens out roughly
-> over many sessions rather than exactly.
+> **Balancing happens when an agent starts.** A branch keeps its account while it can serve. It
+> moves when its account reaches its switch threshold or a usage limit, becomes unavailable
+> (turned off, cooling down, or needing re-auth), has had no new request for an hour, or returns
+> a transient 429 and another account can take it.
+> An open response counts in **Agents: N** and protects its branch entry from pin-cap eviction
+> until the client disconnects, the body is closed/finalized, or the transport raises, even when
+> silent. It does not refresh the one-hour routing-pin retention: after that hour, a next request
+> may move the branch while the response is still open, and that response keeps counting on its
+> original account until it closes. While an old response is still open after a move, both the
+> old and new pins count, so the sum of **Agents: N** can briefly exceed the number of branches.
+> It balances by how many agents have
+> been active on each account in the last 5 minutes, not by usage percentage, so usage
+> evens out roughly over many sessions rather than exactly.
 
-While agents are spread out, each profile on the dashboard shows how many it is serving
-(**Agents: N**), and every agent moved off an unavailable account is logged in Activity.
+While agents are spread out, each profile on the dashboard shows how many Claude Code
+main agents and subagents, plus any app session that sends `x-claude-unlimited-session`,
+were active in the last 5 minutes (**Agents: N**), and every agent moved off an unavailable
+account is logged in Activity. Codex CLI sessions are outside this count.
 
 **Settings → Session routing → "Balance sessions and subagents across accounts"** makes that
 the default for every session, with no flag to remember. **Off by default**, because it changes how your
@@ -713,7 +723,7 @@ Which one wins, in order:
 |---|---|
 | `cu code --profile <name>` | That terminal's main agent uses that account, never rotated. Its subagents do too — unless a profile is marked "Force in subagents", in which case they go there, just as strictly. |
 | "Force in subagents" on a profile | Every subagent goes there; the main agent rotates normally (or stays pinned, with `--profile`). |
-| `cu code --distribute` | Main agent and each subagent start on the least-busy account and stay there, that session. |
+| `cu code --distribute` | Main agent and each subagent start on the account with fewest agents active in the last 5 minutes (an open response or recent activity). Each branch keeps that account while it can serve, and moves when the account reaches its switch threshold or a usage limit, becomes unavailable, has no new request for an hour, or returns a transient 429 another account can take; the pin is retained for up to one hour. |
 | Settings → "Balance sessions and subagents across accounts" | Same as above, for every session, no flag needed. |
 | *nothing set (default)* | Normal rotation — everyone shares one account until it's spent. |
 
@@ -1010,7 +1020,9 @@ see the state of your pool without opening the dashboard.
 **On macOS you get it automatically.** Installing or updating Claude Unlimited installs
 `HUD - Heads-Up Display.app` into `~/Applications`, registers it to start when you log in,
 and opens it — nothing to build, nothing to run. It also appears in the menu bar, showing
-the account currently serving and how close it is to rotating.
+the first account in its 15-minute recent-use grace (or the rotation pointer when none is
+recent) and how close it is to rotating; this is not the instant `serving_now` signal or
+the five-minute **Agents: N** count.
 
 <p align="center">
 <img src="docs/screenshots/hud-floating-vertical.png" height="300" alt="HUD floating, vertical">
@@ -1051,7 +1063,8 @@ the old `CapacityWidget.app`, the name it had before, keeping your saved positio
   pull it about 40 points away to let go. Release it while it is stuck and it **docks**: flush against the edge, its ends curving
   out into it like the display notch, vertical on the left or right, horizontal along the top or bottom, remembered across restarts and display
   changes. **Undock** in the cog menu floats it again.
-- An account that is serving lights up from inside, in its provider's colour; several can be lit
+- An account used recently lights up from inside, in its provider's colour; this 15-minute
+  recent-use grace is separate from the five-minute agent count, and several accounts can be lit
   at once. Each account has **two rings**: the outer one is the 5-hour window — green, then amber,
   then red as it nears the switch threshold, the same bands as the Dashboard's bars — and the
   thinner inner one is the weekly window, blue until 90% and red from there. An account whose
@@ -1065,8 +1078,15 @@ the old `CapacityWidget.app`, the name it had before, keeping your saved positio
   (Dark otherwise). Anything you change in the cog menu is kept.
 - It refreshes every 5 seconds (every 2 while the pointer is over it).
 - Hover a profile for its detail card: plan, usage windows, reset times, today's spend, and a
-  session line — while it is serving, how many agents are on it and for how long; otherwise when
-  it was last used. Under that, the model and project of its latest request (a Codex account
+  session line — the number of agents and sessions routed through branch pinning (Claude
+  Code agents, or apps sending a session id) active in the last 5 minutes; if that is zero but the
+  account is in its 15-minute recent-use grace, it says **used recently**; otherwise it shows
+  when the account was last used. A separate **oldest pin age**, when a retained pin is
+  still inside its one-hour inactivity window, gives the age of the oldest retained branch pin;
+  an open response past that pin's retention cutoff can still count as active without an
+  **oldest pin age**, and remains counted while silent until the client disconnects or the body
+  is closed/finalized, or the transport raises.
+  Under that, the model and project of its latest request (a Codex account
   shows the Claude model it translated, e.g. `opus-5 → gpt-5.6-terra`).
 - Right-click (or Control-click) a profile to **Take over**, to **Enable** or **Disable** it, or
   to choose whether its percentage shows the **5-hour** or the **weekly** window (**Percentage
@@ -1180,7 +1200,7 @@ Every command below also works under the short alias **`cu`** — e.g. `cu code`
 |---|---|
 | `claude-unlimited code` | **The one you'll use.** Launches `claude` routed through your pool — or whatever **Settings → Launch commands** has in its place. Also repairs the `cu` shortcut if an update dropped it. |
 | `claude-unlimited code --profile <name>` | Pin the session to one account instead of rotating. |
-| `claude-unlimited code --distribute` | Balance the session across accounts — the main agent and each subagent start on the least-busy account and stay there, each keeping its own prompt cache warm. |
+| `claude-unlimited code --distribute` | Balance the session across accounts — the main agent and each subagent start on the account with fewest agents active in the last 5 minutes (an open response or recent activity), keep that account while it can serve, and move when the account reaches its switch threshold or a usage limit, becomes unavailable, has no new request for an hour, or returns a transient 429 another account can take; the pin is retained for up to one hour. |
 | `claude-unlimited codex [--port <n>] [--account <name>] [--] [codex args…]` | Launches the real **Codex CLI**, routed through your pool's enabled Codex/ChatGPT accounts — needs at least one (add-codex-account). Routes with `-c` overrides on the command line only; it never edits `~/.codex/config.toml`. A Codex session never moves the Claude Code rotation, and each Codex session stays on the account that served it until that account runs out, needs re-auth or is cooling down. With more than one enabled Codex account, prompts you to pick one — default is rotated accounts, the same as `cu code` — and `--account <name>` skips the prompt. `--port`, `--account` and `-h`/`--help` are read only right after `codex`, before any other argument (use `cu codex -- --help` for Codex's own help): from the first other argument on, everything goes to `codex` verbatim and in order — including Codex's own `-p`/`--profile`, and a `--port` or `--account` meant for Codex (`cu codex exec --port 9` hands `--port 9` to Codex) — and a `--` right after these options is dropped. |
 | `claude-unlimited desktop` | Route the Claude **desktop app** through your pool, then launch it. `--revert` undoes it. |
 | `claude-unlimited status` | Is the daemon installed and running, and its pid. |

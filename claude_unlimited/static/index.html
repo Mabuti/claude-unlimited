@@ -19,10 +19,12 @@
     --warn: #FFB020; --warn-soft: rgba(255,176,32,0.14); --warn-border: rgba(255,176,32,0.32);
     --good: #35D07F; --good-soft: rgba(53,208,127,0.14);
     --bad: #FF5C5C; --bad-soft: rgba(255,92,92,0.12); --bad-border: rgba(255,92,92,0.35);
-    /* Codex/OpenAI Profiles get their own accent, distinct from --accent (the
-       Claude/Anthropic blue used by oauth+api), applied consistently across
-       their icon, badge, and type-card. */
+    /* --accent is product chrome, also used by API profiles and charts.
+       --codex is the Codex/OpenAI mark; --claude is the Claude subscription
+       (kind oauth) mark and its type-card. A profile tag color still wins
+       over both provider accents. */
     --codex: #2FD9C4; --codex-soft: rgba(47,217,196,0.14); --codex-border: rgba(47,217,196,0.38);
+    --claude: #D97757; --claude-soft: rgba(217,119,87,0.16); --claude-border: rgba(217,119,87,0.40);
     --track: #1E1E23; --track-marker: rgba(255,255,255,0.5); --chip-off: #2A2A2F; --knob-on: #0A0A0C;
     --fs-micro: 10.5px; --fs-body: 13px; --fs-name: 16px; --fs-stat: 20px;
   }
@@ -35,6 +37,7 @@
     --good: #1C8A3E; --good-soft: rgba(28,138,62,0.12);
     --bad: #D42B2B; --bad-soft: rgba(212,43,43,0.1); --bad-border: rgba(212,43,43,0.3);
     --codex: #0E8F80; --codex-soft: rgba(14,143,128,0.12); --codex-border: rgba(14,143,128,0.32);
+    --claude: #A8452A; --claude-soft: rgba(168,69,42,0.12); --claude-border: rgba(168,69,42,0.34);
     --track: #E7E9EC; --track-marker: rgba(0,0,0,0.35); --chip-off: #DDE0E4; --knob-on: #FFFFFF;
   }
   body {
@@ -260,6 +263,8 @@
      same priority order tag-color has over any kind-based default. */
   .p-icon.kind-codex:not(.has-tag) { color: var(--codex); background: var(--codex-soft); }
   .p-icon-lg.kind-codex:not(.has-tag) { color: var(--codex); background: var(--codex-soft); }
+  .p-icon.kind-claude:not(.has-tag) { color: var(--claude); background: var(--claude-soft); }
+  .p-icon-lg.kind-claude:not(.has-tag) { color: var(--claude); background: var(--claude-soft); }
   .p-name { font-size: var(--fs-body); font-weight: 700; }
   .p-kind { font-size: var(--fs-micro); color: var(--text-faint); margin-left: 2px; }
   .p-status-word { font-size: var(--fs-micro); font-weight: 700; margin-left: auto; padding: 2px 7px; border-radius: 5px; white-space: nowrap; }
@@ -519,11 +524,12 @@
   .type-icon svg { width: 14px; height: 14px; }
   .type-name { font-size: var(--fs-body); font-weight: 700; }
   .type-desc { font-size: var(--fs-micro); color: var(--text-faint); line-height: 1.4; }
-  /* Codex/OpenAI selects into the provider accent rather than the generic
-     --accent, matching the icon and plan badge shown once a Profile
-     exists. */
+  /* Codex/OpenAI and Claude subscription choices use provider accents rather
+     than the generic --accent, matching their profile icons. */
   .type-card.sel[data-type-card="codex"] { border-color: var(--codex-border); background: var(--codex-soft); }
   .type-card.sel[data-type-card="codex"] .type-icon { color: var(--codex); }
+  .type-card.sel[data-type-card="oauth"] { border-color: var(--claude-border); background: var(--claude-soft); }
+  .type-card.sel[data-type-card="oauth"] .type-icon { color: var(--claude); }
   .model-map-table { width: 100%; border-collapse: collapse; font-size: var(--fs-micro); margin-top: 4px; }
   .model-map-table th, .model-map-table td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border-soft); color: var(--text-dim); }
   /* The Claude model name is the label for its row — it was rendering at
@@ -1506,7 +1512,7 @@
         <div class="field-row">
           <div class="field-text">
             <div class="field-title" data-i18n="settings.routing.distribute_label">Balance sessions and subagents across accounts</div>
-            <div class="field-sub" data-i18n="settings.routing.distribute_sub">Each new agent starts on the least-busy account. Same as launching every session with --distribute. Off by default.</div>
+            <div class="field-sub" data-i18n="settings.routing.distribute_sub">Each new agent starts on the account with fewest agents active in the last 5 minutes (an open response or recent activity). Same as launching every session with --distribute. Off by default.</div>
           </div>
           <div class="toggle off" id="distributeDefaultToggle" data-field="distribute_sessions_default"><div class="toggle-knob"></div></div>
         </div>
@@ -1527,15 +1533,15 @@
           <div class="toggle off" id="fableLimitAllToggle" data-field="fable_limit_all_profiles"><div class="toggle-knob"></div></div>
         </div>
         <div class="routing-explainer">
-          <div data-i18n="settings.routing.explainer">A Claude Code session is not one caller: the agent you type at (the "main agent") and every subagent it spawns send their own requests. Normally they all share one account, chosen by rotation. Turn this on and each new agent goes to the account with the fewest agents already working on it, across all your sessions — ties go to your priority order, then to the least-used account. Over time this spreads your usage across accounts instead of draining one first.</div>
-          <div class="routing-when" data-i18n="settings.routing.when">Balancing happens only when an agent starts — a new session, or a new subagent. It never rebalances mid-session: once an agent is on an account it stays there, so its prompt cache stays warm. It moves only if that account reaches its switch threshold or a usage limit, becomes unavailable, or the agent sits idle for an hour. It spreads by how many agents each account is serving, not by usage percentage, so usage evens out roughly rather than exactly.</div>
+          <div data-i18n="settings.routing.explainer">A Claude Code session is not one caller: the agent you type at (the "main agent") and every subagent it spawns send their own requests. Normally they all share one account, chosen by rotation. Turn this on and each new agent goes to the account with the fewest agents active in the last 5 minutes (an open response or recent activity), across all your sessions — ties go to your priority order, then to the least-used account. Over time this spreads your usage across accounts instead of draining one first.</div>
+          <div class="routing-when" data-i18n="settings.routing.when">Balancing happens when an agent starts — a new session, or a new subagent. Each branch stays on its account until that account reaches its switch threshold or a usage limit, becomes unavailable, the branch has had no new request for an hour, or a request gets a transient 429 and another account can take the branch. An open response does not reset the hour, so the next request can move the branch while the old response is still open. It spreads by how many agents have been active on each account in the last 5 minutes (an open response or recent activity), not by usage percentage, so usage evens out roughly rather than exactly.</div>
           <div class="routing-example">
             <div class="routing-example-title" data-i18n="settings.routing.example_off_title">Setting OFF (default) — one account at a time</div>
             <div class="routing-example-body" data-i18n="settings.routing.example_off">Example: you ask Claude Code to audit three services, and it spawns two subagents to read them in parallel. All three — the agent you type at, and both subagents — send their requests to Personal Max. When Personal Max reaches its switch threshold, all three move together to Work Max. This is how Claude Unlimited has always worked.</div>
           </div>
           <div class="routing-example">
             <div class="routing-example-title" data-i18n="settings.routing.example_on_title">Setting ON — agents spread across accounts</div>
-            <div class="routing-example-body" data-i18n="settings.routing.example_on">Example: the same audit, with the setting on. The agent you type at starts on Personal Max, the first subagent on Work Max, the second on Codex — all three at the same time, each on the account that was least busy when it started. Each stays on its own account until it finishes. If Work Max reaches its threshold mid-task, only the subagent on Work Max moves; the other two stay where they are.</div>
+            <div class="routing-example-body" data-i18n="settings.routing.example_on">Example: the same audit, with the setting on. The agent you type at starts on Personal Max, the first subagent on Work Max, the second on Codex — all three at the same time, each on the account with fewest agents active in the last 5 minutes when it started. Each keeps its account while it can serve. A branch moves when its account reaches its switch threshold or a usage limit, becomes unavailable, has had no new request for an hour, or returns a transient 429 and another account can take it. If Work Max reaches its threshold mid-task, only the subagent on Work Max moves; the other two remain unless one of those events affects them.</div>
           </div>
           <div class="routing-note" data-i18n="settings.routing.note">Still available per session either way: cu code --distribute turns balancing on for one session while this is off. cu code --profile &lt;name&gt; always wins over both and pins the main agent to one account; its subagents go to a profile marked "Forced in subagents" if there is one, held just as strictly — never rerouted (if that profile is disabled, they follow the pin).</div>
         </div>
@@ -2058,7 +2064,7 @@
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.code">Starts the daemon if it isn't already running, then launches claude routed through your pool. With more than one enabled Profile, prompts you to pick one for this session (or Rotated accounts for the default automatic behavior) — pass --profile &lt;name&gt; to skip the prompt, or run non-interactively for the same default. --distribute instead balances the session across accounts: the main agent and each subagent start on the least-busy account and stay there, each keeping its own prompt cache warm. Any other extra arguments pass straight through to claude. It also repairs the cu shortcut if an update left it missing. The executable it launches is whatever Settings → Launch commands has for Claude Code.</div>
+          <div class="field-sub" data-i18n="help.cmd.code">Starts the daemon if it isn't already running, then launches claude routed through your pool. With more than one enabled Profile, prompts you to pick one for this session (or Rotated accounts for the default automatic behavior) — pass --profile &lt;name&gt; to skip the prompt, or run non-interactively for the same default. --distribute instead balances the session across accounts: the main agent and each subagent start on the account with fewest agents active in the last 5 minutes (an open response or recent activity), each branch keeps that account while it can serve, and moves when the account reaches its switch threshold or a usage limit, becomes unavailable, has no new request for an hour, or returns a transient 429 another account can take. Each keeps its own prompt cache warm. Any other extra arguments pass straight through to claude. It also repairs the cu shortcut if an update left it missing. The executable it launches is whatever Settings → Launch commands has for Claude Code.</div>
         </div>
         <div class="divider"></div>
         <div class="cmd-row">
@@ -2118,7 +2124,7 @@
           </tr>
           <tr>
             <td class="mono">cu code --distribute</td>
-            <td data-i18n="help.routing.r_distribute">The main agent and each subagent start on the least-busy account and stay there, each keeping its own prompt cache warm. No rebalancing mid-session.</td>
+            <td data-i18n="help.routing.r_distribute">The main agent and each subagent start on the account with fewest agents active in the last 5 minutes (an open response or recent activity), each branch keeps that account while it can serve, and moves when the account reaches its switch threshold or a usage limit, becomes unavailable, has no new request for an hour, or returns a transient 429 another account can take. Each keeps its own prompt cache warm.</td>
           </tr>
           <tr>
             <td data-i18n="help.routing.r_setting_how">Settings → Session routing</td>
@@ -2352,7 +2358,7 @@
         <div class="section-sub" data-i18n="help.widget.sub">macOS only, English only</div>
       </div>
       <div class="section-body">
-        <div class="field-sub" data-i18n="help.widget.body">A floating dock showing every account as a circle with two usage rings: the 5-hour window outside, the weekly one inside (blue, red from 90%). The number under it names its window (5h or w); an account that needs re-auth says Reauth in red. The logo takes the account's colour from the Profiles page. An API-key account shows its estimated total cost instead, with its token cap as the ring when it has one. On macOS it installs with Claude Unlimited and starts with you — there is nothing to build. It also adds a menu bar item showing the account currently serving. Drag it anywhere — near a screen edge it pulls onto the edge and docks there when you let go, turning to run along it — and hover a profile for its details. Right-click (or Control-click) a profile to take it over, to enable or disable it, or to choose whether its percentage shows the 5-hour or the weekly window — remembered per profile. The cog sets size, orientation, background and transparency. If you close it, reopen it with the button directly above the language selector, or with `cu hud install`; `cu hud remove` takes it away for good. It only ever talks to 127.0.0.1, and the only two things it changes are Take over and enabling or disabling a profile: the same actions as the Dashboard's, sent with the daemon's per-run security token.</div>
+        <div class="field-sub" data-i18n="help.widget.body">A floating dock showing every account as a circle with two usage rings: the 5-hour window outside, the weekly one inside (blue, red from 90%). The number under it names its window (5h or w); an account that needs re-auth says Reauth in red. The logo takes the account's colour from the Profiles page. An API-key account shows its estimated total cost instead, with its token cap as the ring when it has one. On macOS it installs with Claude Unlimited and starts with you — there is nothing to build. It also adds a menu bar item showing the first account within its 15-minute recent-use grace, or the rotation pointer when none is recent; the detail card shows the five-minute "N active (open or last 5 min)" line for agents and sessions routed through branch pinning (Claude Code agents, or apps sending a session id), and Codex CLI sessions are not counted. Drag it anywhere — near a screen edge it pulls onto the edge and docks there when you let go, turning to run along it — and hover a profile for its details. Right-click (or Control-click) a profile to take it over, to enable or disable it, or to choose whether its percentage shows the 5-hour or the weekly window — remembered per profile. The cog sets size, orientation, background and transparency. If you close it, reopen it with the button directly above the language selector, or with `cu hud install`; `cu hud remove` takes it away for good. It only ever talks to 127.0.0.1, and the only two things it changes are Take over and enabling or disabling a profile: the same actions as the Dashboard's, sent with the daemon's per-run security token.</div>
       </div>
     </div>
 </div>

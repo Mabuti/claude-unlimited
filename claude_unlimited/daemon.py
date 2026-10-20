@@ -959,7 +959,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 "current_profile_id": current_profile_id,
                 "current_profile_name": current_profile.name if current_profile is not None else None,
                 # Branch-routed agents never move current_profile_id; this is
-                # what they are actually on (profile id -> live agents).
+                # the five-minute active count (profile id -> agents).
                 "live_agents": _gateway.live_agent_counts(),
                 # Issue #3: `in_use_now` on /api/profiles is smoothed by a
                 # 15-minute grace so the Dashboard light does not flicker, so
@@ -980,15 +980,18 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             in_flight = _gateway.in_flight_ids()
             items = [_profile_to_public_dict(p, runtime_map.get(p.id), usage_map.get(p.id), p.id in in_flight)
                      for p in profile_repo.list_profiles()]
+            # The badge and balancer use the same five-minute active count;
+            # agents_since below deliberately keeps the one-hour pin view.
             live_agents = _gateway.live_agent_counts()
             on_account = _gateway.agents_on_account_seconds()
             last_use = usage_history.latest_by_profile()
             now_utc = datetime.now(timezone.utc)
             for item in items:
                 item["live_agents"] = live_agents.get(item["id"], 0)
-                # The widget's "serving now" block. last_* is the latest
-                # COMPLETED request (usage is recorded once known), so it is
-                # labelled as the latest, never as what is running this second.
+                # The widget's recent-use block, not the instant serving_now
+                # signal. last_* is the latest COMPLETED request (usage is
+                # recorded once known), so it is labelled as the latest, never
+                # as what is running this second.
                 last = last_use.get(item["id"]) or {}
                 item["last_model"] = last.get("model")
                 item["last_requested_model"] = last.get("requested_model")
@@ -1027,10 +1030,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/branch-pins":
-            # Which agent sits on which account. gateway already keeps this as
-            # a read-only view (TTL-filtered); it had no consumer until now, so
-            # the Dashboard could only show a COUNT of live agents and never
-            # which branch was where.
+            # Which retained branch pins sit on which accounts. The one-hour
+            # retention view also marks whether each pin was active in the
+            # five-minute badge/balancer window.
             pins = _gateway.branch_pins()
             pool = load_pool()
             names = {p.id: p.name for p in pool.profiles}

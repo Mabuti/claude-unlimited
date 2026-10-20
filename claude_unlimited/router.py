@@ -119,6 +119,7 @@ class RoutingDecision:
     # too: "transient_failover", "manual_override", "branch_pinned", "subagent_forced", and the
     # pinned-Profile set "forced" | "forced_profile_missing" | "forced_profile_disabled" |
     # "forced_profile_needs_reauth". Anything reading .reason has to expect all of them.
+    reserved: bool = False  # gateway.py: this branch decision owns one pending reservation
 
 
 @dataclass(frozen=True)
@@ -288,13 +289,15 @@ def choose_for_new_branch(pool: PoolSnapshot, now: datetime,
     priority": its job is to spread branches so one account isn't drained
     while another sits idle. Ordering, in force:
 
-      1. fewest branches currently pinned to it (`branch_counts`) — the
-         spreading rule, and it has to come FIRST. Any other leading key
+      1. fewest agents active on it in the last five minutes (`branch_counts`;
+         an open response or recent activity) — the spreading rule, and it
+         has to come FIRST. Any other leading key
          (priority, utilization) is the same for every branch of a session,
          so every branch would pick the same winner and "each subagent gets
          its own account" would quietly become "all of them share one".
-         Count-first makes the assignment round-robin: each account takes a
-         branch before any account takes a second.
+         Count-first makes the assignment round-robin while accounts differ in
+         five-minute activity; when all tie at 0 (e.g. after a quiet spell),
+         it falls through to priority.
       2. priority band — decides the order WITHIN a round, so the user's
          preference still says who is used first, second, third.
       3. least-utilized first (`last_usage_percent`) — accounts are limited
