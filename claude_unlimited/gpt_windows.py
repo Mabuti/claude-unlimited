@@ -27,7 +27,9 @@ from typing import Optional
 # threshold (prompts over 272K input tokens are priced at 2x input and 1.5x
 # output for the full request, developers.openai.com model pages, 2026-09).
 # gpt-6.1-sol's listed 500K window is above that threshold: budgeting it is an
-# explicit user choice, and the local -272k variant exists to stay under it.
+# explicit user choice, and the local -272k variant targets the 272K line. The
+# byte estimate cannot see replayed reasoning, so that target is not a
+# guarantee that every upstream request stays below the pricing threshold.
 # `max_context_window` is the server ceiling a user can raise Codex CLI's own
 # budget to; it is recorded for the freshness check only, never budgeted
 # against. Changing a row is a spending decision.
@@ -112,12 +114,13 @@ MIN_BUDGET = budget_for(UNKNOWN_WINDOW)
 def upstream_slug(model: Optional[str]) -> str:
     """Return the backend slug for a model id, resolving local aliases.
 
-    Model ids are normalized the same way as :func:`window_for`: surrounding
-    whitespace is ignored and comparisons are case-insensitive.
+    Alias comparisons ignore surrounding whitespace and case. Non-alias ids
+    keep their original casing after surrounding whitespace is stripped: a
+    profile override is an opaque upstream id unless it is one of our aliases.
     """
-    key = (model or "").strip().lower()
-    variant = CODEX_MODEL_VARIANTS.get(key)
-    return variant[0] if variant is not None else key
+    value = (model or "").strip()
+    variant = CODEX_MODEL_VARIANTS.get(value.lower())
+    return variant[0] if variant is not None else value
 
 
 def backend_for(auth_mode: Optional[str], base_url: Optional[str]) -> str:

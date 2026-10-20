@@ -4607,10 +4607,15 @@ function _claudeModelOptionsFor(current) {
 function _codexModelNoteKey(model) {
   return typeof _modelNotes === 'object' && _modelNotes ? _modelNotes[model] : null;
 }
+function _codexModelNote(model) {
+  const key = _codexModelNoteKey(model);
+  return key ? t(key) : '';
+}
 function _codexModelOption(model) {
-  const option = { value: model, label: model };
-  const noteKey = _codexModelNoteKey(model);
-  if (noteKey) option.title = t(noteKey);
+  const labels = typeof _modelLabels === 'undefined' ? {} : _modelLabels;
+  const option = { value: model, label: (labels[model] || model) };
+  const note = _codexModelNote(model);
+  if (note) option.title = note;
   return option;
 }
 function _codexModelOptionsFor(current) {
@@ -4661,11 +4666,12 @@ function renderParityRows() {
     const ordered = [base, ...indices.filter((i) => i !== base)].filter((i) => i !== undefined);
     return ordered.map((i) => {
       const r = _parityRows[i];
+      const modelNote = _codexModelNote(r.model);
       return `<tr>
         <td>${i === base ? sel(`parity_claude_${i}`, r.claude_model) : esc(r.claude_model)}</td>
         <td>${i === base ? esc(t('settings.parity.any')) : sel(`parity_source_${i}`, r.source_effort)}</td>
         <td aria-hidden="true">→</td>
-        <td>${sel(`parity_model_${i}`, r.model)}</td>
+        <td>${sel(`parity_model_${i}`, r.model, modelNote)}${modelNote ? `<small class="field-sub parity-model-note" style="display:block">${esc(modelNote)}</small>` : ''}</td>
         <td>${sel(`parity_effort_${i}`, r.effort, r.effort === 'follow' ? t('settings.parity.follow_hint') : '')}${r.effort && r.effort !== 'follow' ? `<small class="field-sub" style="display:block">${esc(t('settings.parity.fixed_hint'))}</small>` : ''}</td>
         <td>${sel(`parity_ceffort_${i}`, r.claude_effort || '')}</td>
         <td><button class="parity-del" data-row="${i}" title="${esc(t('settings.parity.delete_row'))}" aria-label="${esc(t('settings.parity.delete_row'))}">
@@ -4690,7 +4696,7 @@ function renderParityRows() {
         (v) => { r.source_effort = v; renderParityRows(); });
     }
     setupSelectInput(document.getElementById(`parity_ceffort_${i}`), _claudeEffortOptions(), (v) => { r.claude_effort = v || null; });
-    setupSelectInput(document.getElementById(`parity_model_${i}`), _codexModelOptionsFor(r.model), (v) => { r.model = v; });
+    setupSelectInput(document.getElementById(`parity_model_${i}`), _codexModelOptionsFor(r.model), (v) => { r.model = v; renderParityRows(); });
     setupSelectInput(document.getElementById(`parity_effort_${i}`), _codexEffortOptions(), (v) => { r.effort = v; renderParityRows(); });
   });
   body.querySelectorAll('.parity-del').forEach((btn) => {
@@ -4846,6 +4852,7 @@ async function loadModelParity() {
     return;
   }
   _selectableModels = data.selectable_models || _selectableModels;
+  _modelLabels = data.model_labels || {};
   _modelNotes = data.model_notes || {};
   _reasoningEfforts = data.reasoning_efforts || _reasoningEfforts;
   _parityMeta = {
@@ -4924,6 +4931,7 @@ async function resetModelParity() {
 // the lineup changed. A test asserts no model id appears literally in this
 // file.
 let _selectableModels = [];
+let _modelLabels = {};
 let _modelNotes = {};
 let _reasoningEfforts = [];
 const CODEX_MODEL_OPTIONS = () => [

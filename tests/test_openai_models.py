@@ -5,6 +5,7 @@ from claude_unlimited.openai_models import (
     automatic_mapping,
     advertised_models,
     fallback_models,
+    model_labels,
     map_model,
     selectable_models,
 )
@@ -33,8 +34,17 @@ def test_gpt_6_1_sol_variants_are_selectable_without_entering_default_routing():
     models = selectable_models(catalogue=None)
     assert "gpt-6.1-sol" in models
     assert "gpt-6.1-sol-272k" in models
+    assert models[models.index("gpt-6.1-sol") + 1] == "gpt-6.1-sol-272k"
     assert "gpt-6.1-sol" not in _MODEL_LADDER
     assert "gpt-6.1-sol-272k" not in _MODEL_LADDER
+
+
+def test_gpt_6_1_sol_variants_are_terminal_pins_and_have_server_labels():
+    assert fallback_models("gpt-6.1-sol") == []
+    assert fallback_models("gpt-6.1-sol-272k") == []
+    labels = model_labels(catalogue=None)
+    assert labels["gpt-6.1-sol"] == "GPT-6.1 Sol (500K)"
+    assert labels["gpt-6.1-sol-272k"] == "GPT-6.1 Sol (272K cap)"
 
 
 def test_unknown_model_falls_back_to_the_balanced_default():

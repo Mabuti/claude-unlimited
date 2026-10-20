@@ -631,13 +631,16 @@ so on your behalf, and you get the million back:
 answers with a GPT model whose ordinary window is about **272K** tokens, so the daemon sizes
 every turn before routing it: a normal ChatGPT choice takes turns up to about 226K estimated
 input tokens, leaving room for the reply and its reasoning, and longer turns go to a Claude
-account. `gpt-6.1-sol` is the explicit exception: its selector offers the backend-default
-500K window (about 443K estimated input tokens) and a local `gpt-6.1-sol-272k` alias capped at
-272K (about 226K estimated input tokens). The selector explains that only the 500K choice
-crosses the 272K long-context price threshold, where input is billed at 2× and output at
-1.5× for the whole request; the capped alias keeps long conversations under that threshold
-and moves them to another account sooner. The alias is translated to `gpt-6.1-sol` before it
-reaches OpenAI.
+account. `gpt-6.1-sol` is the explicit exception: on a ChatGPT-subscription profile its
+selector offers the backend-default 500K window (about 443K estimated input tokens) and a
+local `gpt-6.1-sol-272k` alias capped at 272K (about 226K estimated input tokens). The capped
+choice aims to keep requests under OpenAI's 272K long-context price threshold, but the
+estimate cannot see replayed reasoning, so that is a target, not a guarantee; long
+conversations move to another account sooner. The 500K choice crosses the threshold, where
+input is billed at 2× and output at 1.5× for the whole request, so long turns can cost more.
+On an API-key profile there is no published window for this model yet, so whichever variant
+you choose is budgeted at the assumed 272K floor. The alias is translated to `gpt-6.1-sol`
+before it reaches OpenAI.
 
 When no account that may take the request can hold it — say the Claude accounts are out of
 capacity and a 400K conversation arrives — the daemon answers exactly the "prompt is too long"
@@ -653,8 +656,9 @@ GPT model this build has not met is assumed at 272K and said so, in the Activity
 Settings — never excluded on a guess.
 
 **Auto is the cautious alternative** — it stays quiet when it cannot be sure: when only ChatGPT/Codex accounts can take the
-session (the usual 272K choices only hold about 272K; a user-selected 500K gpt-6.1-sol choice
-is called out separately above, and 1M still would not enlarge it), when an
+session (ordinary GPT/Codex models are about 272K; only a user-selected 500K gpt-6.1-sol on a
+ChatGPT-subscription profile budgets past that, while an API-key profile for this model stays
+at the assumed 272K floor), when an
 API profile points somewhere other than Anthropic, or when your Claude Code version has not
 been checked for it. The launch prints why, and Settings shows the same verdict together with
 each ChatGPT account's window.

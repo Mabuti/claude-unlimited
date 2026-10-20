@@ -48,12 +48,16 @@ def main() -> int:
     fetched = cache.get("fetched_at", "?") if isinstance(cache, dict) else "?"
     problems: list[str] = []
     seen = 0
+    backend_slugs: set[str] = set()
     listed_windows: dict[str, tuple[object, object]] = {}
     for entry in models:
         if not isinstance(entry, dict):
             continue
         slug = str(entry.get("slug") or "").strip().lower()
-        if not slug or entry.get("visibility") != "list":
+        if not slug:
+            continue
+        backend_slugs.add(slug)
+        if entry.get("visibility") != "list":
             continue  # hidden/internal slugs are not selectable targets
         seen += 1
         window = entry.get("context_window")
@@ -71,6 +75,9 @@ def main() -> int:
                             f"table assumes {gpt_windows.CODEX_BACKEND_EFFECTIVE * 100:g}")
 
     for alias, (real_slug, cap) in gpt_windows.CODEX_MODEL_VARIANTS.items():
+        alias_slug = alias.strip().lower()
+        if alias_slug in backend_slugs:
+            problems.append(f"  {alias}: alias name collides with a backend slug")
         listed = listed_windows.get(real_slug.lower())
         if listed is None:
             problems.append(f"  {alias}: real slug {real_slug} is not a visible listed model in the cache")

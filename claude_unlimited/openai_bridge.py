@@ -35,7 +35,7 @@ from . import openai_translate
 from .openai_translate import user_turn_index
 from .config import Profile
 from .gpt_windows import upstream_slug
-from .openai_models import fallback_models, map_model, requested_effort
+from .openai_models import fallback_models, is_terminal_model, map_model, requested_effort
 from . import wire_formats
 
 CHATGPT_BACKEND_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -561,14 +561,15 @@ def run(profile: Profile, stored_credential: str, body: bytes,
 
     # Start from whatever this backend last accepted in place of the mapped
     # model, then walk the ladder if that is rejected too. A Profile override
-    # is honoured as the first candidate but is not the only one: a pinned
-    # model that gets retired should degrade to a working one rather than take
-    # the Profile down with it.
+    # is honoured as the first candidate but is not the only one for ordinary
+    # models: the two explicit gpt-6.1-sol choices are terminal pins, so their
+    # backend rejection must reach the caller instead of becoming Astra.
     # Gated with the ladder, not before it: the memo is a process-global dict
     # keyed by model name alone, so a substitution learned against the Codex
     # backend would otherwise be applied to a same-named model on a completely
     # different server.
-    first_choice = _substitute_model(upstream_model) if fmt.uses_model_ladder else upstream_model
+    first_choice = (upstream_model if (not fmt.uses_model_ladder or is_terminal_model(upstream_model))
+                    else _substitute_model(upstream_model))
     candidates = [first_choice]
     if fmt.uses_model_ladder:
         # Scoped to formats served by the Codex backend, whose lineup the

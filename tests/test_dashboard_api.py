@@ -72,6 +72,8 @@ def test_codex_model_map_exposes_gpt_6_1_sol_variants_and_notes(running_server):
     status, body = _request(f"{base}/api/codex/model-map")
     assert status == 200
     assert {"gpt-6.1-sol", "gpt-6.1-sol-272k"}.issubset(body["selectable_models"])
+    assert body["model_labels"]["gpt-6.1-sol"] == "GPT-6.1 Sol (500K)"
+    assert body["model_labels"]["gpt-6.1-sol-272k"] == "GPT-6.1 Sol (272K cap)"
     assert body["model_notes"] == {
         "gpt-6.1-sol": "models.note.gpt_6_1_sol_500k",
         "gpt-6.1-sol-272k": "models.note.gpt_6_1_sol_272k",

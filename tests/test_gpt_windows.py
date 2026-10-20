@@ -49,6 +49,10 @@ def test_gpt_6_1_sol_272k_variant_is_capped_but_uses_the_real_slug_upstream():
         ("gpt-6.1-sol-272k", 272_000, 226_400, False)
 
 
+def test_non_alias_upstream_slug_strips_only_surrounding_whitespace():
+    assert gw.upstream_slug(" MyModel/Coder-7B ") == "MyModel/Coder-7B"
+
+
 def test_budget_is_the_cli_headroom_minus_the_output_reserve():
     assert gw.budget_for(272_000) == 258_400 - 32_000 == 226_400
     assert gw.MIN_BUDGET == 226_400

@@ -1247,9 +1247,12 @@ def _codex_guard_lines(pool, enabled_profiles, forced_profile) -> list:
 # "user_forced_200k" and "user_already_set" are the user's own doing and need
 # no commentary; "no_profiles" already fails louder elsewhere.
 _ONE_M_REASON_NOTES = {
-    "codex_only_route": "only ChatGPT/Codex accounts can take this session, and a GPT backend "
-                        "holds about 272K. Add a Claude account to the rotation (long turns then "
-                        "go there) — or choose Force 1M in Settings to set it anyway.",
+    "codex_only_route": "only ChatGPT/Codex accounts can take this session. Ordinary GPT/Codex "
+                        "models are about 272K; only a user-selected 500K gpt-6.1-sol on a "
+                        "ChatGPT-subscription profile budgets past that, while an API-key profile "
+                        "for it is still budgeted at the assumed 272K floor. Add a Claude account "
+                        "to the rotation (long turns then go there) — or choose Force 1M in Settings "
+                        "to set it anyway.",
     "custom_gateway_unknown": "an API profile points somewhere other than Anthropic, and we "
                               "cannot verify what context window it serves.",
     "client_version_unverified": "this Claude Code version has not been verified for it.",

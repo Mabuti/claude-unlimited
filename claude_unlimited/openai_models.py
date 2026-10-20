@@ -491,10 +491,20 @@ _OPENAI_MODEL_NOTE_KEYS: dict[str, str] = {
     "gpt-6.1-sol-272k": "models.note.gpt_6_1_sol_272k",
 }
 
+# These are explicit user choices, not default-routing targets. A rejected
+# choice must surface its backend error rather than silently walking the
+# ordinary fallback ladder.
+_CURATED_SELECTABLE: tuple[str, ...] = ("gpt-6.1-sol", "gpt-6.1-sol-272k")
+
 
 def model_notes() -> dict[str, str]:
     """Locale keys for selectable model explanations shown by the Dashboard."""
     return dict(_OPENAI_MODEL_NOTE_KEYS)
+
+
+def is_terminal_model(model: str) -> bool:
+    """Whether a selected model must return backend rejection unchanged."""
+    return model.strip().lower() in _CURATED_SELECTABLE
 
 
 # Ordered most- to least-capable. A model id is a moving target: OpenAI
@@ -533,7 +543,10 @@ def fallback_models(model: str, catalogue: Optional[Catalogue] = None) -> list[s
     capable that is likely rejected for the same reason, then wraps to the
     rungs above so a retired mid-tier model can still reach a working one. A
     model outside the ladder (a Profile override, or a lineup this build has
-    never heard of) falls back to the whole ladder."""
+    never heard of) falls back to the whole ladder. The two explicit
+    gpt-6.1-sol choices are terminal: rejection is returned to the caller."""
+    if model.strip().lower() in _CURATED_SELECTABLE:
+        return []
     ladder = model_ladder(catalogue)
     if model not in ladder:
         return ladder
@@ -600,24 +613,25 @@ def automatic_mapping(parity=None,
 
 # Older ids that remain selectable for a Profile pinned to one, even though
 # nothing maps to them by default, plus the explicit gpt-6.1-sol choices.
-_CURATED_SELECTABLE: tuple[str, ...] = ("gpt-6.1-sol", "gpt-6.1-sol-272k")
 _LEGACY_SELECTABLE: tuple[str, ...] = ("gpt-5.5", "gpt-5.2") + _CURATED_SELECTABLE
 
 
 def selectable_models(catalogue: Optional[Catalogue] = None) -> list[str]:
-    """Every OpenAI/Codex model id the Dashboard may offer in a dropdown,
-    ordered most-expensive/most-capable FIRST.
+    """Every OpenAI/Codex model id the Dashboard may offer in a dropdown.
 
-    The order is the catalogue's own rank (model_catalogue._sort_key: OpenAI
-    is generation-then-cost, with the documented o1-pro correction), so the
-    flagship leads and legacy rungs trail. With a catalogue the live OpenAI
-    lineup comes first; the curated ladder rungs and _LEGACY_SELECTABLE are
-    appended so a known-good id is never lost. Without a catalogue this is the
-    ladder (already most-capable-first) then legacy."""
+    Catalogue models and fallback-ladder rungs retain their own
+    most-expensive/most-capable-first ordering; legacy selectable ids follow.
+    The explicit gpt-6.1-sol choices stay adjacent, with the 500K choice
+    before the 272K cap, without entering the fallback ladder or defaults."""
     cat = _catalogue_or_current(catalogue)
     seen: list[str] = []
+    pair_anchor: Optional[int] = None
     if cat is not None:
-        for model in cat.openai:  # already rank-ordered, cost/generation desc
+        for index, model in enumerate(cat.openai):  # already rank-ordered, cost/generation desc
+            if model.id in _CURATED_SELECTABLE:
+                if pair_anchor is None:
+                    pair_anchor = index
+                continue
             if model.id not in seen:
                 seen.append(model.id)
     for rung in model_ladder(cat):
@@ -626,10 +640,29 @@ def selectable_models(catalogue: Optional[Catalogue] = None) -> list[str]:
     for target in effective_model_map(cat).values():
         if target.model not in seen:
             seen.append(target.model)
-    for extra in _LEGACY_SELECTABLE:
+    extras = (_LEGACY_SELECTABLE if cat is None
+              else tuple(extra for extra in _LEGACY_SELECTABLE
+                         if extra not in _CURATED_SELECTABLE))
+    for extra in extras:
         if extra not in seen:
             seen.append(extra)
+    if cat is not None:
+        pair = [model for model in _CURATED_SELECTABLE if model not in seen]
+        if pair_anchor is None:
+            seen.extend(pair)
+        else:
+            seen[pair_anchor:min(pair_anchor, len(seen))] = pair
     return seen
+
+
+def model_labels(catalogue: Optional[Catalogue] = None) -> dict[str, str]:
+    """Display labels for every model offered by :func:`selectable_models`.
+
+    The Dashboard receives labels from this server-side map so model ids stay
+    values in every selector and cannot drift into hardcoded frontend text.
+    """
+    cat = _catalogue_or_current(catalogue)
+    return {model: _openai_label(model, cat) for model in selectable_models(cat)}
 
 
 def selectable_claude_models(catalogue: Optional[Catalogue] = None) -> list[dict]:

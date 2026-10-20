@@ -43,9 +43,13 @@ per-request guard possible:
 
 `gpt-6.1-sol` is the first listed slug whose 500K `context_window` exceeds the
 272K long-context price threshold. The owner chose to offer both the backend's
-500K variant and a local `gpt-6.1-sol-272k` variant capped at 272K. The 500K
-choice is explicit and carries a 443K estimated-input budget; the capped choice
-keeps the 226.4K budget used by the other 272K rows. The alias is translated to
+500K variant and a local `gpt-6.1-sol-272k` variant capped at 272K. On a
+ChatGPT-subscription profile the 500K choice is explicit and carries a 443K
+estimated-input budget; the capped choice uses the 226.4K budget used by the
+other 272K rows and targets requests below the price threshold. The estimator
+cannot see replayed reasoning, so that target is not a guarantee. On an
+API-key profile no published window exists for this model yet, so either choice
+is budgeted at the assumed 272K floor. The alias is translated to
 `gpt-6.1-sol` before it reaches the backend, and the Dashboard explains the
 quota trade-off beside both choices.
 
