@@ -134,6 +134,7 @@ def test_codex_socket_timeout_before_headers_releases_branch_activity(pool_env, 
 
     assert gw._in_flight_count == {}
     assert gw._branch_open_responses == {}
+    assert gw._branch_pending_attempts == {}
     assert gw.serving_now_ids() == set()
 
 

@@ -119,6 +119,7 @@ class RoutingDecision:
     # too: "transient_failover", "manual_override", "branch_pinned", "subagent_forced", and the
     # pinned-Profile set "forced" | "forced_profile_missing" | "forced_profile_disabled" |
     # "forced_profile_needs_reauth". Anything reading .reason has to expect all of them.
+    reserved: bool = False  # gateway.py: this branch decision owns one pending reservation
 
 
 @dataclass(frozen=True)

@@ -1745,157 +1745,158 @@ class Gateway:
             # The Profile a pinned request is held to: the pin itself, or —
             # for a subagent — the "Forced in subagents" Profile.
             held_to = forced_profile_id
-            with self._lock:
-                pool = load_pool()
-                snapshot = self._sync_snapshot(pool, request_effort, _requested_model(parsed_request))
-                pre_recovery_states = {rt.profile_id: rt.state for rt in snapshot.profiles}
-                snapshot = recover_expired_cooldowns(snapshot, now)
-                self._runtime = {rt.profile_id: rt for rt in snapshot.profiles}
-                snapshot = self._maybe_return_to_preferred(pool, snapshot)
-                if forced_profile_id is not None:
-                    # An explicit --profile pin outranks everything: it must
-                    # never be silently substituted, not even by a branch pin.
-                    # One deliberate exception: a subagent goes to the Profile
-                    # marked "Forced in subagents", when there is one. That flag
-                    # is the more specific choice — "orchestrate on this
-                    # account, run the workers on that one" — and it is taken
-                    # just as strictly as the pin: if that Profile cannot
-                    # serve, the subagent fails; it is never rerouted. A
-                    # DISABLED holder counts as no holder: subagents then
-                    # follow the pin, as they do when nothing is flagged.
-                    subagent_target = self._forced_subagent_profile(pool) if is_subagent else None
-                    if subagent_target is not None:
-                        held_to = subagent_target.id
-                    decision = self._forced_decision(pool, held_to, now, fit)
-                else:
-                    decision = self._branch_decision(
-                        pool, snapshot, now, branch, is_subagent, parent_agent_id,
-                        attempted, distribute, may_create_pin, moves=branch_moves,
-                        app_pinned=app_pinned, fit=fit)
-            # Remember branch_routed before the reason is rewritten to
-            # transient_failover: the attempt still belongs to the branch and
-            # must open/close its branch response count.
-            branch_routed = decision.reason in _BRANCH_ROUTED_REASONS
-            if decision.reason == "fable_limit_no_alternative" and decision.profile_id is not None:
-                self._note_fable_limit_served_anyway(pool, decision.profile_id, now,
-                                                     "no other account can take the session — served anyway")
-
-            for rt in snapshot.profiles:
-                if pre_recovery_states.get(rt.profile_id) in _QUOTA_RESET_SOURCE_STATES and rt.state == ProfileState.ELIGIBLE:
-                    self._warned_approaching.discard(rt.profile_id)
-                    name = self._profile_name(pool, rt.profile_id)
-                    activity.record("rotation", f"{name} quota reset — eligible again")
-                    notifications.notify_if_enabled("quota_reset", "Claude Unlimited",
-                                                      f"{name} is available again.", pool.settings)
-
-            if retry_excluding_attempted:
-                retry_excluding_attempted = False
-                if not branch_routed:
-                    # Ordinary requests keep the existing global sticky
-                    # selector. Branch-routed requests already went through
-                    # _branch_decision above, which excludes every Profile
-                    # in `attempted` and applies forced-subagent routing plus
-                    # the least-loaded branch tie-break.
-                    decision = choose(snapshot, now, fit=fit, exclude=attempted)
-                if decision.profile_id is not None:
-                    if branch_routed and branch is not None:
-                        # _branch_decision already re-pinned message traffic
-                        # to this branch-aware choice. Mark the move as the
-                        # transient-429 failover, while the response wrapper
-                        # remains owned by the Profile that actually serves.
-                        if branch_moves:
-                            from_id, _, _ = branch_moves[-1]
-                            branch_moves[-1] = (from_id, decision.profile_id, "transient_429")
-                    decision = RoutingDecision(profile_id=decision.profile_id, reason="transient_failover")
-
-            for from_id, to_id, why in branch_moves:
-                self._record_branch_move(pool, from_id, to_id, why)
-            branch_moves.clear()
-
-            if decision.reason == "no_profile_fits_request" and guard is not None:
-                # Capacity exists; no account that may take this request can
-                # HOLD it. Not a 503 (Claude Code would hold for ten minutes
-                # and retry the same body) but the one error it recovers
-                # from: an Anthropic-shaped prompt-too-long, on which it
-                # compacts and re-sends — to the same pinned account, or to
-                # whichever one the smaller conversation then fits.
-                return self._prompt_too_long_result(pool, snapshot, guard, headers, branch,
-                                                    held_to)
-
-            if decision.profile_id is None or decision.profile_id in attempted:
-                if forced_profile_id is not None:
-                    activity.record("error", "Pinned Profile unavailable — request rejected",
-                                     meta=f"{held_to}: {decision.reason}, "
-                                          f"client={_client_label(headers)}")
-                    return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
-                                          error=decision.reason)
-                exhausted, resets_at = _capacity_exhaustion(snapshot, pool)
-                # Said ONCE per outage, not once per request: a client that
-                # retries in a loop used to write an Activity line and raise a
-                # notification every time, burying the one line that mattered.
-                if not self._exhaustion_announced:
-                    self._exhaustion_announced = True
-                    if exhausted:
-                        text = "All Profiles are out of capacity — requests rejected"
-                        note = _exhaustion_message(resets_at)
-                    else:
-                        text = "No eligible Profile available — requests rejected"
-                        note = "No eligible Profile is available — requests are being rejected."
-                    activity.record("error", text,
-                                     meta=f"last active was {previous_profile_id}, "
-                                          f"client={_client_label(headers)}")
-                    notifications.notify_if_enabled("needs_attention", "Claude Unlimited", note,
-                                                      pool.settings)
-                # 429, not 503: an empty pool (every account exhausted or
-                # cooling down) is a quota condition local to this daemon,
-                # not the provider being overloaded. Claude Code treats
-                # 503/overloaded_error as transient capacity and silently
-                # retries for minutes before surfacing anything — measured
-                # as a ~12-minute hang ending in "Repeated 529 Overloaded
-                # errors" for what was actually "your quota is gone."
-                # daemon.py maps this status + the no_eligible_profile/
-                # all_profiles_exhausted marker to {"type": "rate_limit_error"}
-                # for the client. 429/rate_limit_error ONLY when the pool is
-                # empty for a QUOTA reason -- something is exhausted, draining
-                # or cooling down, i.e. "come back later" is the honest answer
-                # and a Retry-After means something. When every Profile is
-                # instead AUTH_INVALID, disabled, or there are none configured
-                # at all, "rate limited" is simply false: the account needs
-                # re-authentication or the user needs to add one, and nothing
-                # improves by waiting. Those keep the original 503 mapping
-                # untouched -- deliberately NOT "improved" here, because that
-                # path was never measured and guessing at it is how this
-                # branch got its first bug.
-                quota_blocked = any(
-                    rt.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING, ProfileState.COOLDOWN)
-                    for rt in snapshot.profiles
-                )
-                if not quota_blocked:
-                    return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
-                                          error="no_usable_profile")
-                # Retry-After always comes from the already-truthful,
-                # already-capped helper (_MAX_TRUTHFUL_RETRY_AFTER_SECONDS).
-                # A separate uncapped "wait = resets_at - now" computation
-                # used to run first when `exhausted` was set, bypassing the
-                # cap entirely -- a 7-day (or year-2999) resets_at produced a
-                # Retry-After of hundreds of thousands of seconds instead of
-                # the omission test_far_off_deadline_omits_retry_after_rather_than_lying
-                # requires. One source of truth for both the exhausted and
-                # the merely-quota_blocked cases.
-                error_headers = {}
-                retry_after_seconds = _pool_retry_after_seconds(snapshot, now)
-                if retry_after_seconds is not None:
-                    error_headers["retry-after"] = str(retry_after_seconds)
-                return GatewayResult(status=429, headers=error_headers, body_chunks=None, profile_id=None,
-                                      error=("all_profiles_exhausted" if exhausted else "no_eligible_profile"),
-                                      error_detail=_exhaustion_message(resets_at) if exhausted else None)
-
             pending_attempt: Optional[_BranchPinAttempt] = None
-            if branch_routed and branch is not None and decision.profile_id is not None:
-                with self._lock:
-                    pending_attempt = self._branch_attempt_owner_locked(
-                        branch, decision.profile_id)
             try:
+                with self._lock:
+                    pool = load_pool()
+                    snapshot = self._sync_snapshot(pool, request_effort, _requested_model(parsed_request))
+                    pre_recovery_states = {rt.profile_id: rt.state for rt in snapshot.profiles}
+                    snapshot = recover_expired_cooldowns(snapshot, now)
+                    self._runtime = {rt.profile_id: rt for rt in snapshot.profiles}
+                    snapshot = self._maybe_return_to_preferred(pool, snapshot)
+                    if forced_profile_id is not None:
+                        # An explicit --profile pin outranks everything: it must
+                        # never be silently substituted, not even by a branch pin.
+                        # One deliberate exception: a subagent goes to the Profile
+                        # marked "Forced in subagents", when there is one. That flag
+                        # is the more specific choice — "orchestrate on this
+                        # account, run the workers on that one" — and it is taken
+                        # just as strictly as the pin: if that Profile cannot
+                        # serve, the subagent fails; it is never rerouted. A
+                        # DISABLED holder counts as no holder: subagents then
+                        # follow the pin, as they do when nothing is flagged.
+                        subagent_target = self._forced_subagent_profile(pool) if is_subagent else None
+                        if subagent_target is not None:
+                            held_to = subagent_target.id
+                        decision = self._forced_decision(pool, held_to, now, fit)
+                    else:
+                        decision = self._branch_decision(
+                            pool, snapshot, now, branch, is_subagent, parent_agent_id,
+                            attempted, distribute, may_create_pin, moves=branch_moves,
+                            app_pinned=app_pinned, fit=fit)
+                    if (decision.reserved and branch is not None
+                            and decision.profile_id is not None):
+                        pending_attempt = self._branch_attempt_owner_locked(
+                            branch, decision.profile_id, decision.reserved)
+                # Remember branch_routed before the reason is rewritten to
+                # transient_failover: the attempt still belongs to the branch and
+                # must open/close its branch response count.
+                branch_routed = decision.reason in _BRANCH_ROUTED_REASONS
+                if decision.reason == "fable_limit_no_alternative" and decision.profile_id is not None:
+                    self._note_fable_limit_served_anyway(pool, decision.profile_id, now,
+                                                         "no other account can take the session — served anyway")
+
+                for rt in snapshot.profiles:
+                    if pre_recovery_states.get(rt.profile_id) in _QUOTA_RESET_SOURCE_STATES and rt.state == ProfileState.ELIGIBLE:
+                        self._warned_approaching.discard(rt.profile_id)
+                        name = self._profile_name(pool, rt.profile_id)
+                        activity.record("rotation", f"{name} quota reset — eligible again")
+                        notifications.notify_if_enabled("quota_reset", "Claude Unlimited",
+                                                          f"{name} is available again.", pool.settings)
+
+                if retry_excluding_attempted:
+                    retry_excluding_attempted = False
+                    if not branch_routed:
+                        # Ordinary requests keep the existing global sticky
+                        # selector. Branch-routed requests already went through
+                        # _branch_decision above, which excludes every Profile
+                        # in `attempted` and applies forced-subagent routing plus
+                        # the least-loaded branch tie-break.
+                        decision = choose(snapshot, now, fit=fit, exclude=attempted)
+                    if decision.profile_id is not None:
+                        if branch_routed and branch is not None:
+                            # _branch_decision already re-pinned message traffic
+                            # to this branch-aware choice. Mark the move as the
+                            # transient-429 failover, while the response wrapper
+                            # remains owned by the Profile that actually serves.
+                            if branch_moves:
+                                from_id, _, _ = branch_moves[-1]
+                                branch_moves[-1] = (from_id, decision.profile_id, "transient_429")
+                        decision = RoutingDecision(profile_id=decision.profile_id, reason="transient_failover",
+                                                   reserved=decision.reserved)
+
+                for from_id, to_id, why in branch_moves:
+                    self._record_branch_move(pool, from_id, to_id, why)
+                branch_moves.clear()
+
+                if decision.reason == "no_profile_fits_request" and guard is not None:
+                    # Capacity exists; no account that may take this request can
+                    # HOLD it. Not a 503 (Claude Code would hold for ten minutes
+                    # and retry the same body) but the one error it recovers
+                    # from: an Anthropic-shaped prompt-too-long, on which it
+                    # compacts and re-sends — to the same pinned account, or to
+                    # whichever one the smaller conversation then fits.
+                    return self._prompt_too_long_result(pool, snapshot, guard, headers, branch,
+                                                        held_to)
+
+                if decision.profile_id is None or decision.profile_id in attempted:
+                    if forced_profile_id is not None:
+                        activity.record("error", "Pinned Profile unavailable — request rejected",
+                                         meta=f"{held_to}: {decision.reason}, "
+                                              f"client={_client_label(headers)}")
+                        return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
+                                              error=decision.reason)
+                    exhausted, resets_at = _capacity_exhaustion(snapshot, pool)
+                    # Said ONCE per outage, not once per request: a client that
+                    # retries in a loop used to write an Activity line and raise a
+                    # notification every time, burying the one line that mattered.
+                    if not self._exhaustion_announced:
+                        self._exhaustion_announced = True
+                        if exhausted:
+                            text = "All Profiles are out of capacity — requests rejected"
+                            note = _exhaustion_message(resets_at)
+                        else:
+                            text = "No eligible Profile available — requests rejected"
+                            note = "No eligible Profile is available — requests are being rejected."
+                        activity.record("error", text,
+                                         meta=f"last active was {previous_profile_id}, "
+                                              f"client={_client_label(headers)}")
+                        notifications.notify_if_enabled("needs_attention", "Claude Unlimited", note,
+                                                          pool.settings)
+                    # 429, not 503: an empty pool (every account exhausted or
+                    # cooling down) is a quota condition local to this daemon,
+                    # not the provider being overloaded. Claude Code treats
+                    # 503/overloaded_error as transient capacity and silently
+                    # retries for minutes before surfacing anything — measured
+                    # as a ~12-minute hang ending in "Repeated 529 Overloaded
+                    # errors" for what was actually "your quota is gone."
+                    # daemon.py maps this status + the no_eligible_profile/
+                    # all_profiles_exhausted marker to {"type": "rate_limit_error"}
+                    # for the client. 429/rate_limit_error ONLY when the pool is
+                    # empty for a QUOTA reason -- something is exhausted, draining
+                    # or cooling down, i.e. "come back later" is the honest answer
+                    # and a Retry-After means something. When every Profile is
+                    # instead AUTH_INVALID, disabled, or there are none configured
+                    # at all, "rate limited" is simply false: the account needs
+                    # re-authentication or the user needs to add one, and nothing
+                    # improves by waiting. Those keep the original 503 mapping
+                    # untouched -- deliberately NOT "improved" here, because that
+                    # path was never measured and guessing at it is how this
+                    # branch got its first bug.
+                    quota_blocked = any(
+                        rt.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING, ProfileState.COOLDOWN)
+                        for rt in snapshot.profiles
+                    )
+                    if not quota_blocked:
+                        return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
+                                              error="no_usable_profile")
+                    # Retry-After always comes from the already-truthful,
+                    # already-capped helper (_MAX_TRUTHFUL_RETRY_AFTER_SECONDS).
+                    # A separate uncapped "wait = resets_at - now" computation
+                    # used to run first when `exhausted` was set, bypassing the
+                    # cap entirely -- a 7-day (or year-2999) resets_at produced a
+                    # Retry-After of hundreds of thousands of seconds instead of
+                    # the omission test_far_off_deadline_omits_retry_after_rather_than_lying
+                    # requires. One source of truth for both the exhausted and
+                    # the merely-quota_blocked cases.
+                    error_headers = {}
+                    retry_after_seconds = _pool_retry_after_seconds(snapshot, now)
+                    if retry_after_seconds is not None:
+                        error_headers["retry-after"] = str(retry_after_seconds)
+                    return GatewayResult(status=429, headers=error_headers, body_chunks=None, profile_id=None,
+                                          error=("all_profiles_exhausted" if exhausted else "no_eligible_profile"),
+                                          error_detail=_exhaustion_message(resets_at) if exhausted else None)
+
                 profile = pool.get(decision.profile_id)
                 attempted.add(profile.id)
                 if self._exhaustion_announced:
@@ -4021,8 +4022,9 @@ class Gateway:
         return any(response_key[0] == key and count > 0
                    for response_key, count in self._branch_pending_attempts.items())
 
-    def _branch_attempt_owner_locked(self, key: tuple, profile_id: str) -> Optional[_BranchPinAttempt]:
-        if self._branch_pending_attempts.get((key, profile_id), 0) <= 0:
+    def _branch_attempt_owner_locked(self, key: tuple, profile_id: str,
+                                     reserved: bool) -> Optional[_BranchPinAttempt]:
+        if not reserved:
             return None
         return _BranchPinAttempt(self, key, profile_id)
 
@@ -4314,7 +4316,8 @@ class Gateway:
                                 reserve_pending=reserve_pending)
         if pinned is not None:
             # Same account as last turn -> its prompt cache is still warm.
-            return RoutingDecision(profile_id=pinned, reason="branch_pinned")
+            return RoutingDecision(profile_id=pinned, reason="branch_pinned",
+                                   reserved=reserve_pending)
         # A pin that is still in the map here is live but unusable (its
         # Profile isn't ELIGIBLE, or failed this request): re-assigning it is a
         # move, reported through `moves`. Expired pins were already dropped.
@@ -4351,7 +4354,8 @@ class Gateway:
                 if may_create_pin:
                     self._remember_pin(key, forced_profile.id, parent_agent_id,
                                        reserve_pending=reserve_pending)
-                return RoutingDecision(profile_id=forced_profile.id, reason="subagent_forced")
+                return RoutingDecision(profile_id=forced_profile.id, reason="subagent_forced",
+                                       reserved=reserve_pending)
 
         decision = choose_for_new_branch(snapshot, now, self._branch_counts(),
                                           exclude=frozenset(attempted), fit=fit)
@@ -4359,6 +4363,9 @@ class Gateway:
         if decision.profile_id is not None and may_create_pin:
             self._remember_pin(key, decision.profile_id, parent_agent_id,
                                reserve_pending=reserve_pending)
+        if decision.profile_id is not None and may_create_pin and reserve_pending:
+            return RoutingDecision(profile_id=decision.profile_id, reason=decision.reason,
+                                   reserved=True)
         return decision
 
     # Polling gives up to ~10 minutes of staleness, during

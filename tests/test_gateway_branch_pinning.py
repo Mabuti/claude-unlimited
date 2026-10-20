@@ -345,6 +345,130 @@ def test_transient_429_branch_failover_pins_the_profile_that_serves(pool_env, mo
             for pin in gw.branch_pins()] == [("ag1", "b", True)]
     assert gw.live_agent_counts() == {"b": 1}
     assert moves == [("a", "b", "transient_429")]
+    assert gw._branch_pending_attempts == {}
+
+
+def test_attempt_owned_reservation_survives_repin_ancillary_retry_and_cap_trim(pool_env, monkeypatch):
+    monkeypatch.setattr(gateway_module, "BRANCH_PIN_CAP", 1)
+    save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2)]))
+    calls = []
+    a_setup_started = threading.Event()
+    allow_a_setup = threading.Event()
+    a_thread = []
+    a_results = []
+    a_errors = []
+
+    def get_token(profile_id):
+        if a_thread and threading.current_thread() is a_thread[0]:
+            a_setup_started.set()
+            assert allow_a_setup.wait(2)
+        return f"tok-{profile_id}"
+
+    def transport(req):
+        profile_id = next(pid for pid in ("a", "b") if f"tok-{pid}" in str(req.headers))
+        calls.append(profile_id)
+        if len(calls) in (1, 3):
+            return fake_response(429, {"x-should-retry": "true"})
+        return fake_response(200, HEALTHY)
+
+    monkeypatch.setattr(gateway_module.secret_store, "get_token", get_token)
+    gw = Gateway(transport=transport)
+
+    def run_a():
+        a_thread.append(threading.current_thread())
+        try:
+            a_results.append(gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}",
+                                       distribute=True))
+        except BaseException as exc:
+            a_errors.append(exc)
+
+    worker = threading.Thread(target=run_a)
+    worker.start()
+    assert a_setup_started.wait(2)
+    key = ("s1", "ag1")
+
+    try:
+        b_result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+        assert b_result.profile_id == "b"
+        b_result.body_chunks.close()
+
+        c_result = gw.handle("POST", "/v1/messages/count_tokens", hdrs(agent="ag1"), b"{}",
+                              distribute=True)
+        assert c_result.profile_id == "a"
+        c_result.body_chunks.close()
+
+        d_result = gw.handle("POST", "/v1/messages", hdrs(agent="D"), b"{}", distribute=True)
+        d_result.body_chunks.close()
+
+        with gw._lock:
+            assert key in gw._branch_pins
+            assert gw._branch_pins[key].profile_id == "b"
+            assert gw._branch_pending_attempts[(key, "a")] == 1
+    finally:
+        allow_a_setup.set()
+        worker.join(2)
+
+    assert not worker.is_alive()
+    assert a_errors == []
+    assert len(a_results) == 1
+    with gw._lock:
+        assert (key, "a") not in gw._branch_pending_attempts
+        assert gw._branch_open_responses[(key, "a")] == 1
+    a_results[0].body_chunks.close()
+
+
+def test_non_reserving_branch_assignment_does_not_change_pending(pool_env):
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    gw = healthy_gateway()
+    pool = load_pool()
+    key = ("s1", "ancillary")
+    with gw._lock:
+        snapshot = gw._sync_snapshot(pool)
+        decision = gw._branch_decision(
+            pool, snapshot, datetime.now(timezone.utc), key, False, None, set(),
+            distribute=True, may_create_pin=False)
+
+        assert decision.reason == "branch_assigned"
+        assert decision.reserved is False
+        assert gw._branch_pending_attempts == {}
+        assert key not in gw._branch_pins
+
+
+def test_branch_reservation_released_when_move_recording_raises(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    gw = healthy_gateway()
+    first = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+    list(first.body_chunks)
+    first.body_chunks.close()
+
+    with gw._lock:
+        old_profile = gw._branch_pins[("s1", "ag1")].profile_id
+        gw._runtime[old_profile].state = ProfileState.EXHAUSTED
+
+    def fail_move(*_args):
+        raise RuntimeError("move recording failed")
+
+    monkeypatch.setattr(gw, "_record_branch_move", fail_move)
+    with pytest.raises(RuntimeError, match="move recording failed"):
+        gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+
+    with gw._lock:
+        assert gw._branch_pending_attempts == {}
+
+
+def test_quota_exhaustion_releases_branch_reservation(pool_env):
+    reset = int((datetime.now(timezone.utc).timestamp()) + 300)
+    save_pool(Pool(profiles=[prof("a")]))
+
+    gw = Gateway(transport=lambda req: fake_response(
+        429, {"anthropic-ratelimit-unified-5h-status": "rejected",
+              "anthropic-ratelimit-unified-5h-reset": str(reset)}))
+    result = gw.handle("POST", "/v1/messages", hdrs(agent="ag1"), b"{}", distribute=True)
+
+    assert result.status == 429
+    with gw._lock:
+        assert gw._branch_pending_attempts == {}
+        assert gw._branch_open_responses == {}
 
 
 def test_transient_429_branch_retry_honors_forced_subagent_profile(pool_env, monkeypatch):
