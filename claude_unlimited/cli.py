@@ -2341,9 +2341,10 @@ def _fetch_live_profiles(host: str, port: int, timeout: float = 2.0) -> Optional
 
 
 def reauth(port: int, profile_id: Optional[str] = None) -> int:
-    """`claude-unlimited reauth`: re-authenticates an OAuth Profile,
-    defaulting to whichever ones the running daemon reports as AUTH_INVALID,
-    with the same interactive picker `code --profile` uses.
+    """`claude-unlimited reauth`: re-authenticates an OAuth Profile.
+
+    With `--profile <id>`, it targets that Profile directly; without the flag,
+    it offers an interactive picker among Profiles that need re-authentication.
 
     Reuses the Profile's isolated claude_config_dir, set when it was added,
     so re-authenticating logs back into the same account rather than an
@@ -2398,7 +2399,12 @@ def reauth(port: int, profile_id: Optional[str] = None) -> int:
     if profile_id is not None:
         target = next((p for p in pool.profiles if p.id == profile_id), None)
         if target is None:
-            print(f"No Profile with id {profile_id!r} exists.", file=sys.stderr)
+            print(
+                f"No Profile with id {profile_id!r} exists. The id is the one shown in the "
+                "Overview card's command; run `claude-unlimited reauth` without `--profile` "
+                "to choose from a picker.",
+                file=sys.stderr,
+            )
             return 1
         if target.kind != "oauth":
             print(f"Profile {profile_id!r} is not an OAuth Profile; reauth only supports OAuth Profiles.",
@@ -2441,7 +2447,7 @@ def reauth(port: int, profile_id: Optional[str] = None) -> int:
         else:
             print("Which Profile needs re-authenticating?\n")
             for i, p in enumerate(candidates, start=1):
-                print(f"  [{i}] {p.name}")
+                print(f"  [{i}] {p.name} (id: {p.id})")
             print()
             try:
                 raw = input(f"Choice [1-{len(candidates)}]: ").strip()

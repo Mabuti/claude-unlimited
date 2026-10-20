@@ -195,19 +195,19 @@ def test_spawn_failure_returns_copyable_fallback(running_server, monkeypatch):
     }
 
 
-def test_wsl_uses_windows_terminal_and_wsl_distro(monkeypatch):
+def test_wsl_uses_cmd_start_without_windows_terminal(monkeypatch):
     argv = _capture_terminal(
         monkeypatch, platform="linux", wsl=True, distro="Ubuntu-22.04",
         available={"cmd.exe": "/mnt/c/Windows/System32/cmd.exe", "wt.exe": "/mnt/c/Windows/wt.exe"},
     )
 
-    # "--" re-parses through the default shell; "--exec" preserves the intended argv.
-    assert argv[:10] == [
-        "/mnt/c/Windows/System32/cmd.exe", "/c", "start", "", "wt.exe",
-        "wsl.exe", "-d", "Ubuntu-22.04", "--exec", daemon._reauth_login_shell(),
+    assert argv[:9] == [
+        "/mnt/c/Windows/System32/cmd.exe", "/c", "start", "", "wsl.exe",
+        "-d", "Ubuntu-22.04", "--exec", daemon._reauth_login_shell(),
     ]
-    assert argv[10] == "-lic"
-    assert shlex.join([sys.executable, "-m", "claude_unlimited", "reauth", "--profile", "deadbeef"]) in argv[11]
+    assert argv[9] == "-lic"
+    assert shlex.join([sys.executable, "-m", "claude_unlimited", "reauth", "--profile", "deadbeef"]) in argv[10]
+    assert all(item != "wt.exe" for item in argv)
 
 
 def test_wsl_falls_back_to_cmd_start(monkeypatch):
@@ -216,11 +216,11 @@ def test_wsl_falls_back_to_cmd_start(monkeypatch):
         available={"cmd.exe": "/mnt/c/Windows/System32/cmd.exe"},
     )
 
-    assert argv == [
+    assert argv[:10] == [
         "/mnt/c/Windows/System32/cmd.exe", "/c", "start", "", "wsl.exe", "-d", "Ubuntu", "--exec",
         daemon._reauth_login_shell(), "-lic",
-        argv[-1],
     ]
+    assert argv[-1] == argv[10]
     assert shlex.join([sys.executable, "-m", "claude_unlimited", "reauth", "--profile", "deadbeef"]) in argv[-1]
 
 
@@ -246,8 +246,20 @@ def test_native_windows_uses_wt_when_available(monkeypatch):
     )
 
     assert argv == [
-        r"C:\\Windows\\wt.exe", sys.executable, "-m", "claude_unlimited",
+        r"C:\\Windows\\wt.exe", "cmd.exe", "/k", sys.executable, "-m", "claude_unlimited",
         "reauth", "--profile", "deadbeef",
+    ]
+
+
+def test_native_windows_cmd_fallback_keeps_window_open(monkeypatch):
+    argv = _capture_terminal(
+        monkeypatch, platform="win32",
+        available={"cmd.exe": r"C:\\Windows\\System32\\cmd.exe"},
+    )
+
+    assert argv == [
+        r"C:\\Windows\\System32\\cmd.exe", "/c", "start", "", "cmd.exe", "/k",
+        sys.executable, "-m", "claude_unlimited", "reauth", "--profile", "deadbeef",
     ]
 
 
@@ -317,7 +329,7 @@ def test_wsl_resolves_distro_from_wslpath_when_environment_is_missing(
         spawn_meta=spawn_meta,
     )
 
-    assert argv[5:8] == ["wsl.exe", "-d", expected_distro]
+    assert argv[4:7] == ["wsl.exe", "-d", expected_distro]
     assert "-d" in argv
     assert wslpath_meta == {
         "argv": ["/usr/bin/wslpath", "-w", "/"],
@@ -360,7 +372,28 @@ def test_wsl_uses_fixed_cmd_path_when_cmd_is_not_on_path(monkeypatch):
     )
 
     assert argv[0] == "/mnt/c/Windows/System32/cmd.exe"
-    assert argv[4] == "wt.exe"
+    assert argv[4] == "wsl.exe"
+
+
+def test_wsl_cmd_uses_wslpath_for_custom_automount_root(monkeypatch):
+    wslpath_meta = {}
+    monkeypatch.setattr(daemon.shutil, "which", lambda name: {
+        "wslpath": "/usr/bin/wslpath",
+    }.get(name))
+
+    def fake_run(argv, **kwargs):
+        wslpath_meta.update(argv=argv, kwargs=kwargs)
+        return SimpleNamespace(stdout="/custom/windows/System32/cmd.exe\n")
+
+    monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+    monkeypatch.setattr(daemon.os.path, "isfile",
+                        lambda path: path == "/custom/windows/System32/cmd.exe")
+
+    assert daemon._wsl_cmd_executable() == "/custom/windows/System32/cmd.exe"
+    assert wslpath_meta == {
+        "argv": ["/usr/bin/wslpath", "-u", r"C:\Windows\System32\cmd.exe"],
+        "kwargs": {"capture_output": True, "text": True, "timeout": 2, "check": True},
+    }
 
 
 def test_linux_launcher_uses_the_login_interactive_shell_and_keeps_window_open(monkeypatch):
@@ -413,7 +446,7 @@ def test_native_windows_replaces_pythonw_with_sibling_python(monkeypatch, tmp_pa
 
     assert launched is True
     assert reason is None
-    assert calls == [[r"C:\\Windows\\wt.exe", str(python), "-m", "claude_unlimited",
+    assert calls == [[r"C:\\Windows\\wt.exe", "cmd.exe", "/k", str(python), "-m", "claude_unlimited",
                       "reauth", "--profile", "deadbeef"]]
 
 

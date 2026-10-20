@@ -1639,11 +1639,14 @@ function renderReauthAction(p) {
     ${status ? `<span class="p-reauth-note">${esc(status)}</span>` : ''}
     <button type="button" class="btn danger p-reauth-btn" data-action="reauth">${esc(t('profile.reauth'))}</button>
     <div class="p-reauth-command">
-      <code>${esc(command)}</code>
-      <button type="button" class="copy-btn" data-action="copy-reauth" data-command="${esc(command)}">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
-        <span>${esc(t('settings.network.copy'))}</span>
-      </button>
+      <span class="p-reauth-command-caption">${esc(t('profile.reauth_command_caption'))}</span>
+      <div class="p-reauth-command-row">
+        <code>${esc(command)}</code>
+        <button type="button" class="copy-btn" data-action="copy-reauth" data-command="${esc(command)}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+          <span>${esc(t('settings.network.copy'))}</span>
+        </button>
+      </div>
     </div>
     ${reason}
   </div>`;

@@ -40,6 +40,8 @@ def test_reauth_action_keeps_button_command_and_copy_control_in_every_mode():
     assert body.count('data-action="reauth"') == 1
     assert body.count('data-action="copy-reauth"') == 1
     assert "${esc(command)}" in body
+    assert "profile.reauth_command_caption" in body
+    assert "p-reauth-command-caption" in body
 
 
 def test_reauth_fallback_reason_is_escaped_and_rendered_under_command():
@@ -58,7 +60,10 @@ def test_profile_refresh_removes_stale_reauth_ui_state():
 
 
 def test_reauth_strings_exist_in_every_locale():
-    required = {"profile.reauth", "profile.reauth_opened", "profile.reauth_fallback"}
+    required = {
+        "profile.reauth", "profile.reauth_opened", "profile.reauth_fallback",
+        "profile.reauth_command_caption",
+    }
     locale_dir = daemon._STATIC_DIR.parent / "locales"
     for path in sorted(locale_dir.glob("*.json")):
         strings = json.loads(path.read_text(encoding="utf-8"))

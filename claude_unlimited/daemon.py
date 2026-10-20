@@ -142,13 +142,22 @@ def _is_wsl() -> bool:
 
 
 def _reauth_command(profile_id: str) -> list[str]:
-    """The only command the Dashboard is allowed to launch for re-auth."""
+    """Return the fixed interpreter argv used to spawn Dashboard re-auth.
+
+    The card always shows the console-script line from
+    :func:`_reauth_display_command`; the spawned command uses this process's
+    interpreter so a user service does not depend on PATH.
+    """
     executable = _reauth_interpreter() or sys.executable
     return [executable, "-m", "claude_unlimited", "reauth", "--profile", profile_id]
 
 
 def _reauth_display_command(profile_id: str) -> str:
-    """The copyable command shown when no terminal can be opened."""
+    """Return the console-script line always shown on the re-auth card.
+
+    The launcher itself uses the current process's interpreter so a user
+    service does not depend on PATH.
+    """
     return f"claude-unlimited reauth --profile {profile_id}"
 
 
@@ -236,10 +245,28 @@ def _wsl_distro() -> Optional[str]:
 
 
 def _wsl_cmd_executable() -> Optional[str]:
-    """Find cmd.exe from PATH, then from WSL's fixed Windows system path."""
+    """Find cmd.exe from PATH, wslpath, then WSL's fixed system path."""
     cmd = shutil.which("cmd.exe")
     if cmd:
         return cmd
+    wslpath = shutil.which("wslpath")
+    if wslpath:
+        try:
+            result = subprocess.run(
+                [wslpath, "-u", r"C:\Windows\System32\cmd.exe"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result is not None:
+            output = result.stdout
+            if isinstance(output, str):
+                derived_cmd = output.strip()
+                if derived_cmd and os.path.isfile(derived_cmd):
+                    return derived_cmd
     fixed_cmd = "/mnt/c/Windows/System32/cmd.exe"
     return fixed_cmd if os.path.isfile(fixed_cmd) else None
 
@@ -273,28 +300,22 @@ def _launch_reauth_terminal(profile_id: str) -> tuple[bool, Optional[str]]:
         cmd = _wsl_cmd_executable()
         if cmd:
             shell_argv = _reauth_shell_argv(command_argv)
-            if shutil.which("wt.exe"):
-                # Windows Terminal's `wsl.exe` is a subcommand here. Keeping
-                # `-d` after it prevents wt.exe from treating the distro as
-                # its own starting-directory argument. See Microsoft's
-                # Windows Terminal command-line documentation:
-                # https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments
-                launch_argv = [cmd, "/c", "start", "", "wt.exe", "wsl.exe", "-d", distro,
-                               "--exec", *shell_argv]
-            else:
-                launch_argv = [cmd, "/c", "start", "", "wsl.exe", "-d", distro,
-                               "--exec", *shell_argv]
+            # Windows Terminal treats unescaped semicolons in its command
+            # line as command delimiters, so run the proven cmd/start form
+            # directly and let wsl.exe create the terminal window.
+            launch_argv = [cmd, "/c", "start", "", "wsl.exe", "-d", distro,
+                           "--exec", *shell_argv]
             launch_cwd = "/mnt/c/Windows"
         else:
             reason = "cmd.exe is not available."
     elif sys.platform == "win32":
         wt = shutil.which("wt.exe")
         if wt:
-            launch_argv = [wt, *command_argv]
+            launch_argv = [wt, "cmd.exe", "/k", *command_argv]
         else:
             cmd = shutil.which("cmd.exe")
             if cmd:
-                launch_argv = [cmd, "/c", "start", "", *command_argv]
+                launch_argv = [cmd, "/c", "start", "", "cmd.exe", "/k", *command_argv]
             else:
                 reason = "Neither wt.exe nor cmd.exe is available."
     elif sys.platform == "darwin":
