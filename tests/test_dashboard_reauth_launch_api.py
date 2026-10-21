@@ -312,6 +312,8 @@ def test_spawn_error_is_reported_as_launcher_failure(monkeypatch):
 def test_wsl_resolves_distro_from_wslpath_when_environment_is_missing(
     monkeypatch, wslpath_output, expected_distro
 ):
+    monkeypatch.setattr(daemon.os.path, "isdir",
+                        lambda path: path == "/mnt/c/Windows")
     wslpath_meta = {}
     spawn_meta = {}
     argv = _capture_terminal(
@@ -336,6 +338,22 @@ def test_wsl_resolves_distro_from_wslpath_when_environment_is_missing(
         "kwargs": {"capture_output": True, "text": True, "timeout": 2, "check": True},
     }
     assert spawn_meta == {"cwd": "/mnt/c/Windows"}
+
+
+def test_wsl_omits_cwd_when_windows_directory_is_missing(monkeypatch):
+    spawn_meta = {}
+    monkeypatch.setattr(daemon.os.path, "isdir", lambda path: False)
+
+    _capture_terminal(
+        monkeypatch,
+        platform="linux",
+        wsl=True,
+        distro="Ubuntu",
+        available={"cmd.exe": "/mnt/c/Windows/System32/cmd.exe"},
+        spawn_meta=spawn_meta,
+    )
+
+    assert "cwd" not in spawn_meta
 
 
 def test_wsl_without_a_distro_falls_back_without_spawning(monkeypatch):
