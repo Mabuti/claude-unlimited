@@ -1211,7 +1211,7 @@ Every command below also works under the short alias **`cu`** — e.g. `cu code`
 | `claude-unlimited doctor` | Checks your install, credential storage, and config. Run it first, and whenever something seems off. |
 | `claude-unlimited add-account` | Adds a Claude subscription via browser login. Isolated — never disturbs your existing `claude` login. |
 | `claude-unlimited add-codex-account` | Same, for a ChatGPT/Codex subscription. |
-| `claude-unlimited reauth` | Re-authenticates an account that needs it. Logs back into the *same* account, never a new one. |
+| `claude-unlimited reauth [--profile <id>]` | The **Reauth** button and command appear on **Overview** cards of Claude OAuth (subscription) Profiles that need re-auth. Without `--profile`, it offers a picker; with it, use the Profile's **id**, not its display name. Clicking **Reauth** opens a terminal: on WSL and Linux desktops it runs this install's reauth in a login shell, so `claude` is on `PATH`; on Windows and macOS it opens a new terminal running this install's interpreter. The command on the card is the one to paste into your own terminal on every platform. |
 
 </details>
 
@@ -1289,11 +1289,20 @@ message *No eligible Profile is available*, because that one is a configuration 
 <summary><b>An account says "needs re-auth"</b></summary>
 <br>
 
-Usually it fixes itself — tokens are refreshed in the background whether or not an account
-is currently in rotation. If it doesn't, run `claude-unlimited reauth`: it lists whichever
-accounts actually need it, so there's no guessing.
+The **Reauth** button and command appear on **Overview** cards of Claude OAuth (subscription)
+Profiles that need re-auth. Tokens are normally refreshed in the background whether or not an
+account is currently in rotation. If they don't, clicking **Reauth** opens a terminal: on WSL
+and Linux desktops it runs this install's reauth in a login shell, so `claude` is on `PATH`; on
+Windows and macOS it opens a new terminal running this install's interpreter. The command on
+the card is the one to paste into your own terminal on every platform. You can also run
+`claude-unlimited reauth --profile <id>` to target one OAuth
+Profile directly. Without the flag, it lists whichever accounts actually need it, so there's
+no guessing.
 Once it is signed back in, its usage is read straight away, so the Dashboard and the HUD
 show real numbers for it within seconds instead of at the next scheduled read.
+
+The Dashboard card button is for Claude OAuth (subscription) Profiles. It is separate from
+the HUD's **Reauth** status word, which only reports that an account needs attention.
 </details>
 
 <details>

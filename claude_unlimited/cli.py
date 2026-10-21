@@ -2395,10 +2395,11 @@ def _fetch_live_profiles(host: str, port: int, timeout: float = 2.0) -> Optional
         return None
 
 
-def reauth(port: int) -> int:
-    """`claude-unlimited reauth`: re-authenticates an OAuth Profile,
-    defaulting to whichever ones the running daemon reports as AUTH_INVALID,
-    with the same interactive picker `code --profile` uses.
+def reauth(port: int, profile_id: Optional[str] = None) -> int:
+    """`claude-unlimited reauth`: re-authenticates an OAuth Profile.
+
+    With `--profile <id>`, it targets that Profile directly; without the flag,
+    it offers an interactive picker among Profiles that need re-authentication.
 
     Reuses the Profile's isolated claude_config_dir, set when it was added,
     so re-authenticating logs back into the same account rather than an
@@ -2450,45 +2451,73 @@ def reauth(port: int) -> int:
         print(f"Could not read the Profile pool: {exc}", file=sys.stderr)
         return 1
 
+    if profile_id is not None:
+        target = next((p for p in pool.profiles if p.id == profile_id), None)
+        if target is None:
+            print(
+                f"No Profile with id {profile_id!r} exists. The id is the one shown in the "
+                "Overview card's command; run `claude-unlimited reauth` without `--profile` "
+                "to choose from a picker.",
+                file=sys.stderr,
+            )
+            return 1
+        if target.kind != "oauth":
+            print(f"Profile {profile_id!r} is not an OAuth Profile; reauth only supports OAuth Profiles.",
+                  file=sys.stderr)
+            return 1
+
+        # An explicit id is authoritative: the daemon may have cleared or
+        # changed the live state between the Dashboard click and this terminal
+        # opening, so do not make the user pick again or refuse to continue.
+        live = _fetch_live_profiles(LOOPBACK_HOST, port)
+        if live is None:
+            print(f"Note: continuing with {target.name} from --profile; the daemon's current state could not be checked.")
+        elif not any(item.get("id") == target.id and item.get("state") == "auth_invalid" for item in live):
+            print(f"Note: {target.name} does not currently report needs re-auth; continuing because --profile was supplied.")
+        print(f"Re-authenticating {target.name}…\n")
+    else:
+        target = None
+
     oauth_profiles = [p for p in pool.profiles if p.kind == "oauth"]
     if not oauth_profiles:
         print("No OAuth (subscription) Profiles are configured yet — run `claude-unlimited add-account` first.")
         return 0
 
-    live = _fetch_live_profiles(LOOPBACK_HOST, port)
-    if live is not None:
-        needs_reauth_ids = {item["id"] for item in live if item.get("state") == "auth_invalid"}
-        candidates = [p for p in oauth_profiles if p.id in needs_reauth_ids]
-        if not candidates:
-            print("No OAuth Profile currently needs re-authentication.")
-            return 0
-    else:
-        print("Could not reach the daemon to check which Profiles actually need re-auth — "
-              "showing every OAuth Profile instead.\n")
-        candidates = oauth_profiles
+    if target is None:
+        live = _fetch_live_profiles(LOOPBACK_HOST, port)
+        if live is not None:
+            needs_reauth_ids = {item["id"] for item in live if item.get("state") == "auth_invalid"}
+            candidates = [p for p in oauth_profiles if p.id in needs_reauth_ids]
+            if not candidates:
+                print("No OAuth Profile currently needs re-authentication.")
+                return 0
+        else:
+            print("Could not reach the daemon to check which Profiles actually need re-auth — "
+                  "showing every OAuth Profile instead.\n")
+            candidates = oauth_profiles
 
-    if len(candidates) == 1:
-        target = candidates[0]
-        print(f"Re-authenticating {target.name}…\n")
-    else:
-        print("Which Profile needs re-authenticating?\n")
-        for i, p in enumerate(candidates, start=1):
-            print(f"  [{i}] {p.name}")
-        print()
-        try:
-            raw = input(f"Choice [1-{len(candidates)}]: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\nCancelled.", file=sys.stderr)
-            return 1
-        try:
-            idx = int(raw)
-        except ValueError:
-            print(f"Not a number: {raw!r}.", file=sys.stderr)
-            return 1
-        if not (1 <= idx <= len(candidates)):
-            print(f"{idx} isn't one of the choices.", file=sys.stderr)
-            return 1
-        target = candidates[idx - 1]
+        if len(candidates) == 1:
+            target = candidates[0]
+            print(f"Re-authenticating {target.name}…\n")
+        else:
+            print("Which Profile needs re-authenticating?\n")
+            for i, p in enumerate(candidates, start=1):
+                print(f"  [{i}] {p.name} (id: {p.id})")
+            print()
+            try:
+                raw = input(f"Choice [1-{len(candidates)}]: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nCancelled.", file=sys.stderr)
+                return 1
+            try:
+                idx = int(raw)
+            except ValueError:
+                print(f"Not a number: {raw!r}.", file=sys.stderr)
+                return 1
+            if not (1 <= idx <= len(candidates)):
+                print(f"{idx} isn't one of the choices.", file=sys.stderr)
+                return 1
+            target = candidates[idx - 1]
 
     # A Profile added by manual paste or "Import current login" has no
     # isolated dir of its own, so give it a fresh one the way add-account
@@ -2734,9 +2763,14 @@ def main(argv=None) -> int:
     sub.add_parser("add-codex-account", aliases=["aca"],
                     help="log into a ChatGPT/Codex subscription via an isolated "
                          "session and add it as a codex-kind Profile")
-    reauth_p = sub.add_parser("reauth", help="re-authenticate an OAuth Profile that needs it "
-                                              "(defaults to whichever ones the daemon reports as needing it)")
+    reauth_p = sub.add_parser(
+        "reauth",
+        help="re-authenticate an OAuth subscription Profile; `claude-unlimited reauth` without "
+             "--profile offers a picker; the Dashboard card shows the full command with its id filled in",
+    )
     reauth_p.add_argument("--port", type=int, default=None)
+    reauth_p.add_argument("--profile", metavar="ID", default=None,
+                          help="target this OAuth Profile's id (not its display name) directly, without the picker")
     desktop_p = sub.add_parser("desktop", help="configure the Claude desktop app to use the pool, then launch it")
     desktop_p.add_argument("--port", type=int, default=None)
     desktop_p.add_argument("--revert", action="store_true",
@@ -2807,7 +2841,7 @@ def main(argv=None) -> int:
     if args.cmd in ("add-codex-account", "aca"):
         return add_codex_account()
     if args.cmd == "reauth":
-        return reauth(_resolve_port_or_exit(args.port))
+        return reauth(_resolve_port_or_exit(args.port), profile_id=args.profile)
     if args.cmd == "code":
         return code(_resolve_port_or_exit(args.port), unknown, profile_arg=args.profile,
                     distribute=args.distribute)

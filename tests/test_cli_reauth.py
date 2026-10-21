@@ -152,3 +152,85 @@ def test_reauth_never_renames_an_existing_profile(env, monkeypatch, tmp_path, ca
     assert len(profiles) == 1  # no duplicate created
     assert profiles[0].id == target.id
     assert profiles[0].name == "shared@example.com (Team)"  # untouched, not recomputed
+
+
+def test_reauth_profile_id_skips_picker_and_continues_when_state_changed(env, monkeypatch, tmp_path, capsys):
+    target = profile_repo.create_profile(
+        name="Target", kind="oauth", credential="old-tok-long",
+        account_uuid="uuid-target", org_uuid="org-target", organization_type="claude_max")
+    profile_repo.create_profile(
+        name="Other", kind="oauth", credential="other-tok-long",
+        account_uuid="uuid-other", org_uuid="org-other", organization_type="claude_max")
+
+    account = anthropic_oauth.AccountProfile(
+        account_uuid="uuid-target", email="target@example.com", display_name="Target",
+        org_uuid="org-target", org_name="Target Org", organization_type="claude_max",
+        has_claude_max=True, has_claude_pro=False)
+    _wire_reauth_mocks(monkeypatch, tmp_path, account)
+    monkeypatch.setattr(cli, "_fetch_live_profiles",
+                        lambda host, port: [{"id": target.id, "state": "eligible"}])
+    monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(
+        AssertionError("--profile must skip the picker")))
+
+    rc = cli.reauth(cli.DEFAULT_PORT, profile_id=target.id)
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "does not currently report needs re-auth" in output
+    assert "Target is re-authenticated" in output
+
+
+def test_reauth_profile_id_unknown_is_clear_error(env, monkeypatch, tmp_path, capsys):
+    _wire_reauth_mocks(monkeypatch, tmp_path, account=None)
+
+    rc = cli.reauth(cli.DEFAULT_PORT, profile_id="deadbeef")
+
+    assert rc == 1
+    error = capsys.readouterr().err
+    assert "No Profile with id 'deadbeef' exists" in error
+    assert "Overview card's command" in error
+    assert "claude-unlimited reauth` without `--profile`" in error
+
+
+def test_reauth_picker_prints_profile_ids_beside_names(env, monkeypatch, tmp_path, capsys):
+    first = profile_repo.create_profile(
+        name="First", kind="oauth", credential="first-tok-long",
+        account_uuid="uuid-first", org_uuid="org-first", organization_type="claude_max")
+    target = profile_repo.create_profile(
+        name="Target", kind="oauth", credential="target-tok-long",
+        account_uuid="uuid-target", org_uuid="org-target", organization_type="claude_max")
+    account = anthropic_oauth.AccountProfile(
+        account_uuid="uuid-target", email="target@example.com", display_name="Target",
+        org_uuid="org-target", org_name="Target Org", organization_type="claude_max",
+        has_claude_max=True, has_claude_pro=False)
+    _wire_reauth_mocks(monkeypatch, tmp_path, account)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "2")
+
+    rc = cli.reauth(cli.DEFAULT_PORT)
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert f"[1] First (id: {first.id})" in output
+    assert f"[2] Target (id: {target.id})" in output
+
+
+def test_reauth_profile_id_rejects_non_oauth_profile(env, monkeypatch, tmp_path, capsys):
+    target = profile_repo.create_profile(
+        name="API", kind="api", credential="api-token-long")
+    _wire_reauth_mocks(monkeypatch, tmp_path, account=None)
+
+    rc = cli.reauth(cli.DEFAULT_PORT, profile_id=target.id)
+
+    assert rc == 1
+    error = capsys.readouterr().err
+    assert "is not an OAuth Profile" in error
+    assert "reauth only supports OAuth Profiles" in error
+
+
+def test_main_passes_reauth_profile_flag_to_function(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli, "reauth",
+                        lambda port, profile_id=None: calls.append((port, profile_id)) or 0)
+
+    assert cli.main(["reauth", "--port", "4321", "--profile", "deadbeef"]) == 0
+    assert calls == [(4321, "deadbeef")]

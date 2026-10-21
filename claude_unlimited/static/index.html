@@ -240,6 +240,7 @@
   .p-card.has-tag { border-color: color-mix(in srgb, var(--tag-color) 55%, var(--border)); }
   .p-card.active-card { border-color: var(--accent-border); }
   .p-card.active-card.has-tag { border-color: var(--tag-color); }
+  .p-card.needs-reauth { border-color: var(--bad) !important; }
   .p-card.active-card::before {
     content: ""; position: absolute; inset: -40% -20% auto auto; width: 240px; height: 240px;
     background: radial-gradient(circle, var(--accent-soft), transparent 70%); pointer-events: none;
@@ -349,6 +350,15 @@
   .toggle-knob { position: absolute; top: 2px; right: 2px; width: 13px; height: 13px; border-radius: 50%; background: var(--knob-on); }
   .toggle.off .toggle-knob { right: auto; left: 2px; background: var(--text-faint); }
 
+  .p-reauth { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .p-reauth-btn { padding: 5px 10px; font-size: var(--fs-micro); }
+  .p-reauth-note { font-size: var(--fs-micro); color: var(--bad); }
+  .p-reauth-command { display: flex; flex-direction: column; align-items: stretch; gap: 6px; width: 100%; min-width: 0;
+                      background: var(--bg-field); border: 1px solid var(--bad-border); border-radius: 8px; padding: 7px 10px; }
+  .p-reauth-command-caption { font-size: var(--fs-micro); color: var(--text-faint); }
+  .p-reauth-command-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .p-reauth-command code { min-width: 0; flex: 1; overflow-x: auto; white-space: nowrap; color: var(--bad);
+                           font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: var(--fs-micro); }
   .empty { color: var(--text-faint); font-size: var(--fs-body); padding: 24px; text-align: center;
            border: 1px dashed var(--border); border-radius: 12px; }
 
@@ -2023,7 +2033,7 @@
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.reauth">Re-authenticates a Profile that needs it — defaults to whichever ones the daemon reports as "needs re-auth", and lets you pick if there's more than one. Logs back into the exact same account, never a new one. Once it is back, its usage is read straight away.</div>
+          <div class="field-sub" data-i18n="help.cmd.reauth">The Reauth button and command appear on Overview cards of Claude OAuth (subscription) Profiles that need re-auth. `claude-unlimited reauth` without --profile offers a picker among Profiles that need re-auth. Pass --profile &lt;id&gt; with the Profile's id, not its display name, to target one directly. Clicking Reauth opens a terminal: on WSL and Linux desktops it runs this install's reauth in a login shell, so `claude` is on PATH; on Windows and macOS it opens a new terminal running this install's interpreter. The command on the card is the one to paste into your own terminal on every platform. Logs back into the exact same account, never a new one. Once it is back, its usage is read straight away.</div>
         </div>
         <div class="divider"></div>
         <div class="cmd-row">
