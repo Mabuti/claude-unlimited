@@ -3565,18 +3565,19 @@ async function refreshCodexCreditsVisibility() {
 // What a session launched right now would actually get, and why. The decision
 // is made inside `cu code` in another process; the daemon runs the same pure
 // function over the same pool so this can be answered without launching.
+// Three cases: no per-model list, one shared budget, or distinct budgets; keep in step with _codex_budget_summary in cli.py.
 function _guardBudgetSummary(g) {
   const entries = Array.isArray(g.model_budgets) ? g.model_budgets : [];
   if (!entries.length) {
     return t('settings.context1m.budget_one')
-      .replace('{budget}', String(Math.floor((g.budget || 0) / 1000)));
+      .replace('{budget}', () => String(Math.floor((g.budget || 0) / 1000)));
   }
   const budgets = entries.map((entry) => Number(entry.budget) || 0);
   const models = entries.map((entry) => entry.model || '').filter(Boolean);
   const separator = t('settings.context1m.budget_list_sep');
   const budgetOn = (budget, modelList) => t('settings.context1m.budget_on')
-    .replace('{budget}', String(Math.floor(budget / 1000)))
-    .replace('{models}', modelList);
+    .replace('{budget}', () => String(Math.floor(budget / 1000)))
+    .replace('{models}', () => modelList);
   if (new Set(budgets).size === 1) {
     return budgetOn(budgets[0], models.join(separator));
   }
@@ -3625,13 +3626,13 @@ function renderContext1mVerdict(preview) {
   const guardProfiles = (preview.guard && Array.isArray(preview.guard.profiles)) ? preview.guard.profiles : [];
   guardProfiles.forEach((g) => {
     lines.push(t('settings.context1m.guard_line')
-      .replace('{name}', g.name || g.id || '')
-      .replace('{budget_summary}', _guardBudgetSummary(g)));
+      .replace('{name}', () => g.name || g.id || '')
+      .replace('{budget_summary}', () => _guardBudgetSummary(g)));
     if (g.assumed) {
       _guardAssumptionLines(g).forEach((assumption) => {
         lines.push(t(assumption.key)
-          .replace('{name}', g.name || g.id || '')
-          .replace('{models}', assumption.models));
+          .replace('{name}', () => g.name || g.id || '')
+          .replace('{models}', () => assumption.models));
       });
     }
   });

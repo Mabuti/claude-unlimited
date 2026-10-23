@@ -498,9 +498,9 @@ def _context_1m_preview(pool) -> dict:
 
     `guard` is present whenever a codex Profile is in the route: one entry per
     such account with the window the per-request capacity guard (docs/adr/
-    0009) budgets it at, so the dashboard can show each resolved model's
-    budget and the models sharing one — and flag
-    any GPT id whose window is ASSUMED rather than known."""
+    0009) budgets it at, so the dashboard can show each resolved model's budget
+    (models with the same budget are listed together) and flag any GPT id whose
+    window is ASSUMED rather than known."""
     mode = getattr(pool.settings, "context_1m", "force_1m")
     version = _cached_client_version() if mode == "auto" else None
     profiles = pool.enabled_profiles()

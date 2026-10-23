@@ -13,7 +13,15 @@ BUDGET_KEYS = {
 }
 
 
+def _guard_budget_summary_body():
+    source = APP_JS.read_text(encoding="utf-8")
+    start = source.index("function _guardBudgetSummary")
+    end = source.index("\nfunction _guardAssumptionLines", start)
+    return source[start:end]
+
+
 def test_budget_line_keys_and_placeholders_exist_in_every_locale():
+    """Protect translated budget-line keys and their required placeholders."""
     for code in ("en", "de", "es", "ro"):
         strings = json.loads((LOCALES / f"{code}.json").read_text(encoding="utf-8"))
         for key, placeholders in BUDGET_KEYS.items():
@@ -23,8 +31,13 @@ def test_budget_line_keys_and_placeholders_exist_in_every_locale():
 
 
 def test_budget_line_does_not_reintroduce_english_formatting_literals():
-    source = APP_JS.read_text(encoding="utf-8")
+    """Protect budget summaries from English literals and unsafe data replacement."""
+    source = _guard_budget_summary_body()
 
     assert "smallest of these" not in source
     assert "} on ${" not in source
     assert "K on " not in source
+    assert (
+        ".replace('{models}', () => modelList)" in source
+        and ".replace('{models}', modelList)" not in source
+    )
