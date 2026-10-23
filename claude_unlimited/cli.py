@@ -1227,11 +1227,11 @@ def _codex_budget_summary(summary: dict) -> str:
     """Format all resolved model budgets without hiding a larger choice."""
     entries = summary.get("model_budgets") or []
     if not entries:
-        return f"~{summary['budget'] // 1000}K (smallest of these)"
+        return f"~{summary['budget'] // 1000}K"
     budgets = [int(entry["budget"]) for entry in entries]
     models = [str(entry["model"]) for entry in entries]
     if len(set(budgets)) == 1:
-        return f"~{budgets[0] // 1000}K (smallest of these) on {', '.join(models)}"
+        return f"~{budgets[0] // 1000}K on {', '.join(models)}"
     return ", ".join(f"~{budget // 1000}K on {model}"
                       for model, budget in zip(models, budgets))
 

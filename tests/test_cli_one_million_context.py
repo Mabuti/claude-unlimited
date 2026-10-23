@@ -371,6 +371,26 @@ def test_the_launch_note_shows_each_distinct_resolved_budget():
     assert "assumed" in line and "gpt-99-nova" in line
 
 
+def test_codex_budget_summary_has_no_smallest_of_these_label():
+    import claude_unlimited.cli as cli
+
+    assert cli._codex_budget_summary({"budget": 226_400}) == "~226K"
+    assert cli._codex_budget_summary({
+        "budget": 226_400,
+        "model_budgets": [
+            {"model": "gpt-5.6-sol", "budget": 226_400},
+            {"model": "gpt-5.6-terra", "budget": 226_400},
+        ],
+    }) == "~226K on gpt-5.6-sol, gpt-5.6-terra"
+    assert cli._codex_budget_summary({
+        "budget": 443_000,
+        "model_budgets": [
+            {"model": "gpt-6.1-sol", "budget": 443_000},
+            {"model": "gpt-6-sol", "budget": 226_400},
+        ],
+    }) == "~443K on gpt-6.1-sol, ~226K on gpt-6-sol"
+
+
 def test_the_client_version_is_not_reread_on_every_poll(monkeypatch):
     """An open dashboard polls /api/settings once a second; forking `claude
     --version` that often would be absurd."""

@@ -3568,15 +3568,20 @@ async function refreshCodexCreditsVisibility() {
 function _guardBudgetSummary(g) {
   const entries = Array.isArray(g.model_budgets) ? g.model_budgets : [];
   if (!entries.length) {
-    return `~${Math.floor((g.budget || 0) / 1000)}K (smallest of these)`;
+    return t('settings.context1m.budget_one')
+      .replace('{budget}', String(Math.floor((g.budget || 0) / 1000)));
   }
   const budgets = entries.map((entry) => Number(entry.budget) || 0);
   const models = entries.map((entry) => entry.model || '').filter(Boolean);
+  const separator = t('settings.context1m.budget_list_sep');
+  const budgetOn = (budget, modelList) => t('settings.context1m.budget_on')
+    .replace('{budget}', String(Math.floor(budget / 1000)))
+    .replace('{models}', modelList);
   if (new Set(budgets).size === 1) {
-    return `~${Math.floor(budgets[0] / 1000)}K (smallest of these) on ${models.join(', ')}`;
+    return budgetOn(budgets[0], models.join(separator));
   }
-  return entries.map((entry) => `~${Math.floor((Number(entry.budget) || 0) / 1000)}K on ${entry.model || ''}`)
-    .join(', ');
+  return entries.map((entry) => budgetOn(Number(entry.budget) || 0, entry.model || ''))
+    .join(separator);
 }
 
 function _guardAssumptionLines(g) {
