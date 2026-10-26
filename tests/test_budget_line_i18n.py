@@ -17,6 +17,35 @@ BUDGET_KEYS = {
 }
 
 
+NODE_LOCALE_PRELUDE = r'''
+const assert = require('node:assert/strict');
+let _strings;
+function t(key) {
+  return _strings[key] || key;
+}
+function localized(locale, key, replacements = {}) {
+  return Object.entries(replacements).reduce(
+    (text, [placeholder, value]) => text.replace(placeholder, () => String(value)),
+    locales[locale][key],
+  );
+}
+'''
+
+
+def _slice_js_function(source, start_marker, end_marker):
+    try:
+        start = source.index(start_marker)
+    except ValueError as exc:
+        raise AssertionError(f"missing marker {start_marker!r}") from exc
+    try:
+        end = source.index(end_marker, start)
+    except ValueError as exc:
+        raise AssertionError(
+            f"missing marker {end_marker!r} after {start_marker!r}"
+        ) from exc
+    return source[start:end]
+
+
 def _guard_budget_summary_body():
     """Slice the summary function through the following declaration.
 
@@ -24,22 +53,43 @@ def _guard_budget_summary_body():
     ``_strings`` supplied by the Node harness.
     """
     source = APP_JS.read_text(encoding="utf-8")
-    start = source.index("function _guardBudgetSummary")
-    end = source.index("\nfunction _guardAssumptionLines", start)
-    return source[start:end]
+    return _slice_js_function(
+        source,
+        "function _guardBudgetSummary",
+        "\nfunction _guardAssumptionLines",
+    )
 
 
 def _guard_verdict_body():
-    """Slice the three context-guard functions through the next declaration.
+    """Slice each context-guard function through its next declaration.
 
-    The end marker is the following function declaration.  Keep this source
-    standalone: it may depend only on ``t``/``_strings`` and the DOM methods
-    stubbed by the verdict harness.
+    Keep this source standalone: it may depend only on ``t``/``_strings`` and
+    the DOM methods stubbed by the verdict harness.
     """
     source = APP_JS.read_text(encoding="utf-8")
-    start = source.index("function _guardBudgetSummary")
-    end = source.index("\nasync function toggleFableLimitAll", start)
-    return source[start:end]
+    slices = [
+        _slice_js_function(
+            source,
+            "function _guardBudgetSummary",
+            "\nfunction _guardAssumptionLines",
+        ),
+        _slice_js_function(
+            source,
+            "function _guardAssumptionLines",
+            "\nfunction renderContext1mVerdict",
+        ),
+        _slice_js_function(
+            source,
+            "function renderContext1mVerdict",
+            "\nasync function toggleFableLimitAll",
+        ),
+    ]
+    return "\n".join(slices)
+
+
+def _set_language_body():
+    source = APP_JS.read_text(encoding="utf-8")
+    return _slice_js_function(source, "async function setLanguage(", "\n// ---- helpers ----")
 
 
 def test_budget_line_keys_and_placeholders_exist_in_every_locale():
@@ -72,27 +122,19 @@ def test_budget_line_does_not_reintroduce_english_formatting_literals():
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node unavailable")
-def test_guard_budget_summary_renders_shared_budget_in_every_locale():
+def test_guard_budget_summary_renders_all_cases_in_every_locale():
     """Run rendered budget lines instead of only checking their source."""
     source = _guard_budget_summary_body()
     locales = {
         code: json.loads((LOCALES / f"{code}.json").read_text(encoding="utf-8"))
         for code in ("en", "de", "es", "ro")
     }
-    harness = r'''
-const assert = require('node:assert/strict');
-const locales = ''' + json.dumps(locales) + r''';
-let _strings = locales.en;
-function t(key) {
-  return _strings[key] || key;
-}
-function localized(locale, key, replacements = {}) {
-  return Object.entries(replacements).reduce(
-    (text, [placeholder, value]) => text.replace(placeholder, () => String(value)),
-    locales[locale][key],
-  );
-}
-'''
+    harness = (
+        NODE_LOCALE_PRELUDE
+        + "\nconst locales = "
+        + json.dumps(locales)
+        + ";\n_strings = locales.en;\n"
+    )
     checks = r'''
 const budgetOne = 'settings.context1m.budget_one';
 const budgetOn = 'settings.context1m.budget_on';
@@ -123,22 +165,6 @@ assert.equal(
   }),
 );
 
-const renderedShared = {};
-for (const code of Object.keys(locales)) {
-  _strings = locales[code];
-  const rendered = _guardBudgetSummary({model_budgets: sharedEntries});
-  renderedShared[code] = rendered;
-  assert.equal(rendered, localized(code, budgetOn, {
-    '{budget}': 226,
-    '{models}': sharedEntries.map(({model}) => model).join(localized(code, listSeparator)),
-  }));
-  assert.ok(!rendered.includes(budgetOn), `${code} rendered a raw locale key`);
-}
-assert.equal(renderedShared.de, '~226K für gpt-5.6-sol, gpt-5.6-terra');
-assert.notEqual(renderedShared.de, renderedShared.en);
-assert.notEqual(renderedShared.es, renderedShared.en);
-assert.notEqual(renderedShared.ro, renderedShared.en);
-
 const distinctBudgets = [
   {model: 'gpt-6.1-sol', budget: 443000},
   {model: 'gpt-6-sol', budget: 226400},
@@ -156,6 +182,33 @@ assert.equal(
   })).join(localized('en', listSeparator)),
 );
 
+const renderedByLocale = {};
+for (const code of Object.keys(locales)) {
+  _strings = locales[code];
+  const noList = _guardBudgetSummary({budget: 226400});
+  const shared = _guardBudgetSummary({model_budgets: sharedEntries});
+  const distinct = _guardBudgetSummary({model_budgets: distinctBudgets});
+  renderedByLocale[code] = {noList, shared, distinct};
+  assert.equal(noList, localized(code, budgetOne, {'{budget}': 226}));
+  assert.equal(shared, localized(code, budgetOn, {
+    '{budget}': 226,
+    '{models}': sharedEntries.map(({model}) => model).join(localized(code, listSeparator)),
+  }));
+  assert.equal(distinct, distinctBudgets.map(({model, budget}) => localized(code, budgetOn, {
+    '{budget}': Math.floor(budget / 1000),
+    '{models}': model,
+  })).join(localized(code, listSeparator)));
+  assert.ok(!noList.includes(budgetOne), `${code} rendered a raw locale key`);
+  assert.ok(!shared.includes(budgetOn), `${code} rendered a raw locale key`);
+  assert.ok(!distinct.includes(budgetOn), `${code} rendered a raw locale key`);
+}
+assert.equal(renderedByLocale.de.shared, '~226K für gpt-5.6-sol, gpt-5.6-terra');
+assert.equal(renderedByLocale.de.distinct, '~443K für gpt-6.1-sol, ~226K für gpt-6-sol');
+assert.notEqual(renderedByLocale.de.shared, renderedByLocale.en.shared);
+assert.notEqual(renderedByLocale.es.shared, renderedByLocale.en.shared);
+assert.notEqual(renderedByLocale.ro.shared, renderedByLocale.en.shared);
+
+_strings = locales.en;
 const literalModel = "gpt-$&-$'-x";
 assert.equal(
   _guardBudgetSummary({model_budgets: [{model: literalModel, budget: 272000}]}),
@@ -185,25 +238,86 @@ assert.equal(
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node unavailable")
+def test_set_language_rerenders_context1m_verdict_in_new_locale():
+    """Repaint the settings verdict with the newly selected locale strings."""
+    locales = {
+        code: json.loads((LOCALES / f"{code}.json").read_text(encoding="utf-8"))
+        for code in ("en", "de")
+    }
+    harness = (
+        NODE_LOCALE_PRELUDE
+        + "\nconst locales = "
+        + json.dumps(locales)
+        + ";\n_strings = locales.en;\n"
+        + r'''
+let _lastContext1mPreview = null;
+const rendered = [];
+const verdict = {
+  style: {},
+  classList: {toggle: () => {}},
+  replaceChildren: (...children) => {
+    rendered.splice(0, rendered.length, ...children.map(child => child.textContent));
+  },
+};
+const document = {
+  getElementById: id => id === 'context1mVerdict' ? verdict : null,
+  querySelectorAll: () => [],
+  createElement: tag => {
+    assert.equal(tag, 'div');
+    return {textContent: ''};
+  },
+};
+const applyTranslations = () => {};
+const renderNotifList = () => {};
+const renderLauncherRows = () => {};
+const renderParityRows = () => {};
+const renderParityGrid = () => {};
+const refreshCodexSelectOptions = () => {};
+const updateCodexModelHelp = () => {};
+const api = async path => {
+  assert.equal(path, '/api/locales/de');
+  return {strings: locales.de};
+};
+'''
+    )
+    checks = r'''
+(async () => {
+  const preview = {
+    reason: 'enabled_1m_guarded',
+    enabled: true,
+    guard: {profiles: [{
+      name: 'Team',
+      model_budgets: [{model: 'gpt-6.1-sol', budget: 443000}],
+    }]},
+  };
+  renderContext1mVerdict(preview);
+  assert.ok(rendered[1].includes('on'));
+  await setLanguage('de', {persist: false});
+  assert.ok(rendered[1].includes('für'), rendered.join('\n'));
+})().catch(e => { console.error(e); process.exitCode = 1; });
+'''
+    result = subprocess.run(
+        ["node", "-"],
+        input=harness + _guard_verdict_body() + _set_language_body() + checks,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node unavailable")
 def test_render_context1m_verdict_replacers_keep_profile_and_model_literals():
     """Render verdict lines through a minimal DOM and preserve replacement text."""
     source = _guard_verdict_body()
     locales = {
         "en": json.loads((LOCALES / "en.json").read_text(encoding="utf-8")),
     }
-    harness = r'''
-const assert = require('node:assert/strict');
-const locales = ''' + json.dumps(locales) + r''';
-let _strings = locales.en;
-function t(key) {
-  return _strings[key] || key;
-}
-function localized(locale, key, replacements = {}) {
-  return Object.entries(replacements).reduce(
-    (text, [placeholder, value]) => text.replace(placeholder, () => String(value)),
-    locales[locale][key],
-  );
-}
+    harness = (
+        NODE_LOCALE_PRELUDE
+        + "\nconst locales = "
+        + json.dumps(locales)
+        + ";\n_strings = locales.en;\n"
+        + r'''
 const rendered = [];
 const verdict = {
   style: {},
@@ -223,6 +337,7 @@ const document = {
   },
 };
 '''
+    )
     checks = r'''
 renderContext1mVerdict({
   reason: 'enabled_1m_guarded',

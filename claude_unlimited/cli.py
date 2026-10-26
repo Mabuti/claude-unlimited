@@ -1227,6 +1227,9 @@ def _apply_one_million_context(pool, enabled_profiles, forced_profile) -> None:
 # in step with _guardBudgetSummary in static/app.js. The dashboard reads the
 # settings.context1m.budget_* keys; the CLI line stays English like its other
 # launch notes.
+# Dashboard key mapping: budget_one covers no per-model list; budget_on is used
+# once with all models for a shared budget or once per model for distinct
+# budgets; budget_list_sep joins names or per-model phrases respectively.
 def _codex_budget_summary(summary: dict) -> str:
     """Format all resolved model budgets without hiding a larger choice."""
     entries = summary.get("model_budgets") or []

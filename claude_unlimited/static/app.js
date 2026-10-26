@@ -145,6 +145,7 @@ function setLiveHtml(el, html, onRendered) {
 // ---- i18n ----
 
 let _strings = {};
+let _lastContext1mPreview = null;
 
 function t(key) {
   return _strings[key] || key;
@@ -199,6 +200,10 @@ async function setLanguage(code, { persist } = { persist: true }) {
   renderLauncherRows();
   renderParityRows();
   renderParityGrid();
+  // The 1M verdict is built in JS, so repaint it with the new strings too.
+  if (typeof _lastContext1mPreview !== 'undefined' && _lastContext1mPreview) {
+    renderContext1mVerdict(_lastContext1mPreview);
+  }
   const updateModeSelect = document.getElementById('updateModeSelect');
   if (updateModeSelect && updateModeSelect._cuRenderValue) {
     updateModeSelect._cuOptions = UPDATE_MODE_OPTIONS();
@@ -3565,10 +3570,15 @@ async function refreshCodexCreditsVisibility() {
 // What a session launched right now would actually get, and why. The decision
 // is made inside `cu code` in another process; the daemon runs the same pure
 // function over the same pool so this can be answered without launching.
+
 // Three cases: no per-model list, one shared budget, or distinct budgets; keep
 // in step with _codex_budget_summary in cli.py. The dashboard reads the
 // settings.context1m.budget_* keys; the CLI line stays English like its other
 // launch notes.
+// Key mapping: budget_one is the no-per-model-list case (single figure, no
+// names); budget_on is filled once with all models joined (shared) or once per
+// model (distinct); budget_list_sep joins model names (shared) and the
+// per-model phrases (distinct).
 function _guardBudgetSummary(g) {
   const entries = Array.isArray(g.model_budgets) ? g.model_budgets : [];
   if (!entries.length) {
@@ -3578,7 +3588,8 @@ function _guardBudgetSummary(g) {
   const budgets = entries.map((entry) => Number(entry.budget) || 0);
   const models = entries.map((entry) => entry.model || '').filter(Boolean);
   const separator = t('settings.context1m.budget_list_sep');
-  // Function replacements are required because strings expand $&, $', and $` in model ids.
+  // Pass a function, not a string, to `.replace`, so `$&`, `$'` and ``$` `` in a
+  // model id are not treated as replacement patterns.
   const budgetOn = (budget, modelList) => t('settings.context1m.budget_on')
     .replace('{budget}', () => String(Math.floor(budget / 1000)))
     .replace('{models}', () => modelList);
@@ -3614,6 +3625,7 @@ function _guardAssumptionLines(g) {
 }
 
 function renderContext1mVerdict(preview) {
+  _lastContext1mPreview = preview;
   const el = document.getElementById('context1mVerdict');
   if (!el) return;
   if (!preview) { el.style.display = 'none'; return; }
