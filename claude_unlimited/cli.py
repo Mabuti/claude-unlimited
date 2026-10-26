@@ -1223,7 +1223,10 @@ def _apply_one_million_context(pool, enabled_profiles, forced_profile) -> None:
         print(f"Context window stays at 200K: {note}")
 
 
-# Three cases: no per-model list, one shared budget, or distinct budgets; keep in step with _guardBudgetSummary in static/app.js.
+# Three cases: no per-model list, one shared budget, or distinct budgets; keep
+# in step with _guardBudgetSummary in static/app.js. The dashboard reads the
+# settings.context1m.budget_* keys; the CLI line stays English like its other
+# launch notes.
 def _codex_budget_summary(summary: dict) -> str:
     """Format all resolved model budgets without hiding a larger choice."""
     entries = summary.get("model_budgets") or []
