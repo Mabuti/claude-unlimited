@@ -837,6 +837,8 @@ Codex's own `-p`/`--profile`, and a `--port` or `--account` meant for Codex itse
 (`cu codex exec --port 9` hands `--port 9` to `codex`, not to `cu`). A `--` right after cu's
 own options is dropped rather than passed through.
 
+`--no-launcher-args` is for scripted, locked-down callers. On either `cu code` or `cu codex`, it launches only the configured executable and drops the extra arguments configured under **Settings → Launch commands**; your arguments remain, and `cu codex` keeps its pool-routing overrides.
+
 **Routing, not reconfiguration.** `cu codex` points Codex at the pool with `-c
 model_providers.*` overrides on the command line only — it never writes to
 `~/.codex/config.toml` or anywhere under `CODEX_HOME`. cu writes nothing to Codex's own

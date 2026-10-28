@@ -1821,7 +1821,8 @@ def _codex_provider_overrides(port: int) -> list[str]:
     ]
 
 
-def codex(port: int, codex_args: list[str], profile_arg: Optional[str] = None) -> int:
+def codex(port: int, codex_args: list[str], profile_arg: Optional[str] = None,
+          no_launcher_args: bool = False) -> int:
     """`claude-unlimited codex` / `cu codex`: starts the daemon if needed,
     then launches the real Codex CLI with its model provider pointed at this
     daemon, so Codex sessions are served by the pool's codex-kind
@@ -1829,7 +1830,9 @@ def codex(port: int, codex_args: list[str], profile_arg: Optional[str] = None) -
 
     `profile_arg` is the value of `cu codex --account` (a pool Profile's name
     or id). Codex's own `-p/--profile` is never consumed here; it arrives in
-    `codex_args` like any other codex flag.
+    `codex_args` like any other codex flag. `no_launcher_args` drops the
+    configured extra launcher arguments while keeping the provider overrides
+    that route Codex through this daemon.
 
     Modelled on code() but deliberately narrower: only codex-kind Profiles
     are ever relevant here (an oauth/api Claude Profile cannot serve
@@ -1846,7 +1849,8 @@ def codex(port: int, codex_args: list[str], profile_arg: Optional[str] = None) -
     # hardcoded "codex" (mirrors code()'s own check), and must run before the
     # daemon starts so a missing binary never leaves one running for nothing.
     base = launch_argv("codex")
-    exe, extra = base[0], base[1:]
+    exe = base[0]
+    extra = [] if no_launcher_args else base[1:]
     if not shutil.which(exe):
         print("Codex CLI (`codex`) not found on PATH. Install it first: "
               "https://github.com/openai/codex", file=sys.stderr)
@@ -1928,7 +1932,7 @@ def codex(port: int, codex_args: list[str], profile_arg: Optional[str] = None) -
 
 
 def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None,
-         distribute: bool = False) -> int:
+         distribute: bool = False, no_launcher_args: bool = False) -> int:
     _banner()
     # Self-heal the CLI launchers on every `code` run. This is the RELIABLE
     # trigger: unlike the daemon-startup heal (which only fires if an update
@@ -2048,12 +2052,14 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None,
     # "--dangerously-skip-permissions". `combined` — not claude_args alone —
     # is what _status_line_args inspects, so a configured --settings
     # suppresses the status-line injection exactly as a typed one does (plan
-    # §3.3). With nothing configured, base == ["claude"] and this is
-    # byte-identical to the old `argv = ["claude", *_status_line_args(...), *claude_args]`.
+    # §3.3). With --no-launcher-args, only base[0] and the caller's args are
+    # used, and no status-line settings are injected.
     base = launch_argv("claude")
-    exe, extra = base[0], base[1:]
+    exe = base[0]
+    extra = [] if no_launcher_args else base[1:]
     combined = [*extra, *claude_args]
-    argv = [exe, *_status_line_args(port, combined), *combined]
+    status_line_args = [] if no_launcher_args else _status_line_args(port, combined)
+    argv = [exe, *status_line_args, *combined]
     if os.name == "nt":
         # Windows has no real exec: os.execvp spawns a child and exits the
         # parent, so the shell regains the console while claude's TUI is still
@@ -2709,7 +2715,7 @@ def _resolve_port_or_exit(explicit) -> int:
 # cu's own options for `cu codex`. They are read ONLY in the leading run of
 # tokens right after `codex` (see _split_codex_passthrough).
 _CODEX_OWN_VALUE_OPTIONS = ("--port", "--account")
-_CODEX_OWN_FLAGS = ("-h", "--help")
+_CODEX_OWN_FLAGS = ("-h", "--help", "--no-launcher-args")
 
 
 def _split_codex_passthrough(argv: list) -> tuple:
@@ -2717,7 +2723,7 @@ def _split_codex_passthrough(argv: list) -> tuple:
     `cu codex ...`.
 
     cu's own options (`--port N`, `--port=N`, `--account X`, `--account=X`,
-    `-h`/`--help`) are recognised only in the leading run of tokens right
+    `--no-launcher-args`, `-h`/`--help`) are recognised only in the leading run of tokens right
     after `codex`. The first token that is not one of them ends that run; a
     `--` at that point is dropped, and everything from there on goes to codex
     verbatim and in order — so `cu codex exec --port 9 --account x` hands
@@ -2795,6 +2801,8 @@ def main(argv=None) -> int:
                                 "reaches its switch threshold or a usage limit, becomes unavailable, has no new "
                                 "request for an hour, or returns a transient 429 another account can take; each "
                                 "keeps its own prompt cache warm")
+    code_p.add_argument("--no-launcher-args", action="store_true",
+                        help="launch only the configured executable, dropping its extra launcher arguments")
     # Deliberately no positional for claude's own args: nargs=REMAINDER
     # fails as soon as the first passthrough token looks like a flag (e.g.
     # `claude-unlimited code --model opus`, where argparse matches --model
@@ -2803,7 +2811,7 @@ def main(argv=None) -> int:
 
     codex_p = sub.add_parser("codex", help="start the daemon if needed, then launch the Codex CLI "
                                             "routed through the pool's ChatGPT/Codex accounts",
-                              usage="%(prog)s [--port N] [--account NAME_OR_ID] [--] [codex args ...]",
+                              usage="%(prog)s [--port N] [--account NAME_OR_ID] [--no-launcher-args] [--] [codex args ...]",
                               description="cu's own options are read only right after `codex`, before "
                                           "any other argument. From the first other argument on, "
                                           "everything goes to codex verbatim and in order; a `--` "
@@ -2815,6 +2823,8 @@ def main(argv=None) -> int:
     codex_p.add_argument("--account", metavar="NAME_OR_ID", default=None,
                           help="pin this session to one Codex account (Profile) by name or id, skipping "
                                "the interactive picker")
+    codex_p.add_argument("--no-launcher-args", action="store_true",
+                         help="launch only the configured executable, dropping its extra launcher arguments")
     # Unlike code_p above, argparse never sees codex's own arguments: main()
     # splits them off first (_split_codex_passthrough), so a codex flag that
     # shares a name with one of ours (`cu codex exec --port 9`) is codex's.
@@ -2851,10 +2861,11 @@ def main(argv=None) -> int:
         return reauth(_resolve_port_or_exit(args.port), profile_id=args.profile)
     if args.cmd == "code":
         return code(_resolve_port_or_exit(args.port), unknown, profile_arg=args.profile,
-                    distribute=args.distribute)
+                    distribute=args.distribute, no_launcher_args=args.no_launcher_args)
     if args.cmd == "codex":
         # `unknown` is always empty here: argparse only saw cu's own options.
-        return codex(_resolve_port_or_exit(args.port), unknown + codex_verbatim, profile_arg=args.account)
+        return codex(_resolve_port_or_exit(args.port), unknown + codex_verbatim,
+                     profile_arg=args.account, no_launcher_args=args.no_launcher_args)
     if args.cmd == "desktop":
         return desktop_revert() if args.revert else desktop(_resolve_port_or_exit(args.port))
     if args.cmd == "install":

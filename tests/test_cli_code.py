@@ -1,4 +1,83 @@
 
+import types
+
+import pytest
+
+import claude_unlimited.cli as cli
+from claude_unlimited.config import Pool, Profile, Settings, save_pool
+
+
+@pytest.fixture
+def code_launch_env(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli, "_ensure_daemon", lambda port: True)
+    monkeypatch.setattr(cli, "_request_models_refresh", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_fetch_parity_labels", lambda *a, **kw: {})
+    monkeypatch.setattr(cli.updater, "ensure_cli_aliases", lambda *a, **kw: None)
+    monkeypatch.setattr(cli.hud_installer, "ensure_installed_quietly", lambda *a, **kw: "")
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
+    monkeypatch.setattr("claude_unlimited.config.CONFIG_FILE", tmp_path / "config.json")
+    monkeypatch.setattr(cli, "_fetch_session_token",
+                        lambda host, port, profile_id, timeout=2.0: f"session-tok-for-{profile_id}")
+
+    execs = []
+    monkeypatch.setattr(cli.os, "execvp", lambda file, args: execs.append((file, args)))
+
+    def _run_tool(argv, **kw):
+        execs.append((cli._resolve_launcher(argv[0]), argv))
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli, "_run_tool", _run_tool)
+    return execs
+
+
+def _configured_claude_pool():
+    return Pool(
+        profiles=[Profile(id="a", name="Alice", kind="oauth", enabled=True)],
+        settings=Settings(launchers={"claude": "claude --dangerously-skip-permissions"}),
+    )
+
+
+def test_configured_claude_launcher_args_are_honoured_without_no_launcher_args(
+        code_launch_env):
+    save_pool(_configured_claude_pool())
+
+    assert cli.code(4317, ["--model", "opus"], profile_arg="Alice") == 0
+    (_exe, argv), = code_launch_env
+    assert "--dangerously-skip-permissions" in argv
+    assert argv[-2:] == ["--model", "opus"]
+
+
+def test_code_no_launcher_args_drops_configured_args_and_status_line(
+        monkeypatch, code_launch_env):
+    save_pool(_configured_claude_pool())
+    user_args = ["--model", "opus", "--verbose"]
+
+    def placeholder_must_not_run(*args, **kwargs):
+        raise AssertionError("--profile must keep using its pinned session token")
+
+    monkeypatch.setattr(cli, "_fetch_placeholder_token", placeholder_must_not_run)
+
+    def status_line_must_not_run(*args, **kwargs):
+        raise AssertionError("--no-launcher-args must not inject a status line")
+
+    monkeypatch.setattr(cli, "_status_line_args", status_line_must_not_run)
+
+    assert cli.main(["code", "--no-launcher-args", "--profile", "Alice", *user_args]) == 0
+    (_exe, argv), = code_launch_env
+    assert argv == ["claude", *user_args]
+    assert "--dangerously-skip-permissions" not in argv
+    assert cli.os.environ["ANTHROPIC_AUTH_TOKEN"] == "session-tok-for-a"
+
+
+def test_code_help_advertises_no_launcher_args(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["code", "--help"])
+    assert exc.value.code == 0
+    assert "--no-launcher-args" in capsys.readouterr().out
+
+
 
 def test_codex_pinned_session_relabels_the_model_picker(monkeypatch):
     """Claude Code builds `/model` client-side from these env vars rather than

@@ -195,6 +195,50 @@ def test_configured_launcher_extra_args_are_honoured(monkeypatch, codex_env):
     assert argv == ["codex", *overrides, "--extra-flag", "exec"]
 
 
+def test_codex_no_launcher_args_drops_configured_args_but_keeps_provider_overrides(
+        monkeypatch, codex_env):
+    save_pool(Pool(profiles=[_codex_profile()],
+                    settings=Settings(launchers={
+                        "codex": "codex --dangerously-bypass-approvals-and-sandbox"})))
+    monkeypatch.setattr(cli, "_fetch_placeholder_token", lambda host, port, timeout=2.0: "tok")
+    codex_args = ["exec", "--model", "gpt-5.6-luna", "hi"]
+
+    assert cli.codex(4317, codex_args, profile_arg=None, no_launcher_args=True) == 0
+    (_exe, argv, _env), = codex_env
+    assert argv == ["codex", *cli._codex_provider_overrides(4317), *codex_args]
+    assert "--dangerously-bypass-approvals-and-sandbox" not in argv
+
+
+def test_codex_no_launcher_args_with_account_still_pins(monkeypatch, codex_env):
+    save_pool(Pool(profiles=[_codex_profile(pid="c", name="ChatGPT")],
+                    settings=Settings(launchers={"codex": "codex --extra-flag"})))
+    monkeypatch.setattr(cli, "_fetch_session_token",
+                        lambda host, port, profile_id, timeout=2.0: f"tok-{profile_id}")
+
+    assert cli.main(["codex", "--no-launcher-args", "--account", "ChatGPT",
+                     "exec", "hi"]) == 0
+    (_exe, argv, env), = codex_env
+    assert argv == ["codex", *cli._codex_provider_overrides(4317), "exec", "hi"]
+    assert "--extra-flag" not in argv
+    assert env["CLAUDE_UNLIMITED_TOKEN"] == "tok-c"
+
+
+def test_codex_no_launcher_args_after_command_passes_through_to_codex(monkeypatch, codex_env):
+    save_pool(Pool(profiles=[_codex_profile()]))
+    monkeypatch.setattr(cli, "_fetch_placeholder_token", lambda host, port, timeout=2.0: "tok")
+
+    assert cli.main(["codex", "exec", "--no-launcher-args"]) == 0
+    (_exe, argv, _env), = codex_env
+    assert argv == ["codex", *cli._codex_provider_overrides(4317), "exec", "--no-launcher-args"]
+
+
+def test_codex_help_advertises_no_launcher_args(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["codex", "--help"])
+    assert exc.value.code == 0
+    assert "--no-launcher-args" in capsys.readouterr().out
+
+
 # ---- passthrough of flag-looking args ----
 
 def test_passthrough_of_flag_looking_args_via_main(monkeypatch, codex_env):
@@ -306,7 +350,11 @@ def test_double_dash_split_leaves_other_commands_alone():
     (["codex", "--", "--", "x"], ["codex"], ["--", "x"]),
     (["codex", "-p", "fast", "--port", "9"], ["codex"], ["-p", "fast", "--port", "9"]),
     (["codex", "--help"], ["codex", "--help"], []),
+    (["codex", "--no-launcher-args", "exec"],
+     ["codex", "--no-launcher-args"], ["exec"]),
     (["codex", "exec", "--help"], ["codex"], ["exec", "--help"]),
+    (["codex", "exec", "--no-launcher-args"],
+     ["codex"], ["exec", "--no-launcher-args"]),
     (["codex", "--port"], ["codex", "--port"], []),     # argparse reports the missing value
 ])
 def test_codex_split_reads_only_the_leading_run(argv, own, verbatim):
@@ -315,12 +363,13 @@ def test_codex_split_reads_only_the_leading_run(argv, own, verbatim):
 
 def test_cu_code_parsing_is_unchanged(monkeypatch):
     seen = []
-    monkeypatch.setattr(cli, "code", lambda port, args, profile_arg=None, distribute=False:
-                        seen.append((port, args, profile_arg, distribute)) or 0)
+    monkeypatch.setattr(cli, "code", lambda port, args, profile_arg=None, distribute=False,
+                        no_launcher_args=False:
+                        seen.append((port, args, profile_arg, distribute, no_launcher_args)) or 0)
     monkeypatch.setattr(cli, "_resolve_port_or_exit", lambda port: port)
 
     assert cli.main(["code", "--model", "opus", "--port", "9", "--profile", "p", "--", "-x"]) == 0
-    assert seen == [(9, ["--model", "opus", "--", "-x"], "p", False)]
+    assert seen == [(9, ["--model", "opus", "--", "-x"], "p", False, False)]
 
 
 # ---- nothing written under CODEX_HOME ----
