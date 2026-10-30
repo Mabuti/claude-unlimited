@@ -3777,7 +3777,8 @@ class Gateway:
 
     def _note_assumed_windows(self, pool: Pool, guard: "RequestGuard") -> None:
         """One Activity line per model/backend/reason combination with no known
-        window, such as `gpt-6.1-sol` on an API-key profile. The
+        window, such as `gpt-6.1-sol` or `gpt-6.1-terra` on an API-key
+        profile. The
         `assumption_reason` selects the explanation, so a known subscription
         slug without a published API window is not described as missing from
         `gpt_windows`. The dedicated note lock makes the check-and-add atomic;

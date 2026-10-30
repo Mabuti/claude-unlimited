@@ -481,6 +481,8 @@ _OPENAI_DISPLAY_NAMES: dict[str, str] = {
     "gpt-6-astra": "GPT-6 Astra",
     "gpt-6.1-sol": "GPT-6.1 Sol (500K, subscription)",
     "gpt-6.1-sol-272k": "GPT-6.1 Sol (272K cap)",
+    "gpt-6.1-terra": "GPT-6.1 Terra (500K, subscription)",
+    "gpt-6.1-terra-272k": "GPT-6.1 Terra (272K cap)",
     "gpt-5.6-sol": "GPT-5.6 Sol",
     "gpt-5.6-terra": "GPT-5.6 Terra",
     "gpt-5.6-luna": "GPT-5.6 Luna",
@@ -489,12 +491,17 @@ _OPENAI_DISPLAY_NAMES: dict[str, str] = {
 _OPENAI_MODEL_NOTE_KEYS: dict[str, str] = {
     "gpt-6.1-sol": "models.note.gpt_6_1_sol_500k",
     "gpt-6.1-sol-272k": "models.note.gpt_6_1_sol_272k",
+    "gpt-6.1-terra": "models.note.gpt_6_1_terra_500k",
+    "gpt-6.1-terra-272k": "models.note.gpt_6_1_terra_272k",
 }
 
 # These are explicit user choices, not default-routing targets. A rejected
 # choice must surface its backend error rather than silently walking the
 # ordinary fallback ladder.
-_CURATED_SELECTABLE: tuple[str, ...] = ("gpt-6.1-sol", "gpt-6.1-sol-272k")
+_CURATED_SELECTABLE: tuple[str, ...] = (
+    "gpt-6.1-sol", "gpt-6.1-sol-272k",
+    "gpt-6.1-terra", "gpt-6.1-terra-272k",
+)
 
 
 def model_notes() -> dict[str, str]:
@@ -543,8 +550,9 @@ def fallback_models(model: str, catalogue: Optional[Catalogue] = None) -> list[s
     capable that is likely rejected for the same reason, then wraps to the
     rungs above so a retired mid-tier model can still reach a working one. A
     model outside the ladder (a Profile override, or a lineup this build has
-    never heard of) falls back to the whole ladder. The two explicit
-    gpt-6.1-sol choices are terminal: rejection is returned to the caller."""
+    never heard of) falls back to the whole ladder. The four explicit
+    gpt-6.1-sol and gpt-6.1-terra choices are terminal: rejection is returned
+    to the caller."""
     normalized = model.strip().lower()
     if normalized in _CURATED_SELECTABLE:
         return []
@@ -614,7 +622,8 @@ def automatic_mapping(parity=None,
 
 
 # Older ids that remain selectable for a Profile pinned to one, even though
-# nothing maps to them by default, plus the explicit gpt-6.1-sol choices.
+# nothing maps to them by default, plus the explicit gpt-6.1-sol and
+# gpt-6.1-terra choices.
 _LEGACY_SELECTABLE: tuple[str, ...] = ("gpt-5.5", "gpt-5.2") + _CURATED_SELECTABLE
 
 
@@ -623,8 +632,9 @@ def selectable_models(catalogue: Optional[Catalogue] = None) -> list[str]:
 
     Catalogue models and fallback-ladder rungs retain their own
     most-expensive/most-capable-first ordering; legacy selectable ids follow.
-    The explicit gpt-6.1-sol choices stay adjacent, with the 500K choice
-    before the 272K cap, without entering the fallback ladder or defaults."""
+    The explicit gpt-6.1-sol and gpt-6.1-terra pairs stay adjacent, with each
+    500K choice before its 272K cap, without entering the fallback ladder or
+    defaults."""
     cat = _catalogue_or_current(catalogue)
     seen: list[str] = []
     pair_anchor: Optional[int] = None

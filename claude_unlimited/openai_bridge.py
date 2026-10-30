@@ -562,8 +562,9 @@ def run(profile: Profile, stored_credential: str, body: bytes,
     # Start from whatever this backend last accepted in place of the mapped
     # model, then walk the ladder if that is rejected too. A Profile override
     # is honoured as the first candidate but is not the only one for ordinary
-    # models: the two explicit gpt-6.1-sol choices are terminal pins, so their
-    # backend rejection must reach the caller instead of becoming Astra.
+    # models: the four explicit gpt-6.1-sol and gpt-6.1-terra choices are
+    # terminal pins, so their backend rejection must reach the caller instead
+    # of becoming Astra.
     # Gated with the ladder, not before it: the memo is a process-global dict
     # keyed by model name alone, so a substitution learned against the Codex
     # backend would otherwise be applied to a same-named model on a completely

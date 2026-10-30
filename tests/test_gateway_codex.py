@@ -813,6 +813,17 @@ def test_a_capped_gpt_variant_is_blocked_by_the_real_backend_model(pool_env):
     assert blocked
 
 
+def test_a_capped_gpt_6_1_terra_variant_is_blocked_by_the_real_backend_model(pool_env):
+    """The local Terra 272K alias must follow the backend's real availability key."""
+    from datetime import datetime, timezone
+
+    profile = _codex_profile(codex_model="gpt-6.1-terra-272k")
+    blocked = gateway_module._blocked_models_for(
+        profile, _unavailable("gpt-6.1-terra"), Settings(), datetime.now(timezone.utc))
+    assert "claude-fable-5" in blocked
+    assert blocked
+
+
 def test_a_case_preserving_gpt_override_is_blocked_case_insensitively(pool_env):
     """The payload keeps a user's casing, but availability keys are folded."""
     from datetime import datetime, timezone

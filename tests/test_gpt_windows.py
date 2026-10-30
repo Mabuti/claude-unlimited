@@ -40,6 +40,12 @@ def test_gpt_6_1_sol_uses_the_listed_500k_subscription_window():
     assert (info.window, info.budget, info.assumed) == (500_000, 443_000, False)
 
 
+def test_gpt_6_1_terra_uses_the_listed_500k_subscription_window():
+    assert gw.CODEX_BACKEND_WINDOWS["gpt-6.1-terra"] == (500_000, 872_000)
+    info = gw.window_for("gpt-6.1-terra", auth_mode="chatgpt_subscription")
+    assert (info.window, info.budget, info.assumed) == (500_000, 443_000, False)
+
+
 def test_gpt_6_1_sol_272k_variant_is_capped_but_uses_the_real_slug_upstream():
     assert gw.CODEX_MODEL_VARIANTS["gpt-6.1-sol-272k"] == ("gpt-6.1-sol", 272_000)
     assert gw.upstream_slug("GPT-6.1-SOL-272K") == "gpt-6.1-sol"
@@ -47,6 +53,15 @@ def test_gpt_6_1_sol_272k_variant_is_capped_but_uses_the_real_slug_upstream():
     info = gw.window_for("GPT-6.1-SOL-272K", auth_mode="chatgpt_subscription")
     assert (info.model, info.window, info.budget, info.assumed) == \
         ("gpt-6.1-sol-272k", 272_000, 226_400, False)
+
+
+def test_gpt_6_1_terra_272k_variant_is_capped_but_uses_the_real_slug_upstream():
+    assert gw.CODEX_MODEL_VARIANTS["gpt-6.1-terra-272k"] == ("gpt-6.1-terra", 272_000)
+    assert gw.upstream_slug("GPT-6.1-TERRA-272K") == "gpt-6.1-terra"
+    assert gw.upstream_slug(" gpt-6.1-terra ") == "gpt-6.1-terra"
+    info = gw.window_for("GPT-6.1-TERRA-272K", auth_mode="chatgpt_subscription")
+    assert (info.model, info.window, info.budget, info.assumed) == \
+        ("gpt-6.1-terra-272k", 272_000, 226_400, False)
 
 
 def test_non_alias_upstream_slug_strips_only_surrounding_whitespace():
@@ -86,6 +101,12 @@ def test_known_variant_cap_applies_before_backend_assumption(auth_mode, base_url
 
 def test_api_key_profiles_keep_plain_gpt_6_1_sol_at_the_assumed_floor():
     info = gw.window_for("gpt-6.1-sol", auth_mode="api_key")
+    assert (info.window, info.budget, info.assumed) == (272_000, 226_400, True)
+    assert info.assumption_reason == "no_published_api_window"
+
+
+def test_api_key_profiles_keep_plain_gpt_6_1_terra_at_the_assumed_floor():
+    info = gw.window_for("gpt-6.1-terra", auth_mode="api_key")
     assert (info.window, info.budget, info.assumed) == (272_000, 226_400, True)
     assert info.assumption_reason == "no_published_api_window"
 

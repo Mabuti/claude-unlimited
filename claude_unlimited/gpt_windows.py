@@ -23,15 +23,16 @@ from typing import Optional
 # (~/.codex/models_cache.json, fetched 2026-10-20 by client 0.163.0) and the
 # Codex CLI 0.149.0 bundled fallback catalogue. Value = (context_window,
 # max_context_window). `context_window` is the backend's default budget. For
-# every row except gpt-6.1-sol it equals the 272K long-context threshold in
+# every row except gpt-6.1-sol and gpt-6.1-terra equals the 272K long-context
+# threshold in
 # OpenAI's published API pricing (API prompts over 272K input tokens are priced
 # at 2× input and 1.5× output for the full request, developers.openai.com model
 # pages, 2026-09). This does not claim that a subscription quota meter applies
 # that API-pricing multiplier.
-# gpt-6.1-sol's listed 500K window is above that threshold: budgeting it is an
-# explicit user choice, and the local -272k variant is an explicit 272,000 cap
-# on every profile kind, including API-key; it is not an assumed window. The
-# byte estimate cannot see
+# gpt-6.1-sol and gpt-6.1-terra list 500K windows above that threshold:
+# budgeting both is an explicit user choice, and each local -272k variant is an
+# explicit 272,000 cap on every profile kind, including API-key; it is not an
+# assumed window. The byte estimate cannot see
 # replayed reasoning, so that target is not a guarantee that every upstream
 # request stays below the pricing threshold.
 # `max_context_window` is the server ceiling a user can raise Codex CLI's own
@@ -39,6 +40,7 @@ from typing import Optional
 # against. Changing a row is a spending decision.
 CODEX_BACKEND_WINDOWS: dict[str, tuple[int, int]] = {
     "gpt-6.1-sol": (500_000, 872_000),    # cache 2026-10-20, visibility list
+    "gpt-6.1-terra": (500_000, 872_000),  # cache 2026-10-30, visibility list
     "gpt-6-astra": (272_000, 872_000),      # cache 2026-09-21, visibility list
     "gpt-6-sol": (272_000, 872_000),        # cache 2026-10-14, visibility list
     "gpt-6-luna": (272_000, 872_000),       # cache 2026-10-14, visibility list
@@ -56,6 +58,7 @@ CODEX_BACKEND_WINDOWS: dict[str, tuple[int, int]] = {
 # memo, ladder lookup, or Codex conversation key leaves this process.
 CODEX_MODEL_VARIANTS: dict[str, tuple[str, int]] = {
     "gpt-6.1-sol-272k": ("gpt-6.1-sol", 272_000),
+    "gpt-6.1-terra-272k": ("gpt-6.1-terra", 272_000),
 }
 
 # effective_context_window_percent from the same listing: the headroom the

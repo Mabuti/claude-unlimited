@@ -71,12 +71,17 @@ def test_codex_model_map_exposes_gpt_6_1_sol_variants_and_notes(running_server):
     base, _ = running_server
     status, body = _request(f"{base}/api/codex/model-map")
     assert status == 200
-    assert {"gpt-6.1-sol", "gpt-6.1-sol-272k"}.issubset(body["selectable_models"])
+    assert {"gpt-6.1-sol", "gpt-6.1-sol-272k", "gpt-6.1-terra", "gpt-6.1-terra-272k"}.issubset(
+        body["selectable_models"])
     assert body["model_labels"]["gpt-6.1-sol"] == "GPT-6.1 Sol (500K, subscription)"
     assert body["model_labels"]["gpt-6.1-sol-272k"] == "GPT-6.1 Sol (272K cap)"
+    assert body["model_labels"]["gpt-6.1-terra"] == "GPT-6.1 Terra (500K, subscription)"
+    assert body["model_labels"]["gpt-6.1-terra-272k"] == "GPT-6.1 Terra (272K cap)"
     assert body["model_notes"] == {
         "gpt-6.1-sol": "models.note.gpt_6_1_sol_500k",
         "gpt-6.1-sol-272k": "models.note.gpt_6_1_sol_272k",
+        "gpt-6.1-terra": "models.note.gpt_6_1_terra_500k",
+        "gpt-6.1-terra-272k": "models.note.gpt_6_1_terra_272k",
     }
 
 
