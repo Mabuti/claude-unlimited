@@ -99,12 +99,43 @@ def test_7d_only_usage_survives_gateway_restart(pool_env):
     first = gw.handle("POST", "/v1/messages", {}, b"{}")
     list(first.body_chunks or ())
 
+    saved = json.loads((pool_env / "runtime_state.json").read_text())
+    assert saved["profiles"]["a"]["no_5h_window"] is True
+
     restored = Gateway(transport=lambda req: fake_response(200))
     runtime = restored.runtime_snapshot()["a"]
 
     assert runtime.last_usage_percent is None
     assert runtime.last_usage_percent_7d == 96.0
+    assert runtime.no_5h_window is True
     assert runtime.state == gateway_module.ProfileState.DRAINING
+
+
+def test_team_restart_drops_expired_5h_without_using_7d(pool_env):
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="team-profile", kind="oauth", priority=1,
+                automatic=True, enabled=True, switch_threshold=95.0),
+    ]))
+    (pool_env / "runtime_state.json").write_text(json.dumps({
+        "current_profile_id": "a",
+        "profiles": {
+            "a": {
+                "last_usage_percent": 10.0,
+                "resets_at": "2020-01-01T00:00:00+00:00",
+                "last_usage_percent_7d": 99.0,
+                "resets_at_7d": "2100-01-01T00:00:00+00:00",
+                "no_5h_window": False,
+            },
+        },
+    }))
+
+    restored = Gateway(transport=lambda req: fake_response(200)).runtime_snapshot()["a"]
+
+    assert restored.last_usage_percent is None
+    assert restored.resets_at is None
+    assert restored.last_usage_percent_7d == 99.0
+    assert restored.no_5h_window is False
+    assert restored.state == gateway_module.ProfileState.ELIGIBLE
 
 
 def test_no_profiles_returns_503_not_a_rate_limit(pool_env):

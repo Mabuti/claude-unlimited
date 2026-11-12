@@ -1588,11 +1588,12 @@ function usageWindowLabelOrBlank(rawLabel) {
   return rawLabel ? usageWindowLabel(rawLabel, '') : '';
 }
 
-// The daemon deliberately drops quota state (not usage numbers) on restart
-// (see runtime_state.py's module docstring), so right after a restart a
-// Profile can read status_word "healthy" while its restored usage_5h/7d
-// percent already sits at or past where it would have rotated away. Mirrors
-// the CLI profile picker's rule (cli.py _eligible_usage_suffix /
+// The daemon deliberately drops derived quota state (but keeps usage numbers
+// and whether a Profile has no 5h window) on restart (see runtime_state.py's
+// module docstring), so right after a restart a Profile can read status_word
+// "healthy" while its restored usage_5h/7d percent already sits at or past
+// where it would have rotated away. Mirrors the CLI profile picker's rule
+// (cli.py _eligible_usage_suffix /
 // router.APPROACHING_THRESHOLD_BAND): a window at or above
 // switch_threshold - ALMOST_EXHAUSTED_BAND contradicts "healthy". Both
 // surfaces use the same band so they never disagree. Returns null when

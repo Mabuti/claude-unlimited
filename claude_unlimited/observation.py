@@ -37,11 +37,10 @@ class UsageSnapshot:
     confidence: str  # "measured" | "estimated"
     percent_7d: Optional[float] = None  # the unified-7d sibling; drives Rotation only when `percent` is None
     resets_at_7d: Optional[datetime] = None
-    # What the two window slots above represent. Anthropic always reports
-    # both a 5h and a 7d window, but a codex-kind Profile may report a
+    # What the two window slots above represent. Anthropic may report only a
+    # 7d window (for example, on Max), while a codex-kind Profile may report a
     # single window of some other duration (e.g. "weekly"), so the label is
-    # carried rather than assumed. None means the Anthropic default of
-    # 5h/7d.
+    # carried rather than assumed. None means the Anthropic default of 5h/7d.
     window_label: Optional[str] = None
     window_label_7d: Optional[str] = None
     # Per-model windows. None = this source cannot see them (every real

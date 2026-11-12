@@ -81,7 +81,9 @@ def _pool_retry_after_seconds(pool: PoolSnapshot, now: datetime) -> Optional[int
         if p.state == ProfileState.COOLDOWN and p.cooldown_until is not None:
             deadlines.append(p.cooldown_until)
         elif p.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING):
-            reset = p.resets_at if p.resets_at is not None else p.resets_at_7d
+            reset = p.resets_at
+            if reset is None and p.no_5h_window:
+                reset = p.resets_at_7d
             if reset is not None:
                 deadlines.append(reset)
     if not deadlines:
@@ -678,6 +680,13 @@ def _restorable_usage_fields(persisted: Optional[dict], now: datetime) -> dict:
         return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
     fields: dict = {}
+    no_5h_window = persisted.get("no_5h_window")
+    if isinstance(no_5h_window, bool):
+        fields["no_5h_window"] = no_5h_window
+    elif persisted.get("last_usage_percent") is None and persisted.get("last_usage_percent_7d") is not None:
+        # MAX7D-1 rows predate the explicit capability flag. Their null 5h
+        # sample plus a 7d sample is the unambiguous legacy 7d-only shape.
+        fields["no_5h_window"] = True
     resets_at = _parse(persisted.get("resets_at"))
     if resets_at is not None and resets_at > now and isinstance(persisted.get("last_usage_percent"), (int, float)):
         fields["last_usage_percent"] = persisted["last_usage_percent"]
@@ -1193,7 +1202,10 @@ def _capacity_exhaustion(snapshot, pool) -> tuple[bool, Optional[datetime]]:
     if not runtimes or not all(_out_of_capacity(rt) for rt in runtimes):
         return False, None
     deadlines = [d for rt in runtimes
-                 for d in (rt.resets_at, rt.cooldown_until) if d is not None]
+                 for d in (rt.resets_at,
+                           rt.resets_at_7d if rt.no_5h_window else None,
+                           rt.cooldown_until)
+                 if d is not None]
     return True, min(deadlines) if deadlines else None
 
 
@@ -1237,12 +1249,13 @@ class Gateway:
     is intentionally NOT persisted across a restart — see router.py's module
     docstring: no claimed per-session affinity, request-boundary global Pool
     state only. Transient state gets a fresh start, while ELIGIBLE versus
-    DRAINING is re-derived from valid usage restored alongside it. What IS persisted (via
-    runtime_state.py) is the last-observed usage numbers and which Profile
-    was current. Valid, unexpired usage numbers are restored so both the
-    Dashboard and Rotation retain the last known window after every
-    restart/update/service bounce. A number whose reset time has already
-    passed by load time is dropped, not restored — see _sync_snapshot()."""
+    DRAINING is re-derived from valid usage restored alongside it. What IS
+    persisted (via runtime_state.py) is the last-observed usage numbers, whether the account
+    reported no 5h window, and which Profile was current. Valid, unexpired
+    usage numbers are restored so both the Dashboard and Rotation retain the
+    last known window after every restart/update/service bounce. A number whose
+    reset time has already passed by load time is dropped, not restored — see
+    _sync_snapshot()."""
 
     _USED_NOW_GRACE_SECONDS = 900.0  # 15 minutes — see the class docstring
     # Upper bound on how long an in-flight slot with NO bytes flowing can keep
@@ -1617,6 +1630,7 @@ class Gateway:
                     automatic=p.automatic, state=new_state,
                     last_usage_percent=rt.last_usage_percent, cooldown_until=rt.cooldown_until,
                     resets_at=rt.resets_at,
+                    no_5h_window=rt.no_5h_window,
                     last_usage_percent_7d=rt.last_usage_percent_7d, resets_at_7d=rt.resets_at_7d,
                     window_label=rt.window_label, window_label_7d=rt.window_label_7d,
                     model_usage=rt.model_usage,   # rebuilt every poll tick; dropping it erased every read
@@ -3895,6 +3909,7 @@ class Gateway:
                 pid: {
                     "last_usage_percent": rt.last_usage_percent,
                     "resets_at": rt.resets_at.isoformat() if rt.resets_at else None,
+                    "no_5h_window": rt.no_5h_window,
                     "last_usage_percent_7d": rt.last_usage_percent_7d,
                     "resets_at_7d": rt.resets_at_7d.isoformat() if rt.resets_at_7d else None,
                     "window_label": rt.window_label,

@@ -61,9 +61,13 @@ class ProfileRuntime:
     automatic: bool
     state: ProfileState = ProfileState.ELIGIBLE
     last_usage_percent: Optional[float] = None
+    # True only when the provider explicitly reported no usable 5h window in
+    # the latest UsageSnapshot. A missing/stale 5h sample is not enough to let
+    # the 7d reading drive routing.
+    no_5h_window: bool = False
     cooldown_until: Optional[datetime] = None
     resets_at: Optional[datetime] = None
-    last_usage_percent_7d: Optional[float] = None  # drives Rotation only when 5h is absent; otherwise display-only
+    last_usage_percent_7d: Optional[float] = None  # drives Rotation only when no_5h_window; otherwise display-only
     resets_at_7d: Optional[datetime] = None
     window_label: Optional[str] = None  # None means "assume 5h"; see observation.UsageSnapshot
     window_label_7d: Optional[str] = None  # None means "assume 7d" (Anthropic) or "no second window" (codex); the Dashboard tells them apart by whether last_usage_percent_7d is also None
@@ -150,7 +154,9 @@ def routing_percent(profile_or_runtime: ProfileRuntime) -> Optional[float]:
     value.
     """
     primary = profile_or_runtime.last_usage_percent
-    return primary if primary is not None else profile_or_runtime.last_usage_percent_7d
+    if primary is not None:
+        return primary
+    return profile_or_runtime.last_usage_percent_7d if profile_or_runtime.no_5h_window else None
 
 
 def fits(p: ProfileRuntime, fit: Optional[RequestFit]) -> bool:
@@ -376,7 +382,13 @@ def observe(pool: PoolSnapshot, profile_id: str, observation: Observation, now: 
 
 def _apply(p: ProfileRuntime, observation: Observation, now: datetime) -> ProfileRuntime:
     if isinstance(observation, UsageSnapshot):
+        no_5h_window = p.no_5h_window
+        if observation.percent is None and observation.percent_7d is not None:
+            no_5h_window = True
+        elif observation.percent is not None:
+            no_5h_window = False
         updated = _replace(p, last_usage_percent=observation.percent, resets_at=observation.resets_at,
+                           no_5h_window=no_5h_window,
                            last_usage_percent_7d=observation.percent_7d, resets_at_7d=observation.resets_at_7d)
         used = routing_percent(updated)
         state = ProfileState.DRAINING if used is not None and used >= p.switch_threshold else ProfileState.ELIGIBLE
@@ -477,29 +489,42 @@ def recover_expired_cooldowns(pool: PoolSnapshot, now: datetime) -> PoolSnapshot
 
     new_profiles = []
     for p in pool.profiles:
-        if p.state == ProfileState.COOLDOWN and p.cooldown_until is not None and now >= p.cooldown_until:
-            new_profiles.append(_replace(p, state=ProfileState.ELIGIBLE, cooldown_until=None))
-        elif p.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING):
-            primary_expired = p.resets_at is not None and now >= p.resets_at
-            secondary_expired = p.resets_at_7d is not None and now >= p.resets_at_7d
-            if not primary_expired and (p.resets_at is not None or not secondary_expired):
-                new_profiles.append(p)
-                continue
-            last_usage_percent = None if primary_expired else p.last_usage_percent
-            resets_at = None if primary_expired else p.resets_at
-            last_usage_percent_7d = None if secondary_expired else p.last_usage_percent_7d
-            resets_at_7d = None if secondary_expired else p.resets_at_7d
-            refreshed = _replace(
-                p, last_usage_percent=last_usage_percent, resets_at=resets_at,
-                last_usage_percent_7d=last_usage_percent_7d, resets_at_7d=resets_at_7d,
-            )
-            used = routing_percent(refreshed)
-            state = (ProfileState.DRAINING
-                     if used is not None and used >= p.switch_threshold
-                     else ProfileState.ELIGIBLE)
-            new_profiles.append(_replace(refreshed, state=state))
-        else:
-            new_profiles.append(p)
+        primary_expired = p.resets_at is not None and now >= p.resets_at
+        secondary_expired = p.resets_at_7d is not None and now >= p.resets_at_7d
+        refreshed = _replace(
+            p,
+            last_usage_percent=None if primary_expired else p.last_usage_percent,
+            resets_at=None if primary_expired else p.resets_at,
+            last_usage_percent_7d=None if secondary_expired else p.last_usage_percent_7d,
+            resets_at_7d=None if secondary_expired else p.resets_at_7d,
+        ) if primary_expired or secondary_expired else p
+
+        if p.state == ProfileState.COOLDOWN:
+            if p.cooldown_until is not None and now >= p.cooldown_until:
+                new_profiles.append(_replace(refreshed, state=ProfileState.ELIGIBLE, cooldown_until=None))
+            else:
+                new_profiles.append(refreshed)
+            continue
+
+        if p.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING):
+            # A 5h reset refills ordinary Team/Pro accounts. A 7d reset is the
+            # equivalent refill only for an account that reported no 5h
+            # window; for a normal account it is display data and must not
+            # change quota state.
+            refill_expired = primary_expired or (p.no_5h_window and secondary_expired)
+            if refill_expired:
+                used = routing_percent(refreshed)
+                state = (ProfileState.DRAINING
+                         if used is not None and used >= p.switch_threshold
+                         else ProfileState.ELIGIBLE)
+                new_profiles.append(_replace(refreshed, state=state))
+            else:
+                new_profiles.append(refreshed)
+            continue
+
+        # Expired 7d data is independent display state. Clearing it here must
+        # not alter an account whose 5h window is still live.
+        new_profiles.append(refreshed)
     return PoolSnapshot(profiles=new_profiles, current_profile_id=pool.current_profile_id)
 
 
@@ -513,7 +538,9 @@ def _reset_sort_key(p: ProfileRuntime) -> tuple:
     # Profiles with a known, sooner reset are preferred (spend the one that's
     # about to refill anyway); profiles with no reset info sort last within
     # their priority band, not first.
-    reset = p.resets_at if p.resets_at is not None else p.resets_at_7d
+    reset = p.resets_at
+    if reset is None and p.no_5h_window:
+        reset = p.resets_at_7d
     return (0, reset) if reset is not None else (1, None)
 
 
