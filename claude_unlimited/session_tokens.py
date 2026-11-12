@@ -97,6 +97,14 @@ class SessionGrant:
     distribute: bool = False
 
 
+@dataclass(frozen=True)
+class SessionTokenDetails:
+    """Non-secret details used to explain why a session token was rejected."""
+
+    kind: str
+    last_used_at: Optional[str]
+
+
 def get_or_create(profile_id: str) -> str:
     """Returns a token that resolve() will map back to `profile_id`. Reuses
     an existing live one for the same profile_id if there is one, instead
@@ -154,3 +162,38 @@ def resolve_grant(token: str) -> SessionGrant:
         if profile_id:
             return SessionGrant(forced_profile_id=profile_id)  # a pin always wins
         return SessionGrant(distribute=entry.get("mode") == "distribute")
+
+
+def token_status(token: str) -> str:
+    """Classify a token without changing the session-token file.
+
+    The result is ``live`` for an entry that still passes the sliding expiry
+    rule, ``expired`` for an entry that does not, and ``unknown`` when the
+    token is not present.  The token itself is never returned or logged.
+    """
+    with _lock:
+        entry = _load().get(token)
+        if entry is None:
+            return "unknown"
+        return "live" if isinstance(entry, dict) and not _is_expired(entry, _now()) else "expired"
+
+
+def token_details(token: str) -> Optional[SessionTokenDetails]:
+    """Return safe explanatory details for a stored token entry.
+
+    This deliberately omits the token value.  ``created_at`` is the effective
+    last-use time for legacy entries that have no persisted ``last_used_at``.
+    """
+    with _lock:
+        entry = _load().get(token)
+        if not isinstance(entry, dict):
+            return None
+        profile_id = entry.get("profile_id")
+        if profile_id:
+            kind = f"profile:{profile_id}"
+        elif entry.get("mode") == "distribute":
+            kind = "distribute"
+        else:
+            kind = "unknown"
+        last_used_at = entry.get("last_used_at") or entry.get("created_at")
+        return SessionTokenDetails(kind=kind, last_used_at=last_used_at if isinstance(last_used_at, str) else None)

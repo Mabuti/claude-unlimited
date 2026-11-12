@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -209,3 +210,55 @@ def test_expired_distribute_token_no_longer_grants_anything():
     data[token]["created_at"] = stale
     session_tokens._save(data)
     assert session_tokens.resolve_grant(token) == session_tokens.SessionGrant()
+
+
+@pytest.fixture
+def token_store(tmp_path, monkeypatch):
+    token_file = tmp_path / "session_tokens.json"
+    now = datetime(2026, 11, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(session_tokens, "SESSION_TOKENS_FILE", token_file)
+    monkeypatch.setattr(session_tokens, "_now", lambda: now)
+    return token_file, now
+
+
+def test_token_status_uses_sliding_expiry_and_does_not_write(token_store, monkeypatch):
+    token_file, now = token_store
+    live_token = "fixture-live-token"
+    expired_token = "fixture-expired-token"
+    token_file.write_text(json.dumps({
+        live_token: {
+            "mode": "distribute",
+            "created_at": (now - timedelta(days=31)).isoformat(),
+            "last_used_at": (now - timedelta(days=1)).isoformat(),
+        },
+        expired_token: {
+            "profile_id": "profile-a",
+            "created_at": (now - timedelta(days=31)).isoformat(),
+            "last_used_at": (now - timedelta(days=31)).isoformat(),
+        },
+    }))
+    before = token_file.read_bytes()
+    monkeypatch.setattr(session_tokens, "_save", lambda _data: pytest.fail("token_status must not write"))
+
+    assert session_tokens.token_status(live_token) == "live"
+    assert session_tokens.token_status(expired_token) == "expired"
+    assert session_tokens.token_status("fixture-unknown-token") == "unknown"
+    assert token_file.read_bytes() == before
+
+
+def test_token_details_exposes_only_kind_and_effective_last_use(token_store):
+    token_file, now = token_store
+    token = "fixture-profile-token"
+    last_used_at = (now - timedelta(days=31)).isoformat()
+    token_file.write_text(json.dumps({token: {
+        "profile_id": "profile-a",
+        "created_at": (now - timedelta(days=32)).isoformat(),
+        "last_used_at": last_used_at,
+    }}))
+
+    details = session_tokens.token_details(token)
+
+    assert details is not None
+    assert details.kind == "profile:profile-a"
+    assert details.last_used_at == last_used_at
+    assert token not in repr(details)

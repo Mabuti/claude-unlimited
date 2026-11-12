@@ -21,7 +21,9 @@ Security posture:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -129,6 +131,12 @@ _CHARTS_CSS = (_STATIC_DIR / "vendor" / "charts.css").read_text(encoding="utf-8"
 
 # Regenerated every daemon start; lives only in this process's memory.
 _CSRF_TOKEN = secrets.token_urlsafe(32)
+
+_LOGGER = logging.getLogger(__name__)
+_SESSION_TOKEN_ACTIVITY_INTERVAL_SECONDS = 10 * 60
+_session_token_activity_lock = threading.Lock()
+_session_token_activity_last_recorded: dict[tuple[str, bytes], float] = {}
+_session_token_log_last_recorded: dict[tuple[str, bytes], float] = {}
 
 
 def _is_wsl() -> bool:
@@ -1950,6 +1958,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         grant = session_tokens.resolve_grant(presented)
         if grant.forced_profile_id is not None or grant.distribute:
             return (grant,)
+        self._diagnose_rejected_session_token(presented)
         if openai:
             # The Codex CLI reads error.message from an OpenAI envelope.
             self._send_json(401, {"error": {"message": "[claude-unlimited] invalid local credential",
@@ -1958,6 +1967,46 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self._send_json(401, {"type": "error", "error": {"type": "authentication_error",
                                                            "message": "[claude-unlimited] invalid local credential"}})
         return None
+
+    @staticmethod
+    def _session_token_rate_limit_key(presented: str) -> tuple[str, bytes]:
+        return (str(session_tokens.SESSION_TOKENS_FILE), hashlib.sha256(presented.encode()).digest())
+
+    @classmethod
+    def _allow_session_token_diagnostic(cls, cache: dict[tuple[str, bytes], float], key: tuple[str, bytes]) -> bool:
+        now = time.monotonic()
+        cutoff = now - _SESSION_TOKEN_ACTIVITY_INTERVAL_SECONDS
+        with _session_token_activity_lock:
+            for old_key, recorded_at in list(cache.items()):
+                if recorded_at <= cutoff:
+                    del cache[old_key]
+            if key in cache:
+                return False
+            cache[key] = now
+            return True
+
+    @classmethod
+    def _diagnose_rejected_session_token(cls, presented: str) -> None:
+        status = session_tokens.token_status(presented)
+        key = cls._session_token_rate_limit_key(presented)
+        if status == "expired":
+            details = session_tokens.token_details(presented)
+            kind = details.kind if details is not None else "unknown"
+            last_used_at = details.last_used_at if details is not None else None
+            last_used_at = last_used_at or "unknown"
+            _LOGGER.warning(
+                "Rejected expired session credential: kind=%s last-use=%s",
+                kind,
+                last_used_at,
+            )
+            if cls._allow_session_token_diagnostic(_session_token_activity_last_recorded, key):
+                activity.record(
+                    "error",
+                    "A session's local credential expired — restart that session, or run the session-token rescue",
+                    meta=f"kind={kind}, last-use={last_used_at}",
+                )
+        elif status == "unknown" and cls._allow_session_token_diagnostic(_session_token_log_last_recorded, key):
+            _LOGGER.info("Rejected unknown local credential")
 
     def _handle_proxy_request(self, method: str, path: str) -> None:
         """Everything that isn't /health or /api/*: the live proxy path.
