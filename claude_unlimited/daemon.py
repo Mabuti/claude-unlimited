@@ -1995,15 +1995,15 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             kind = details.kind if details is not None else "unknown"
             last_used_at = details.last_used_at if details is not None else None
             last_used_at = last_used_at or "unknown"
-            _LOGGER.warning(
-                "Rejected expired session credential: kind=%s last-use=%s",
-                kind,
-                last_used_at,
-            )
             if cls._allow_session_token_diagnostic(_session_token_activity_last_recorded, key):
+                _LOGGER.warning(
+                    "Rejected expired session credential: kind=%s last-use=%s",
+                    kind,
+                    last_used_at,
+                )
                 activity.record(
                     "error",
-                    "A session's local credential expired — restart that session, or run the session-token rescue",
+                    "A session's local credential expired — restart that session to get a new one.",
                     meta=f"kind={kind}, last-use={last_used_at}",
                 )
         elif status == "unknown" and cls._allow_session_token_diagnostic(_session_token_log_last_recorded, key):

@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -125,6 +126,44 @@ def test_resolve_grant_persists_last_use_at_most_once_per_hour(frozen_clock, mon
         assert session_tokens.resolve_grant(token) == session_tokens.SessionGrant(forced_profile_id="prof-a")
 
     assert len(saves) <= 1
+
+
+def test_resolve_grant_returns_grant_when_last_use_save_fails(frozen_clock, monkeypatch, caplog):
+    token = session_tokens.get_or_create("prof-a")
+    attempts = []
+
+    def failing_save(_data):
+        attempts.append(token)
+        raise OSError("read-only fixture")
+
+    monkeypatch.setattr(session_tokens, "_save", failing_save)
+    caplog.set_level(logging.WARNING, logger=session_tokens._LOGGER.name)
+
+    assert session_tokens.resolve_grant(token) == session_tokens.SessionGrant(forced_profile_id="prof-a")
+    for _ in range(100):
+        assert session_tokens.resolve_grant(token) == session_tokens.SessionGrant(forced_profile_id="prof-a")
+
+    assert len(attempts) <= 2
+    assert len([record for record in caplog.records if record.levelno == logging.WARNING]) == 1
+    assert token not in caplog.text
+
+
+def test_reused_token_is_returned_when_last_use_save_fails(frozen_clock, monkeypatch):
+    token = session_tokens.get_or_create("prof-a")
+    frozen_clock.advance(minutes=5)
+    attempts = []
+
+    def failing_save(_data):
+        attempts.append(token)
+        raise OSError("read-only fixture")
+
+    monkeypatch.setattr(session_tokens, "_save", failing_save)
+
+    assert session_tokens.get_or_create("prof-a") == token
+    for _ in range(100):
+        assert session_tokens.get_or_create("prof-a") == token
+
+    assert len(attempts) <= 2
 
 
 def test_reused_distribute_token_used_across_45_days_never_stops_resolving(frozen_clock):

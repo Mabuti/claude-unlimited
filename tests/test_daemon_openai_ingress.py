@@ -195,7 +195,7 @@ def test_expired_session_token_keeps_401_and_records_safe_diagnostics(server_wit
                                                   "message": "[claude-unlimited] invalid local credential"}}
     assert len(events) == 1
     assert events[0][0] == "error"
-    assert events[0][1] == "A session's local credential expired — restart that session, or run the session-token rescue"
+    assert events[0][1] == "A session's local credential expired — restart that session to get a new one."
     assert events[0][2] == f"kind=distribute, last-use={last_used_at}"
     assert "distribute" in caplog.text
     assert last_used_at in caplog.text
@@ -203,15 +203,18 @@ def test_expired_session_token_keeps_401_and_records_safe_diagnostics(server_wit
     assert token not in " ".join(str(part) for event in events for part in event if part is not None)
 
 
-def test_expired_session_token_activity_is_rate_limited(server_with, monkeypatch):
+def test_expired_session_token_diagnostics_are_rate_limited(server_with, monkeypatch, caplog):
     token = "fixture-rate-limited-session-token"
     now = datetime(2026, 11, 12, tzinfo=timezone.utc)
+    monotonic_now = [1000.0]
     monkeypatch.setattr(session_tokens, "_now", lambda: now)
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: monotonic_now[0])
     _write_session_token(token, profile_id="profile-a", created_at="2026-09-01T12:00:00+00:00",
                         last_used_at="2026-10-01T12:00:00+00:00")
     events = []
     monkeypatch.setattr(daemon.activity, "record",
                         lambda category, text, meta=None: events.append((category, text, meta)))
+    caplog.set_level(logging.WARNING, logger=daemon._LOGGER.name)
     base = server_with([_codex()])
 
     for _ in range(20):
@@ -220,6 +223,17 @@ def test_expired_session_token_activity_is_rate_limited(server_with, monkeypatch
         assert payload["error"]["message"] == "[claude-unlimited] invalid local credential"
 
     assert len(events) == 1
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+
+    monotonic_now[0] += daemon._SESSION_TOKEN_ACTIVITY_INTERVAL_SECONDS + 1
+    status, _headers, payload = _error(_post(base, "/v1/messages", token=token))
+
+    assert status == 401
+    assert payload["error"]["message"] == "[claude-unlimited] invalid local credential"
+    assert len(events) == 2
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 2
 
 
 def test_unknown_session_token_is_rejected_without_activity(server_with, monkeypatch, caplog):

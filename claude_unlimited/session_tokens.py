@@ -17,6 +17,7 @@ under itself and dead entries don't accumulate indefinitely.
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import threading
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ SESSION_TOKENS_FILE = APP_DIR / "session_tokens.json"
 SESSION_TOKEN_TTL = timedelta(days=30)
 LAST_USED_WRITE_INTERVAL = timedelta(hours=1)
 _lock = threading.Lock()
+_LOGGER = logging.getLogger(__name__)
+_last_used_write_failures: dict[tuple[str, str], datetime] = {}
 
 
 def _now() -> datetime:
@@ -83,6 +86,21 @@ def _record_use(entry: dict, now: datetime) -> bool:
     return True
 
 
+def _save_after_recording_use(data: dict, token: str, now: datetime) -> None:
+    """Persist a last-use update without making an authorized request fail."""
+    key = (str(SESSION_TOKENS_FILE), token)
+    failed_at = _last_used_write_failures.get(key)
+    if failed_at is not None and now - failed_at < LAST_USED_WRITE_INTERVAL:
+        return
+    try:
+        _save(data)
+    except OSError:
+        _last_used_write_failures[key] = now
+        _LOGGER.warning("Could not persist session-token last-use time; continuing")
+    else:
+        _last_used_write_failures.pop(key, None)
+
+
 @dataclass(frozen=True)
 class SessionGrant:
     """What a session token entitles this terminal to.
@@ -130,7 +148,9 @@ def _get_or_create_entry(fields: dict, matches) -> str:
         for tok, entry in alive.items():
             if matches(entry):
                 touched = _record_use(entry, now)
-                if touched or len(alive) != len(data):
+                if touched:
+                    _save_after_recording_use(alive, tok, now)
+                elif len(alive) != len(data):
                     _save(alive)
                 return tok
         token = secrets.token_urlsafe(32)
@@ -157,7 +177,7 @@ def resolve_grant(token: str) -> SessionGrant:
         if entry is None or _is_expired(entry, now):
             return SessionGrant()
         if _record_use(entry, now):
-            _save(data)
+            _save_after_recording_use(data, token, now)
         profile_id = entry.get("profile_id")
         if profile_id:
             return SessionGrant(forced_profile_id=profile_id)  # a pin always wins
