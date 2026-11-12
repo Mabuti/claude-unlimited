@@ -174,7 +174,7 @@ def anthropic_usage_headers(body) -> Optional[dict]:
     observation.classify() already understands, so a reading here lands in
     exactly the pipeline a real response does. The endpoint reports
     utilization as a percentage (46.0 means 46%); the headers carry 0-1.
-    None when the 5-hour window is missing — there is nothing to show."""
+    None when neither usage window is readable."""
     if not isinstance(body, dict):
         return None
     headers: dict = {}
@@ -193,7 +193,7 @@ def anthropic_usage_headers(body) -> Optional[dict]:
                     int(datetime.fromisoformat(resets_at.replace("Z", "+00:00")).timestamp()))
             except ValueError:
                 pass
-    return headers if "anthropic-ratelimit-unified-5h-utilization" in headers else None
+    return headers or None
 
 
 def anthropic_model_windows(body) -> tuple:
@@ -323,6 +323,26 @@ def codex_usage_headers(body) -> Optional[dict]:
     return headers
 
 
+def _has_usable_window(headers: Optional[dict]) -> bool:
+    """Whether synthesized headers contain at least one numeric usage window."""
+    if not isinstance(headers, dict):
+        return False
+    keys = (
+        "anthropic-ratelimit-unified-5h-utilization",
+        "anthropic-ratelimit-unified-7d-utilization",
+        "x-codex-primary-used-percent",
+        "x-codex-secondary-used-percent",
+    )
+    for key in keys:
+        value = headers.get(key)
+        try:
+            if value is not None and not isinstance(value, bool) and float(value) == float(value):
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
+
+
 # ---- scheduling ---------------------------------------------------------------
 
 def interval_for(profile_id: str, observed_at: float) -> float:
@@ -389,7 +409,7 @@ class Scheduler:
         outcome is worth one line in Activity (the start of a rate limit or a
         refusal, or a run of failures); None otherwise."""
         now = self._clock()
-        if result.status == 200 and result.headers:
+        if result.status == 200 and _has_usable_window(result.headers):
             outcome = "ok"
         elif result.status == 429:
             outcome = "rate_limited"

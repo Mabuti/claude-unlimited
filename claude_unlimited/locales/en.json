@@ -56,6 +56,7 @@
   "profile.resets_in": "resets in",
   "profile.resets_on": "resets",
   "profile.not_observed": "not yet observed",
+  "profile.no_5h_window": "no 5h window",
   "profile.session_5h": "5h session",
   "profile.session_7d": "7d weekly",
   "profile.model_window": "{model} weekly",

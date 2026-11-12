@@ -28,6 +28,21 @@ def test_success_with_usage_headers_yields_usage_snapshot():
     assert obs.resets_at.year == 2026
 
 
+def test_success_with_only_7d_usage_headers_yields_a_7d_snapshot():
+    headers = {
+        "anthropic-ratelimit-unified-7d-utilization": "0.96",
+        "anthropic-ratelimit-unified-7d-reset": "1783882799",
+    }
+
+    obs = classify(200, headers, NOW)
+
+    assert isinstance(obs, UsageSnapshot)
+    assert obs.percent is None
+    assert obs.resets_at is None
+    assert obs.percent_7d == 96.0
+    assert obs.resets_at_7d == datetime.fromtimestamp(1783882799, tz=timezone.utc)
+
+
 def test_reset_header_parsed_as_unix_epoch_not_iso8601():
     headers = {"anthropic-ratelimit-unified-5h-utilization": "0.5",
                "anthropic-ratelimit-unified-5h-reset": "1787191800"}

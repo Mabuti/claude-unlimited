@@ -56,6 +56,7 @@
   "profile.resets_in": "Zurücksetzung in",
   "profile.resets_on": "Zurücksetzung",
   "profile.not_observed": "noch nicht beobachtet",
+  "profile.no_5h_window": "kein 5h-Fenster",
   "profile.session_5h": "5-Std.-Sitzung",
   "profile.session_7d": "7-Tage-Woche",
   "profile.model_window": "{model} wöchentlich",

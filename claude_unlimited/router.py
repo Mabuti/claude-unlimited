@@ -63,7 +63,7 @@ class ProfileRuntime:
     last_usage_percent: Optional[float] = None
     cooldown_until: Optional[datetime] = None
     resets_at: Optional[datetime] = None
-    last_usage_percent_7d: Optional[float] = None  # display-only, never drives Rotation
+    last_usage_percent_7d: Optional[float] = None  # drives Rotation only when 5h is absent; otherwise display-only
     resets_at_7d: Optional[datetime] = None
     window_label: Optional[str] = None  # None means "assume 5h"; see observation.UsageSnapshot
     window_label_7d: Optional[str] = None  # None means "assume 7d" (Anthropic) or "no second window" (codex); the Dashboard tells them apart by whether last_usage_percent_7d is also None
@@ -139,6 +139,18 @@ class RequestFit:
     same account serves every smaller conversation."""
     estimated_tokens: int = 0
     over_capacity: frozenset = frozenset()
+
+
+def routing_percent(profile_or_runtime: ProfileRuntime) -> Optional[float]:
+    """The usage percentage that drives routing for one runtime profile.
+
+    A normal Claude account routes on its 5-hour window. A Max account can
+    have no 5-hour window at all, in which case its 7-day reading is the only
+    honest routing signal. The 7-day value never overrides a readable 5-hour
+    value.
+    """
+    primary = profile_or_runtime.last_usage_percent
+    return primary if primary is not None else profile_or_runtime.last_usage_percent_7d
 
 
 def fits(p: ProfileRuntime, fit: Optional[RequestFit]) -> bool:
@@ -300,7 +312,7 @@ def choose_for_new_branch(pool: PoolSnapshot, now: datetime,
          it falls through to priority.
       2. priority band — decides the order WITHIN a round, so the user's
          preference still says who is used first, second, third.
-      3. least-utilized first (`last_usage_percent`) — accounts are limited
+      3. least-utilized first (5h usage, or 7d when 5h is absent) — accounts are limited
          by usage windows, not request count. A profile with no observation
          yet sorts as 0.0, so a fresh account is preferred over a part-spent
          one at the same priority.
@@ -341,7 +353,7 @@ def choose_for_new_branch(pool: PoolSnapshot, now: datetime,
     candidates.sort(key=lambda p: (
         counts.get(p.profile_id, 0),
         p.priority,
-        p.last_usage_percent if p.last_usage_percent is not None else 0.0,
+        routing_percent(p) if routing_percent(p) is not None else 0.0,
         _reset_sort_key(p),
         p.profile_id,  # final tie-break so equal candidates order deterministically
     ))
@@ -364,7 +376,10 @@ def observe(pool: PoolSnapshot, profile_id: str, observation: Observation, now: 
 
 def _apply(p: ProfileRuntime, observation: Observation, now: datetime) -> ProfileRuntime:
     if isinstance(observation, UsageSnapshot):
-        state = ProfileState.DRAINING if observation.percent >= p.switch_threshold else ProfileState.ELIGIBLE
+        updated = _replace(p, last_usage_percent=observation.percent, resets_at=observation.resets_at,
+                           last_usage_percent_7d=observation.percent_7d, resets_at_7d=observation.resets_at_7d)
+        used = routing_percent(updated)
+        state = ProfileState.DRAINING if used is not None and used >= p.switch_threshold else ProfileState.ELIGIBLE
         if state is ProfileState.DRAINING and _credits_can_serve(p):
             # Same reasoning as the QuotaExhausted branch: a credit-funded
             # account is not draining towards unavailability, so the switch
@@ -374,8 +389,7 @@ def _apply(p: ProfileRuntime, observation: Observation, now: datetime) -> Profil
         # A real response carries no per-model windows (model_windows None):
         # keep the last usage read's, or every request would erase them.
         model_usage = p.model_usage if observation.model_windows is None else tuple(observation.model_windows)
-        return _replace(p, state=state, last_usage_percent=observation.percent, resets_at=observation.resets_at,
-                         last_usage_percent_7d=observation.percent_7d, resets_at_7d=observation.resets_at_7d,
+        return _replace(updated, state=state,
                          window_label=observation.window_label, window_label_7d=observation.window_label_7d,
                          model_usage=model_usage,
                          consecutive_unretryable_failures=0)  # a success: this Profile works again
@@ -453,7 +467,7 @@ def spending_on_credits(p: ProfileRuntime) -> bool:
     show so nobody spends money without seeing it."""
     if not _credits_can_serve(p):
         return False
-    used = p.last_usage_percent
+    used = routing_percent(p)
     return used is not None and used >= p.switch_threshold
 
 
@@ -465,8 +479,25 @@ def recover_expired_cooldowns(pool: PoolSnapshot, now: datetime) -> PoolSnapshot
     for p in pool.profiles:
         if p.state == ProfileState.COOLDOWN and p.cooldown_until is not None and now >= p.cooldown_until:
             new_profiles.append(_replace(p, state=ProfileState.ELIGIBLE, cooldown_until=None))
-        elif p.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING) and p.resets_at is not None and now >= p.resets_at:
-            new_profiles.append(_replace(p, state=ProfileState.ELIGIBLE, resets_at=None, last_usage_percent=None))
+        elif p.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING):
+            primary_expired = p.resets_at is not None and now >= p.resets_at
+            secondary_expired = p.resets_at_7d is not None and now >= p.resets_at_7d
+            if not primary_expired and (p.resets_at is not None or not secondary_expired):
+                new_profiles.append(p)
+                continue
+            last_usage_percent = None if primary_expired else p.last_usage_percent
+            resets_at = None if primary_expired else p.resets_at
+            last_usage_percent_7d = None if secondary_expired else p.last_usage_percent_7d
+            resets_at_7d = None if secondary_expired else p.resets_at_7d
+            refreshed = _replace(
+                p, last_usage_percent=last_usage_percent, resets_at=resets_at,
+                last_usage_percent_7d=last_usage_percent_7d, resets_at_7d=resets_at_7d,
+            )
+            used = routing_percent(refreshed)
+            state = (ProfileState.DRAINING
+                     if used is not None and used >= p.switch_threshold
+                     else ProfileState.ELIGIBLE)
+            new_profiles.append(_replace(refreshed, state=state))
         else:
             new_profiles.append(p)
     return PoolSnapshot(profiles=new_profiles, current_profile_id=pool.current_profile_id)
@@ -482,7 +513,8 @@ def _reset_sort_key(p: ProfileRuntime) -> tuple:
     # Profiles with a known, sooner reset are preferred (spend the one that's
     # about to refill anyway); profiles with no reset info sort last within
     # their priority band, not first.
-    return (0, p.resets_at) if p.resets_at is not None else (1, None)
+    reset = p.resets_at if p.resets_at is not None else p.resets_at_7d
+    return (0, reset) if reset is not None else (1, None)
 
 
 def _next_unretryable_streak(p: ProfileRuntime, retry_after_seconds: Optional[float]) -> int:

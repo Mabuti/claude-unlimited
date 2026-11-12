@@ -27,6 +27,10 @@ ANTHROPIC_BODY = {
     "seven_day_opus": None,
     "extra_usage": {"is_enabled": False},
 }
+MAX_ANTHROPIC_BODY = {
+    "five_hour": None,
+    "seven_day": {"utilization": 96.0, "resets_at": "2026-11-12T02:59:59+00:00"},
+}
 CODEX_BODY = {
     "plan_type": "plus",
     "rate_limit": {
@@ -50,6 +54,17 @@ def test_anthropic_usage_becomes_the_same_snapshot_a_real_response_gives():
     assert snap.resets_at == datetime(2026, 9, 16, 0, 0, 0, tzinfo=timezone.utc)
 
 
+def test_max_anthropic_usage_keeps_the_7d_window_when_5h_is_missing():
+    headers = usage_probe.anthropic_usage_headers(MAX_ANTHROPIC_BODY)
+
+    assert headers == {
+        "anthropic-ratelimit-unified-7d-utilization": "0.96",
+        "anthropic-ratelimit-unified-7d-reset": str(
+            int(datetime(2026, 11, 12, 2, 59, 59, tzinfo=timezone.utc).timestamp())
+        ),
+    }
+
+
 def test_codex_usage_becomes_the_same_snapshot_a_real_response_gives():
     headers = usage_probe.codex_usage_headers(CODEX_BODY)
     snap = openai_observation.classify(200, headers, NOW)
@@ -59,7 +74,7 @@ def test_codex_usage_becomes_the_same_snapshot_a_real_response_gives():
 
 
 @pytest.mark.parametrize("body", [None, [], {}, {"five_hour": None}, {"five_hour": {"utilization": "46"}},
-                                  {"seven_day": {"utilization": 10.0}}])
+                                  {"seven_day": {"utilization": "10"}}])
 def test_unreadable_anthropic_shapes_yield_nothing(body):
     assert usage_probe.anthropic_usage_headers(body) is None
 
@@ -211,7 +226,15 @@ def test_a_refused_credential_backs_off_for_hours_without_resting_the_provider(s
 
 def test_a_success_clears_the_backoff(sched):
     sched.record("a", "anthropic", ProbeResult(status=500))
-    sched.record("a", "anthropic", ProbeResult(status=200, headers={"x": "1"}))
+    sched.record("a", "anthropic", ProbeResult(
+        status=200, headers={"anthropic-ratelimit-unified-5h-utilization": "0.1"}))
+    assert "a" not in sched._loaded()["profiles"]
+
+
+def test_a_7d_only_success_clears_the_backoff(sched):
+    sched.record("a", "anthropic", ProbeResult(status=500))
+    sched.record("a", "anthropic", ProbeResult(
+        status=200, headers=usage_probe.anthropic_usage_headers(MAX_ANTHROPIC_BODY)))
     assert "a" not in sched._loaded()["profiles"]
 
 

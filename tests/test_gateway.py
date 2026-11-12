@@ -56,6 +56,57 @@ def test_single_healthy_profile_serves_request(pool_env):
     assert result.profile_id == "a"
 
 
+def test_7d_only_usage_drives_gateway_rotation(pool_env):
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="max-profile", kind="oauth", priority=1,
+                automatic=True, enabled=True, switch_threshold=95.0),
+        Profile(id="b", name="team-profile", kind="oauth", priority=2,
+                automatic=True, enabled=True, switch_threshold=95.0),
+    ]))
+    calls = []
+
+    def transport(req):
+        calls.append(req.headers.get("Authorization"))
+        if len(calls) == 1:
+            return fake_response(200, {
+                "anthropic-ratelimit-unified-7d-utilization": "0.96",
+                "anthropic-ratelimit-unified-7d-reset": "4102444800",
+            })
+        return fake_response(200, {
+            "anthropic-ratelimit-unified-5h-utilization": "0.10",
+            "anthropic-ratelimit-unified-5h-reset": "1787191800",
+        })
+
+    gw = Gateway(transport=transport)
+    first = gw.handle("POST", "/v1/messages", {}, b"{}")
+    list(first.body_chunks or ())
+    second = gw.handle("POST", "/v1/messages", {}, b"{}")
+
+    assert first.profile_id == "a"
+    assert second.profile_id == "b"
+    assert gw.runtime_snapshot()["a"].last_usage_percent is None
+
+
+def test_7d_only_usage_survives_gateway_restart(pool_env):
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="max-profile", kind="oauth", priority=1,
+                automatic=True, enabled=True, switch_threshold=95.0),
+    ]))
+    gw = Gateway(transport=lambda req: fake_response(200, {
+        "anthropic-ratelimit-unified-7d-utilization": "0.96",
+        "anthropic-ratelimit-unified-7d-reset": "4102444800",
+    }))
+    first = gw.handle("POST", "/v1/messages", {}, b"{}")
+    list(first.body_chunks or ())
+
+    restored = Gateway(transport=lambda req: fake_response(200))
+    runtime = restored.runtime_snapshot()["a"]
+
+    assert runtime.last_usage_percent is None
+    assert runtime.last_usage_percent_7d == 96.0
+    assert runtime.state == gateway_module.ProfileState.DRAINING
+
+
 def test_no_profiles_returns_503_not_a_rate_limit(pool_env):
     # An empty CONFIG is not a quota condition: no amount of waiting adds a
     # Profile. Only a pool emptied by exhaustion/cooldown/draining earns the

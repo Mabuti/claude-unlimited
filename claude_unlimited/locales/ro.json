@@ -56,6 +56,7 @@
   "profile.resets_in": "se resetează în",
   "profile.resets_on": "se resetează",
   "profile.not_observed": "încă neobservat",
+  "profile.no_5h_window": "fără fereastră de 5h",
   "profile.session_5h": "sesiune 5h",
   "profile.session_7d": "săptămânal 7z",
   "profile.model_window": "{model} săptămânal",

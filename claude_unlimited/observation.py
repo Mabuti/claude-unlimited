@@ -32,10 +32,10 @@ class ModelWindow:
 
 @dataclass(frozen=True)
 class UsageSnapshot:
-    percent: float
+    percent: Optional[float]
     resets_at: Optional[datetime]
     confidence: str  # "measured" | "estimated"
-    percent_7d: Optional[float] = None  # the unified-7d sibling of `percent`; display-only, never drives Rotation
+    percent_7d: Optional[float] = None  # the unified-7d sibling; drives Rotation only when `percent` is None
     resets_at_7d: Optional[datetime] = None
     # What the two window slots above represent. Anthropic always reports
     # both a 5h and a 7d window, but a codex-kind Profile may report a
@@ -201,16 +201,18 @@ def classify(status_code: int, headers: dict[str, str], now: datetime) -> Observ
 
 def _usage_snapshot_from_headers(headers: dict[str, str]) -> Optional[UsageSnapshot]:
     utilization = _parse_float(headers.get("anthropic-ratelimit-unified-5h-utilization"))
-    if utilization is None:
-        return None
-    percent = utilization * 100
-    resets_at = _parse_reset(headers.get("anthropic-ratelimit-unified-5h-reset"))
-
     utilization_7d = _parse_float(headers.get("anthropic-ratelimit-unified-7d-utilization"))
-    percent_7d = round(utilization_7d * 100, 2) if utilization_7d is not None else None
-    resets_at_7d = _parse_reset(headers.get("anthropic-ratelimit-unified-7d-reset"))
+    if utilization is None and utilization_7d is None:
+        return None
+    percent = round(utilization * 100, 2) if utilization is not None else None
+    resets_at = (_parse_reset(headers.get("anthropic-ratelimit-unified-5h-reset"))
+                 if utilization is not None else None)
 
-    return UsageSnapshot(percent=round(percent, 2), resets_at=resets_at, confidence="measured",
+    percent_7d = round(utilization_7d * 100, 2) if utilization_7d is not None else None
+    resets_at_7d = (_parse_reset(headers.get("anthropic-ratelimit-unified-7d-reset"))
+                    if utilization_7d is not None else None)
+
+    return UsageSnapshot(percent=percent, resets_at=resets_at, confidence="measured",
                           percent_7d=percent_7d, resets_at_7d=resets_at_7d)
 
 

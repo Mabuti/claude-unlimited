@@ -1,9 +1,11 @@
 """Persists the Dashboard-visible slice of Gateway's live runtime state
 (usage %, reset times, which Profile is current) across daemon restarts.
-A display cache only, never a source of truth for Rotation decisions.
+Valid, unexpired usage numbers are restored and may drive Rotation; quota
+state itself is still re-derived rather than persisted.
 
-Deliberately NOT persisted: AUTH_INVALID/EXHAUSTED/COOLDOWN/DRAINING states
-or cooldown_until — a restart should give every enabled Profile a fresh try.
+Deliberately NOT persisted: AUTH_INVALID/EXHAUSTED/COOLDOWN/DRAINING state
+or cooldown_until. Transient state gets a fresh start, while ELIGIBLE versus
+DRAINING is re-derived from any valid usage number restored alongside it.
 Only the last-observed usage numbers are restored, so the Dashboard doesn't
 show a wall of "not yet observed" after every restart. A number whose
 resets_at has already passed at load time is dropped rather than restored:

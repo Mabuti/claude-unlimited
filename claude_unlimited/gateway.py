@@ -51,6 +51,7 @@ from .router import (
     observe,
     record_credits,
     recover_expired_cooldowns,
+    routing_percent,
 )
 from .upstream import UpstreamResponse
 from .upstream import send as real_send
@@ -79,8 +80,10 @@ def _pool_retry_after_seconds(pool: PoolSnapshot, now: datetime) -> Optional[int
     for p in pool.profiles:
         if p.state == ProfileState.COOLDOWN and p.cooldown_until is not None:
             deadlines.append(p.cooldown_until)
-        elif p.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING) and p.resets_at is not None:
-            deadlines.append(p.resets_at)
+        elif p.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING):
+            reset = p.resets_at if p.resets_at is not None else p.resets_at_7d
+            if reset is not None:
+                deadlines.append(reset)
     if not deadlines:
         return None
     soonest = min(deadlines)
@@ -1172,9 +1175,10 @@ def _out_of_capacity(rt) -> bool:
     """
     if rt.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING):
         return True
+    usage = routing_percent(rt)
     return (rt.state == ProfileState.COOLDOWN
-            and rt.last_usage_percent is not None
-            and rt.last_usage_percent >= rt.switch_threshold)
+            and usage is not None
+            and usage >= rt.switch_threshold)
 
 
 def _capacity_exhaustion(snapshot, pool) -> tuple[bool, Optional[datetime]]:
@@ -1232,14 +1236,13 @@ class Gateway:
     Rotation STATE itself (ELIGIBLE/DRAINING/EXHAUSTED/COOLDOWN/AUTH_INVALID)
     is intentionally NOT persisted across a restart — see router.py's module
     docstring: no claimed per-session affinity, request-boundary global Pool
-    state only, and every enabled Profile genuinely deserves a fresh try
-    after a restart, same as it always has. What IS persisted (via
-    runtime_state.py) is just the last-observed usage numbers and which
-    Profile was current — display-only data the Dashboard would otherwise
-    show as a blank "not yet observed" wall after every restart/update/
-    service bounce, even though the real quota window hasn't actually
-    reset. A number whose reset time has already passed by load time is
-    dropped, not restored — see _sync_snapshot()."""
+    state only. Transient state gets a fresh start, while ELIGIBLE versus
+    DRAINING is re-derived from valid usage restored alongside it. What IS persisted (via
+    runtime_state.py) is the last-observed usage numbers and which Profile
+    was current. Valid, unexpired usage numbers are restored so both the
+    Dashboard and Rotation retain the last known window after every
+    restart/update/service bounce. A number whose reset time has already
+    passed by load time is dropped, not restored — see _sync_snapshot()."""
 
     _USED_NOW_GRACE_SECONDS = 900.0  # 15 minutes — see the class docstring
     # Upper bound on how long an in-flight slot with NO bytes flowing can keep
@@ -1510,7 +1513,7 @@ class Gateway:
                     restored.pop("state", None)
                     restored.pop("cooldown_until", None)
                 restored_state = restored.pop("state", state)
-                self._runtime[p.id] = ProfileRuntime(
+                restored_runtime = ProfileRuntime(
                     profile_id=p.id, priority=p.priority, switch_threshold=p.switch_threshold,
                     automatic=p.automatic,
                     state=restored_state,
@@ -1522,7 +1525,13 @@ class Gateway:
                     leave_on_fable_limit=_leave_on_fable_limit(p, pool.settings),
                     **restored,
                 )
-                state = restored_state
+                restored_usage = routing_percent(restored_runtime)
+                if (restored_runtime.state == ProfileState.ELIGIBLE
+                        and restored_usage is not None
+                        and restored_usage >= p.switch_threshold):
+                    restored_runtime.state = ProfileState.DRAINING
+                self._runtime[p.id] = restored_runtime
+                state = restored_runtime.state
                 # A Profile this Gateway has just seen for the first time may
                 # already be near its real expiry (e.g. right after a restart).
                 # The check itself runs in _run_due_credential_checks, OUTSIDE
@@ -1531,6 +1540,7 @@ class Gateway:
             else:
                 rt = self._runtime[p.id]
                 new_state = rt.state
+                routing_usage = routing_percent(rt)
                 credential_refreshed = (
                     p.credential_updated_at is not None and p.credential_updated_at != rt.credential_seen
                 )
@@ -1557,7 +1567,7 @@ class Gateway:
                     new_state = ProfileState.ELIGIBLE
                     self._queue_recovered_usage_read(p.id)
                 elif (rt.state == ProfileState.DRAINING and p.kind in ("oauth", "codex")
-                        and rt.last_usage_percent is not None and rt.last_usage_percent < p.switch_threshold):
+                        and routing_usage is not None and routing_usage < p.switch_threshold):
                     # Raising switch_threshold can put a DRAINING Profile
                     # back under its own threshold without any new request
                     # ever happening — re-check the LAST OBSERVED number
@@ -1586,8 +1596,8 @@ class Gateway:
                     # the one the user just bought credits for.
                     new_state = ProfileState.ELIGIBLE
                 elif (new_state == ProfileState.ELIGIBLE and not may_spend_credits
-                        and p.kind == "codex" and rt.last_usage_percent is not None
-                        and rt.last_usage_percent >= p.switch_threshold):
+                        and p.kind == "codex" and routing_usage is not None
+                        and routing_usage >= p.switch_threshold):
                     # And turning it back off must stop the spending now, for
                     # the same reason — a Profile only ELIGIBLE because credits
                     # were allowed has to go back to draining.
@@ -2135,13 +2145,15 @@ class Gateway:
                                                       f"{profile.name} needs re-authentication.", pool.settings)
 
                 if isinstance(observation, UsageSnapshot) and new_rt is not None and new_rt.state == ProfileState.ELIGIBLE:
-                    near_threshold = observation.percent >= new_rt.switch_threshold - APPROACHING_THRESHOLD_BAND
+                    percent = routing_percent(new_rt)
+                    near_threshold = (percent is not None
+                                      and percent >= new_rt.switch_threshold - APPROACHING_THRESHOLD_BAND)
                     if near_threshold and profile.id not in self._warned_approaching:
                         self._warned_approaching.add(profile.id)
                         notifications.notify_if_enabled(
                             "approaching_threshold", "Claude Unlimited",
                             f"{profile.name} is approaching its switch threshold "
-                            f"({observation.percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
+                            f"({percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
                     elif not near_threshold:
                         self._warned_approaching.discard(profile.id)
 
@@ -2510,13 +2522,15 @@ class Gateway:
                                                   f"{profile.name} needs re-authentication.", pool.settings)
 
             if isinstance(observation, UsageSnapshot) and new_rt is not None and new_rt.state == ProfileState.ELIGIBLE:
-                near_threshold = observation.percent >= new_rt.switch_threshold - APPROACHING_THRESHOLD_BAND
+                percent = routing_percent(new_rt)
+                near_threshold = (percent is not None
+                                  and percent >= new_rt.switch_threshold - APPROACHING_THRESHOLD_BAND)
                 if near_threshold and profile.id not in self._warned_approaching:
                     self._warned_approaching.add(profile.id)
                     notifications.notify_if_enabled(
                         "approaching_threshold", "Claude Unlimited",
                         f"{profile.name} is approaching its switch threshold "
-                        f"({observation.percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
+                        f"({percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
                 elif not near_threshold:
                     self._warned_approaching.discard(profile.id)
 
@@ -2900,13 +2914,15 @@ class Gateway:
                                                       f"{profile.name} needs re-authentication.", pool.settings)
 
                 if isinstance(observation, UsageSnapshot) and new_rt is not None and new_rt.state == ProfileState.ELIGIBLE:
-                    near_threshold = observation.percent >= new_rt.switch_threshold - APPROACHING_THRESHOLD_BAND
+                    percent = routing_percent(new_rt)
+                    near_threshold = (percent is not None
+                                      and percent >= new_rt.switch_threshold - APPROACHING_THRESHOLD_BAND)
                     if near_threshold and profile.id not in self._warned_approaching:
                         self._warned_approaching.add(profile.id)
                         notifications.notify_if_enabled(
                             "approaching_threshold", "Claude Unlimited",
                             f"{profile.name} is approaching its switch threshold "
-                            f"({observation.percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
+                            f"({percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
                     elif not near_threshold:
                         self._warned_approaching.discard(profile.id)
 
