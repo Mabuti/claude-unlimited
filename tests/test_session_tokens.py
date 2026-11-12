@@ -5,9 +5,27 @@ import pytest
 import claude_unlimited.session_tokens as session_tokens
 
 
+class FrozenClock:
+    def __init__(self):
+        self.current = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def __call__(self):
+        return self.current
+
+    def advance(self, **kwargs):
+        self.current += timedelta(**kwargs)
+
+
 @pytest.fixture(autouse=True)
 def isolated_file(tmp_path, monkeypatch):
     monkeypatch.setattr(session_tokens, "SESSION_TOKENS_FILE", tmp_path / "session_tokens.json")
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch):
+    clock = FrozenClock()
+    monkeypatch.setattr(session_tokens, "_now", clock)
+    return clock
 
 
 def test_resolve_unknown_token_returns_none():
@@ -40,6 +58,92 @@ def test_expired_token_no_longer_resolves():
     data[token]["created_at"] = stale
     session_tokens._save(data)
     assert session_tokens.resolve(token) is None
+
+
+def test_token_created_31_days_ago_but_used_1_day_ago_still_resolves(frozen_clock):
+    token = session_tokens.get_or_create("prof-a")
+    data = session_tokens._load()
+    data[token]["created_at"] = (frozen_clock.current - timedelta(days=31)).isoformat()
+    data[token]["last_used_at"] = (frozen_clock.current - timedelta(days=1)).isoformat()
+    session_tokens._save(data)
+
+    assert session_tokens.resolve(token) == "prof-a"
+
+
+def test_token_idle_31_days_does_not_resolve(frozen_clock):
+    token = session_tokens.get_or_create("prof-a")
+    data = session_tokens._load()
+    stale = frozen_clock.current - session_tokens.SESSION_TOKEN_TTL - timedelta(days=1)
+    data[token]["last_used_at"] = stale.isoformat()
+    session_tokens._save(data)
+
+    assert session_tokens.resolve_grant(token) == session_tokens.SessionGrant()
+
+
+def test_legacy_entry_created_31_days_ago_does_not_resolve(frozen_clock):
+    token = session_tokens.get_or_create("prof-a")
+    data = session_tokens._load()
+    stale = frozen_clock.current - session_tokens.SESSION_TOKEN_TTL - timedelta(days=1)
+    data[token]["created_at"] = stale.isoformat()
+    data[token].pop("last_used_at", None)
+    session_tokens._save(data)
+
+    assert session_tokens.resolve_grant(token) == session_tokens.SessionGrant()
+
+
+def test_legacy_entry_created_29_days_ago_resolves(frozen_clock):
+    token = session_tokens.get_or_create("prof-a")
+    data = session_tokens._load()
+    data[token]["created_at"] = (frozen_clock.current - timedelta(days=29)).isoformat()
+    data[token].pop("last_used_at", None)
+    session_tokens._save(data)
+
+    assert session_tokens.resolve(token) == "prof-a"
+
+
+def test_reusing_token_records_last_used_at(frozen_clock):
+    token = session_tokens.get_or_create("prof-a")
+    frozen_clock.advance(minutes=5)
+
+    assert session_tokens.get_or_create("prof-a") == token
+    data = session_tokens._load()
+    assert datetime.fromisoformat(data[token]["last_used_at"]) == frozen_clock.current
+
+
+def test_resolve_grant_persists_last_use_at_most_once_per_hour(frozen_clock, monkeypatch):
+    token = session_tokens.get_or_create("prof-a")
+    real_save = session_tokens._save
+    saves = []
+
+    def counting_save(data):
+        saves.append(data[token].get("last_used_at"))
+        real_save(data)
+
+    monkeypatch.setattr(session_tokens, "_save", counting_save)
+    for _ in range(100):
+        assert session_tokens.resolve_grant(token) == session_tokens.SessionGrant(forced_profile_id="prof-a")
+
+    assert len(saves) <= 1
+
+
+def test_reused_distribute_token_used_across_45_days_never_stops_resolving(frozen_clock):
+    token = session_tokens.get_or_create_distribute()
+
+    for day in range(46):
+        frozen_clock.current = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(days=day)
+        assert session_tokens.get_or_create_distribute() == token
+        assert session_tokens.resolve_grant(token) == session_tokens.SessionGrant(distribute=True)
+
+
+def test_get_or_create_does_not_prune_a_token_that_resolve_grant_accepts(frozen_clock):
+    token = session_tokens.get_or_create("prof-a")
+    data = session_tokens._load()
+    data[token]["created_at"] = (frozen_clock.current - timedelta(days=31)).isoformat()
+    data[token]["last_used_at"] = (frozen_clock.current - timedelta(days=1)).isoformat()
+    session_tokens._save(data)
+
+    assert session_tokens.get_or_create("prof-a") == token
+    assert session_tokens.resolve(token) == "prof-a"
 
 
 def test_get_or_create_after_expiry_mints_a_fresh_token_not_the_stale_one():
