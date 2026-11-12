@@ -5,15 +5,18 @@ upstream status and headers. A real loopback server on an ephemeral port;
 the provider side is always faked."""
 
 import json
+import logging
 import threading
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 
 import pytest
 
 import claude_unlimited.daemon as daemon
 import claude_unlimited.openai_bridge as bridge_module
 from claude_unlimited import placeholder_token
+from claude_unlimited import session_tokens
 from claude_unlimited.config import Pool, Profile, save_pool
 from claude_unlimited.gateway import GatewayResult
 from claude_unlimited.openai_credential import StoredOpenAICredential, encode
@@ -68,6 +71,7 @@ def server_with(monkeypatch, tmp_path):
     monkeypatch.setattr("claude_unlimited.activity.ACTIVITY_FILE", tmp_path / "activity.jsonl")
     monkeypatch.setattr(placeholder_token, "APP_DIR", tmp_path)
     monkeypatch.setattr(placeholder_token, "TOKEN_FILE", tmp_path / "placeholder_token")
+    monkeypatch.setattr(session_tokens, "SESSION_TOKENS_FILE", tmp_path / "session_tokens.json")
     monkeypatch.setattr("claude_unlimited.gateway.runtime_state.RUNTIME_STATE_FILE", tmp_path / "runtime_state.json")
     monkeypatch.setattr("claude_unlimited.gateway.secret_store", FakeSecretStore({
         "c": encode(StoredOpenAICredential(access_token="tok-c", refresh_token=None,
@@ -158,6 +162,94 @@ def test_bad_local_token_on_messages_is_unchanged(server_with):
     assert status == 401
     assert payload == {"type": "error", "error": {"type": "authentication_error",
                                                   "message": "[claude-unlimited] invalid local credential"}}
+
+
+def _write_session_token(token, *, mode=None, profile_id=None, created_at=None, last_used_at=None):
+    entry = {"created_at": created_at}
+    if mode is not None:
+        entry["mode"] = mode
+    if profile_id is not None:
+        entry["profile_id"] = profile_id
+    if last_used_at is not None:
+        entry["last_used_at"] = last_used_at
+    session_tokens.SESSION_TOKENS_FILE.write_text(json.dumps({token: entry}))
+
+
+def test_expired_session_token_keeps_401_and_records_safe_diagnostics(server_with, monkeypatch, caplog):
+    token = "fixture-expired-session-token"
+    now = datetime(2026, 11, 12, tzinfo=timezone.utc)
+    last_used_at = "2026-10-01T12:00:00+00:00"
+    monkeypatch.setattr(session_tokens, "_now", lambda: now)
+    _write_session_token(token, mode="distribute", created_at="2026-09-01T12:00:00+00:00",
+                        last_used_at=last_used_at)
+    events = []
+    monkeypatch.setattr(daemon.activity, "record",
+                        lambda category, text, meta=None: events.append((category, text, meta)))
+    caplog.set_level(logging.DEBUG, logger=daemon._LOGGER.name)
+    base = server_with([_codex()])
+
+    status, _headers, payload = _error(_post(base, "/v1/messages", token=token))
+
+    assert status == 401
+    assert payload == {"type": "error", "error": {"type": "authentication_error",
+                                                  "message": "[claude-unlimited] invalid local credential"}}
+    assert len(events) == 1
+    assert events[0][0] == "error"
+    assert events[0][1] == "A session's local credential expired — restart that session, or run the session-token rescue"
+    assert events[0][2] == f"kind=distribute, last-use={last_used_at}"
+    assert "distribute" in caplog.text
+    assert last_used_at in caplog.text
+    assert token not in caplog.text
+    assert token not in " ".join(str(part) for event in events for part in event if part is not None)
+
+
+def test_expired_session_token_activity_is_rate_limited(server_with, monkeypatch):
+    token = "fixture-rate-limited-session-token"
+    now = datetime(2026, 11, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(session_tokens, "_now", lambda: now)
+    _write_session_token(token, profile_id="profile-a", created_at="2026-09-01T12:00:00+00:00",
+                        last_used_at="2026-10-01T12:00:00+00:00")
+    events = []
+    monkeypatch.setattr(daemon.activity, "record",
+                        lambda category, text, meta=None: events.append((category, text, meta)))
+    base = server_with([_codex()])
+
+    for _ in range(20):
+        status, _headers, payload = _error(_post(base, "/v1/messages", token=token))
+        assert status == 401
+        assert payload["error"]["message"] == "[claude-unlimited] invalid local credential"
+
+    assert len(events) == 1
+
+
+def test_unknown_session_token_is_rejected_without_activity(server_with, monkeypatch, caplog):
+    token = "fixture-unknown-session-token"
+    events = []
+    monkeypatch.setattr(daemon.activity, "record",
+                        lambda category, text, meta=None: events.append((category, text, meta)))
+    caplog.set_level(logging.DEBUG, logger=daemon._LOGGER.name)
+    base = server_with([_codex()])
+
+    status, _headers, payload = _error(_post(base, "/v1/messages", token=token))
+
+    assert status == 401
+    assert payload["error"]["message"] == "[claude-unlimited] invalid local credential"
+    assert events == []
+    assert token not in caplog.text
+
+
+def test_live_session_token_is_not_rejected(server_with, monkeypatch):
+    token = "fixture-live-session-token"
+    now = datetime(2026, 11, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(session_tokens, "_now", lambda: now)
+    _write_session_token(token, mode="distribute", created_at="2026-11-01T12:00:00+00:00",
+                        last_used_at="2026-11-11T12:00:00+00:00")
+    base = server_with([_codex()])
+    monkeypatch.setattr(daemon._gateway, "handle", lambda *args, **kwargs: GatewayResult(
+        status=200, headers={}, body_chunks=[b"ok"], profile_id=None, error=None, error_detail=None))
+
+    with urllib.request.urlopen(_post(base, "/v1/messages", token=token), timeout=5) as response:
+        assert response.status == 200
 
 
 def test_quota_refusal_is_a_single_shot_429_with_retry_after(server_with, monkeypatch):
