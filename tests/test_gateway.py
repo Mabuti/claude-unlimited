@@ -111,6 +111,30 @@ def test_7d_only_usage_survives_gateway_restart(pool_env):
     assert runtime.state == gateway_module.ProfileState.DRAINING
 
 
+def test_legacy_7d_only_usage_without_flag_restores_as_eligible(pool_env):
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="team-profile", kind="oauth", priority=1,
+                automatic=True, enabled=True, switch_threshold=95.0),
+    ]))
+    (pool_env / "runtime_state.json").write_text(json.dumps({
+        "current_profile_id": "a",
+        "profiles": {
+            "a": {
+                "last_usage_percent": None,
+                "last_usage_percent_7d": 99.0,
+                "resets_at_7d": "2100-01-01T00:00:00+00:00",
+            },
+        },
+    }))
+
+    restored = Gateway(transport=lambda req: fake_response(200)).runtime_snapshot()["a"]
+
+    assert restored.last_usage_percent is None
+    assert restored.last_usage_percent_7d == 99.0
+    assert restored.no_5h_window is False
+    assert restored.state == gateway_module.ProfileState.ELIGIBLE
+
+
 def test_team_restart_drops_expired_5h_without_using_7d(pool_env):
     save_pool(Pool(profiles=[
         Profile(id="a", name="team-profile", kind="oauth", priority=1,

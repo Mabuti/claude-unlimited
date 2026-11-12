@@ -103,7 +103,7 @@ def test_persisted_7d_only_usage_restores_without_a_5h_value():
     }
 
 
-def test_legacy_7d_only_usage_infers_the_missing_window_flag():
+def test_legacy_7d_only_usage_does_not_infer_the_missing_window_flag():
     fields = _restorable_usage_fields({
         "last_usage_percent": None,
         "resets_at": None,
@@ -111,7 +111,7 @@ def test_legacy_7d_only_usage_infers_the_missing_window_flag():
         "resets_at_7d": FUTURE.isoformat(),
     }, NOW)
 
-    assert fields["no_5h_window"] is True
+    assert "no_5h_window" not in fields
 
 
 def test_team_5h_reset_recovers_even_with_a_future_7d_sample():
@@ -145,6 +145,39 @@ def test_max_7d_only_stays_draining_until_its_weekly_reset():
     assert after_reset.state == ProfileState.ELIGIBLE
     assert after_reset.last_usage_percent_7d is None
     assert after_reset.resets_at_7d is None
+
+
+def test_no_5h_exhausted_does_not_recover_from_old_7d_reset_while_5h_reset_is_future():
+    runtime = _profile(
+        "max-profile",
+        state=ProfileState.EXHAUSTED,
+        no_5h_window=True,
+        resets_at=NOW + timedelta(hours=2),
+        last_usage_percent_7d=99.0,
+        resets_at_7d=NOW - timedelta(hours=1),
+    )
+
+    recovered = recover_expired_cooldowns(PoolSnapshot(profiles=[runtime]), NOW).profiles[0]
+
+    assert recovered.state == ProfileState.EXHAUSTED
+    assert recovered.resets_at == NOW + timedelta(hours=2)
+    assert recovered.last_usage_percent_7d is None
+    assert recovered.resets_at_7d is None
+
+
+def test_no_5h_exhausted_recovers_when_5h_reset_has_also_passed():
+    runtime = _profile(
+        "max-profile",
+        state=ProfileState.EXHAUSTED,
+        no_5h_window=True,
+        resets_at=NOW - timedelta(minutes=1),
+        last_usage_percent_7d=99.0,
+        resets_at_7d=NOW - timedelta(hours=1),
+    )
+
+    recovered = recover_expired_cooldowns(PoolSnapshot(profiles=[runtime]), NOW).profiles[0]
+
+    assert recovered.state == ProfileState.ELIGIBLE
 
 
 @pytest.mark.parametrize("state", [

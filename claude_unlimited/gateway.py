@@ -683,10 +683,6 @@ def _restorable_usage_fields(persisted: Optional[dict], now: datetime) -> dict:
     no_5h_window = persisted.get("no_5h_window")
     if isinstance(no_5h_window, bool):
         fields["no_5h_window"] = no_5h_window
-    elif persisted.get("last_usage_percent") is None and persisted.get("last_usage_percent_7d") is not None:
-        # MAX7D-1 rows predate the explicit capability flag. Their null 5h
-        # sample plus a 7d sample is the unambiguous legacy 7d-only shape.
-        fields["no_5h_window"] = True
     resets_at = _parse(persisted.get("resets_at"))
     if resets_at is not None and resets_at > now and isinstance(persisted.get("last_usage_percent"), (int, float)):
         fields["last_usage_percent"] = persisted["last_usage_percent"]
@@ -1245,17 +1241,17 @@ class Gateway:
     pointer away from this Profile first — see handle()'s
     `self._last_active.pop(previous_profile_id, None)`.
 
-    Rotation STATE itself (ELIGIBLE/DRAINING/EXHAUSTED/COOLDOWN/AUTH_INVALID)
-    is intentionally NOT persisted across a restart — see router.py's module
-    docstring: no claimed per-session affinity, request-boundary global Pool
-    state only. Transient state gets a fresh start, while ELIGIBLE versus
-    DRAINING is re-derived from valid usage restored alongside it. What IS
-    persisted (via runtime_state.py) is the last-observed usage numbers, whether the account
-    reported no 5h window, and which Profile was current. Valid, unexpired
-    usage numbers are restored so both the Dashboard and Rotation retain the
-    last known window after every restart/update/service bounce. A number whose
-    reset time has already passed by load time is dropped, not restored — see
-    _sync_snapshot()."""
+    Rotation STATE is mostly re-derived across a restart: ELIGIBLE versus
+    DRAINING follows from valid usage restored alongside it, and EXHAUSTED is
+    re-established from the current token budget. AUTH_INVALID is preserved
+    because restarting cannot repair a rejected credential; COOLDOWN is
+    preserved only while its own deadline is still in the future. What IS
+    persisted (via runtime_state.py) is the last-observed usage numbers,
+    whether the account reported no 5h window, and which Profile was current.
+    Valid, unexpired usage numbers are restored so both the Dashboard and
+    Rotation retain the last known window after every restart/update/service
+    bounce. A number whose reset time has already passed by load time is
+    dropped, not restored — see _sync_snapshot()."""
 
     _USED_NOW_GRACE_SECONDS = 900.0  # 15 minutes — see the class docstring
     # Upper bound on how long an in-flight slot with NO bytes flowing can keep

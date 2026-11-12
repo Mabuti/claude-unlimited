@@ -511,7 +511,12 @@ def recover_expired_cooldowns(pool: PoolSnapshot, now: datetime) -> PoolSnapshot
             # equivalent refill only for an account that reported no 5h
             # window; for a normal account it is display data and must not
             # change quota state.
-            refill_expired = primary_expired or (p.no_5h_window and secondary_expired)
+            # A no-5h account may use its 7d reset as the refill deadline, but
+            # an older 7d reset must not override a newer QuotaExhausted
+            # refusal reset stored in resets_at.
+            weekly_refill = (p.no_5h_window and secondary_expired
+                             and (p.resets_at is None or primary_expired))
+            refill_expired = primary_expired or weekly_refill
             if refill_expired:
                 used = routing_percent(refreshed)
                 state = (ProfileState.DRAINING

@@ -1588,8 +1588,9 @@ function usageWindowLabelOrBlank(rawLabel) {
   return rawLabel ? usageWindowLabel(rawLabel, '') : '';
 }
 
-// The daemon deliberately drops derived quota state (but keeps usage numbers
-// and whether a Profile has no 5h window) on restart (see runtime_state.py's
+// The daemon re-derives most quota state on restart, but preserves AUTH_INVALID
+// and COOLDOWN while its deadline is still in the future. It also keeps usage
+// numbers and whether a Profile has no 5h window (see runtime_state.py's
 // module docstring), so right after a restart a Profile can read status_word
 // "healthy" while its restored usage_5h/7d percent already sits at or past
 // where it would have rotated away. Mirrors the CLI profile picker's rule
