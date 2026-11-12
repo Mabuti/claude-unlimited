@@ -154,6 +154,20 @@ def test_successful_launch_uses_only_validated_path_id(running_server, monkeypat
     assert calls == [profile.id]
 
 
+def test_healthy_oauth_profile_launch_is_accepted_on_demand(running_server, monkeypatch):
+    base, token = running_server
+    profile = _oauth_profile()
+    calls = []
+    monkeypatch.setattr(daemon, "_launch_reauth_terminal",
+                        lambda profile_id: calls.append(profile_id) or (True, None))
+
+    status, body = _post(f"{base}/api/profiles/{profile.id}/reauth/launch", token)
+
+    assert status == 200
+    assert body == {"launched": True}
+    assert calls == [profile.id]
+
+
 def test_endpoint_builds_fixed_argv_ignoring_request_fields(running_server, monkeypatch):
     base, token = running_server
     profile = _oauth_profile()

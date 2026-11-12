@@ -250,6 +250,7 @@
   "profiles.menu_view_activity": "Ver en Actividad",
   "profiles.menu_test_connection": "Probar conexión",
   "profiles.menu_fetch_info": "Actualizar información",
+  "profiles.menu_reauth": "Reautenticar",
   "profiles.menu_disable": "Desactivar",
   "profiles.menu_enable": "Activar",
   "activity.export_log": "Exportar registro",

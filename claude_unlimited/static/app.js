@@ -1634,7 +1634,7 @@ function profileNeedsReauth(p) {
 }
 
 function profileCanReauth(p) {
-  return p.kind === 'oauth' && profileNeedsReauth(p);
+  return p.kind === 'oauth';
 }
 
 function reauthCommand(profileId) {
@@ -1667,9 +1667,62 @@ function renderReauthAction(p) {
   </div>`;
 }
 
+function showReauthFallbackModal(profileId, reason) {
+  const existing = document.getElementById('reauthFallbackScrim');
+  if (existing) existing.remove();
+  const command = reauthCommand(profileId);
+  const scrim = document.createElement('div');
+  scrim.id = 'reauthFallbackScrim';
+  scrim.className = 'modal-scrim open';
+  const reasonTitle = reason ? ` title="${esc(reason)}"` : '';
+  scrim.innerHTML = `
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <div>
+          <div class="modal-title">${esc(t('profile.reauth'))}</div>
+          <div class="modal-sub"${reasonTitle}>${esc(t('profile.reauth_fallback'))}</div>
+        </div>
+        <div class="close-btn" data-action="close-reauth-fallback" role="button" tabindex="0">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </div>
+      </div>
+      <div class="modal-body">
+        <div class="code-row">
+          <code id="reauthFallbackCommand">${esc(command)}</code>
+          <button type="button" class="copy-btn" data-action="copy-reauth-fallback">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+            <span>${esc(t('settings.network.copy'))}</span>
+          </button>
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(scrim);
+
+  const close = () => scrim.remove();
+  scrim.addEventListener('click', (e) => {
+    if (e.target === scrim) close();
+  });
+  scrim.querySelector('[data-action="close-reauth-fallback"]').addEventListener('click', close);
+  scrim.querySelector('[data-action="copy-reauth-fallback"]').addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const copyButton = e.currentTarget;
+    const label = copyButton.querySelector('span');
+    try {
+      await navigator.clipboard.writeText(command);
+      const original = label.textContent;
+      label.textContent = t('settings.network.copied');
+      setTimeout(() => { label.textContent = original; }, 1200);
+    } catch (err) {
+      // The command remains visible to copy manually when clipboard access is denied.
+    }
+  });
+}
+
 function renderProfileCard(p) {
   const isActive = (_lastStatus && _lastStatus.current_profile_id === p.id) || p.live_agents > 0;
   const needsReauth = profileNeedsReauth(p);
+  const reauthAction = profileCanReauth(p) ? renderReauthAction(p) : '';
+  const cardReauthAction = needsReauth ? reauthAction : '';
   const usageOverride = healthyUsageOverride(p);
   const statusColors = usageOverride || STATUS_COLORS[p.status_word] || { color: 'var(--good)', bg: 'var(--good-soft)' };
   // The plan badge already names the tier, so this carries only the detail
@@ -1734,7 +1787,7 @@ function renderProfileCard(p) {
           : `<span class="p-disabled-badge">${esc(t('profile.disabled'))}</span>`}
       </div>
       <div class="p-bars">${usageBlock}</div>
-      ${profileCanReauth(p) ? renderReauthAction(p) : ''}
+      ${cardReauthAction}
       <div class="p-foot">
         <div class="p-foot-spacer"></div>
         <span>${p.automatic ? esc(t('profile.auto_rotation_on')) : esc(t('profile.manual_only'))}</span>
@@ -1793,27 +1846,40 @@ let _lastProfiles = [];
 function updateReauthCard(profileId) {
   const card = Array.from(document.querySelectorAll('.p-card')).find((node) => node.dataset.id === profileId);
   const profile = _lastProfiles.find((p) => p.id === profileId);
-  if (!card || !profile || !profileCanReauth(profile)) return;
+  if (!card || !profile || !profileCanReauth(profile)) return false;
   const action = card.querySelector('[data-reauth-container]');
-  if (action) action.outerHTML = renderReauthAction(profile);
+  if (!action) return false;
+  action.outerHTML = renderReauthAction(profile);
+  return true;
 }
 
 async function launchReauth(profileId, button) {
   const profile = _lastProfiles.find((p) => p.id === profileId);
   if (!profileCanReauth(profile || {})) return;
-  button.disabled = true;
+  if (button) button.disabled = true;
+  const fromMenu = button?.dataset?.menuAction === 'reauth';
+  let state;
   try {
     const result = await api(`/api/profiles/${profileId}/reauth/launch`, { method: 'POST', body: '{}' });
-    _reauthUi.set(profileId, {
+    state = {
       mode: result.launched ? 'opened' : 'fallback',
       reason: result.launched ? '' : (result.reason || ''),
-    });
+    };
+    _reauthUi.set(profileId, state);
   } catch (err) {
     // A dead/old daemon is the same user outcome as a launcher failure: show
     // the exact command without making the user hunt through a terminal.
-    _reauthUi.set(profileId, { mode: 'fallback' });
+    state = { mode: 'fallback' };
+    _reauthUi.set(profileId, state);
   }
-  updateReauthCard(profileId);
+  const cardUpdated = updateReauthCard(profileId);
+  if (fromMenu || !cardUpdated) {
+    if (state.mode === 'fallback') {
+      showReauthFallbackModal(profileId, state.reason);
+    } else {
+      showToast('info', t('profile.reauth_opened'), profile.name);
+    }
+  }
 }
 
 async function loadProfiles() {
@@ -2113,6 +2179,7 @@ function openProfileKebabMenu(anchorBtn, profileId) {
     { icon: '<path d="M3 12h4l2.5-7L13 19l2-7h6"/>', label: t('profiles.menu_view_activity'), action: 'activity' },
     { icon: '<path d="M12 20a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z"/><path d="M9 12l2 2 4-4"/>', label: t('profiles.menu_test_connection'), action: 'test' },
     { icon: '<path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/>', label: t('profiles.menu_fetch_info'), action: 'fetch_info' },
+    ...(profileCanReauth(profile) ? [{ icon: '<path d="M20 11a8 8 0 1 0 2 5.3"/><path d="M20 4v7h-7"/>', label: t('profiles.menu_reauth'), action: 'reauth' }] : []),
     { divider: true },
     { icon: '<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8Z"/>', label: t('profiles.menu_take_over'), action: 'take_over', title: t('profiles.take_over_tooltip') },
     { icon: '<circle cx="12" cy="5" r="2"/><path d="M12 7v3M6 21v-3a3 3 0 0 1 3-3h6a3 3 0 0 1 3 3v3"/><circle cx="6" cy="21" r="1"/><circle cx="18" cy="21" r="1"/>',
@@ -2146,6 +2213,7 @@ function openProfileKebabMenu(anchorBtn, profileId) {
       closeKebabMenu();
       if (action === 'edit') openProfileDetailModal(profileId);
       if (action === 'activity') switchView('activity');
+      if (action === 'reauth') await launchReauth(profileId, item);
       if (action === 'toggle') {
         await api(`/api/profiles/${profileId}`, { method: 'PATCH', body: JSON.stringify({ enabled: !profile.enabled }) });
         showToast('success', profile.enabled ? t('toast.profile_disabled') : t('toast.profile_enabled'), profile.name);

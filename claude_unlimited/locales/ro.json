@@ -250,6 +250,7 @@
   "profiles.menu_view_activity": "Vezi în Activitate",
   "profiles.menu_test_connection": "Testează conexiunea",
   "profiles.menu_fetch_info": "Actualizează informațiile",
+  "profiles.menu_reauth": "Reautentifică",
   "profiles.menu_disable": "Dezactivează",
   "profiles.menu_enable": "Activează",
   "activity.export_log": "Exportă jurnalul",

@@ -250,6 +250,7 @@
   "profiles.menu_view_activity": "View in Activity",
   "profiles.menu_test_connection": "Test connection",
   "profiles.menu_fetch_info": "Fetch info",
+  "profiles.menu_reauth": "Re-authenticate",
   "profiles.menu_disable": "Disable",
   "profiles.menu_enable": "Enable",
   "activity.export_log": "Export log",
