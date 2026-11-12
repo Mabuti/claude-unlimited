@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import re
 
 import pytest
 
@@ -24,6 +25,14 @@ from claude_unlimited.router import (
 
 NOW = datetime(2026, 11, 11, tzinfo=timezone.utc)
 FUTURE = NOW + timedelta(hours=4)
+
+
+def _function_body(source, marker):
+    start = source.index(marker)
+    next_function = re.search(r"\n(?:async )?function ", source[start + len(marker):])
+    if not next_function:
+        return source[start:]
+    return source[start:start + len(marker) + next_function.start()]
 
 
 def _profile(profile_id, *, threshold=95.0, priority=1, **usage):
@@ -243,19 +252,51 @@ def test_capacity_exhaustion_includes_weekly_reset_for_no_5h_profiles():
     assert reset == FUTURE
 
 
-def test_profile_payload_serializes_7d_only_usage():
-    profile = Profile(id="max-profile", name="max-profile", kind="oauth", switch_threshold=95.0)
-    runtime = _profile("max-profile", last_usage_percent_7d=96.0, resets_at_7d=FUTURE)
+def test_profile_payload_serializes_no_5h_window_authority():
+    max_profile = Profile(id="max-profile", name="max-profile", kind="oauth", switch_threshold=95.0)
+    max_runtime = _profile("max-profile", no_5h_window=True,
+                           last_usage_percent_7d=96.0, resets_at_7d=FUTURE)
+    team_profile = Profile(id="team-profile", name="team-profile", kind="oauth", switch_threshold=95.0)
+    team_runtime = _profile("team-profile", no_5h_window=False,
+                            last_usage_percent=None, resets_at=None,
+                            last_usage_percent_7d=96.0, resets_at_7d=FUTURE)
 
-    payload = daemon._profile_to_public_dict(profile, runtime=runtime)
+    max_payload = daemon._profile_to_public_dict(max_profile, runtime=max_runtime)
+    team_payload = daemon._profile_to_public_dict(team_profile, runtime=team_runtime)
 
-    assert payload["usage_5h_percent"] is None
-    assert payload["usage_7d_percent"] == 96.0
+    assert max_payload["usage_5h_percent"] is None
+    assert max_payload["usage_7d_percent"] == 96.0
+    assert max_payload["no_5h_window"] is True
+    assert team_payload["usage_5h_percent"] is None
+    assert team_payload["usage_7d_percent"] == 96.0
+    assert team_payload["no_5h_window"] is False
 
 
-def test_dashboard_labels_a_missing_5h_window_and_keeps_the_7d_bar():
+def test_dashboard_label_keeps_team_after_reset_as_not_observed():
+    app_js = (daemon._STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    label_body = _function_body(app_js, "function primaryWindowEmptyLabel(")
+
+    assert "p.kind === 'oauth' && p.no_5h_window === true && !has5h && has7d" in label_body
+    assert "profile.no_5h_window" in label_body
+
+
+def test_dashboard_uses_flagged_7d_only_usage_for_profiles_table_sort():
+    app_js = (daemon._STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    sorter_body = _function_body(app_js, "function filteredSortedProfiles(")
+
+    assert "b.usage_5h_percent ?? (b.no_5h_window === true ? b.usage_7d_percent : null) ?? -1" in sorter_body
+    assert "a.usage_5h_percent ?? (a.no_5h_window === true ? a.usage_7d_percent : null) ?? -1" in sorter_body
+
+
+def test_dashboard_display_callers_use_the_authoritative_window_flag():
     app_js = (daemon._STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
-    assert "profile.no_5h_window" in app_js
-    assert "primaryWindowEmptyLabel" in app_js
-    assert "b.usage_5h_percent ?? b.usage_7d_percent" in app_js
+    for marker in (
+        "function renderProfileCard(",
+        "function renderProfileTableRow(",
+        "function openProfileDetailModal(",
+    ):
+        assert "primaryWindowEmptyLabel(p, has5h, has7d)" in _function_body(app_js, marker)
+
+    cost_body = _function_body(app_js, "function renderCostRow(")
+    assert "p.kind === 'oauth' && p.no_5h_window === true && has7d" in cost_body

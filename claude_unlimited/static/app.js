@@ -1578,7 +1578,7 @@ function secondaryWindowFallbackKey(p) {
 }
 
 function primaryWindowEmptyLabel(p, has5h, has7d) {
-  return p.kind === 'oauth' && !has5h && has7d ? t('profile.no_5h_window') : null;
+  return p.kind === 'oauth' && p.no_5h_window === true && !has5h && has7d ? t('profile.no_5h_window') : null;
 }
 
 // Same lookup as usageWindowLabel, but returns '' instead of falling back to
@@ -2012,8 +2012,8 @@ function filteredSortedProfiles(profiles) {
   const sorters = {
     priority: (a, b) => a.priority - b.priority,
     name: (a, b) => a.name.localeCompare(b.name),
-    usage: (a, b) => (b.usage_5h_percent ?? b.usage_7d_percent ?? -1)
-      - (a.usage_5h_percent ?? a.usage_7d_percent ?? -1),
+    usage: (a, b) => (b.usage_5h_percent ?? (b.no_5h_window === true ? b.usage_7d_percent : null) ?? -1)
+      - (a.usage_5h_percent ?? (a.no_5h_window === true ? a.usage_7d_percent : null) ?? -1),
   };
   return list.slice().sort(sorters[_profileSort] || sorters.priority);
 }
@@ -2733,10 +2733,11 @@ function renderCostRow(profiles, costByProfile) {
     if (isFlatFee) {
       const hasPct = p.usage_5h_percent !== null && p.usage_5h_percent !== undefined;
       const has7d = p.usage_7d_percent !== null && p.usage_7d_percent !== undefined;
-      const displayPct = hasPct ? p.usage_5h_percent : p.usage_7d_percent;
-      const pct = hasPct ? `${displayPct}%` : has7d ? `${t('profile.no_5h_window')}: ${displayPct}%` : '—';
+      const show7dOnly = p.kind === 'oauth' && p.no_5h_window === true && has7d;
+      const displayPct = hasPct ? p.usage_5h_percent : show7dOnly ? p.usage_7d_percent : null;
+      const pct = hasPct ? `${displayPct}%` : show7dOnly ? `${t('profile.no_5h_window')}: ${displayPct}%` : '—';
       const pctColor = hasPct ? barColor(p.status_word, displayPct, p.switch_threshold)
-        : has7d ? weeklyBarColor(p.status_word, displayPct) : 'inherit';
+        : show7dOnly ? weeklyBarColor(p.status_word, displayPct) : 'inherit';
       return `<div class="cost-card">
         <div class="cost-label-row"><span class="cost-label">${esc(p.name)}</span><span class="cost-tag" data-i18n-skip>${esc(t('panel.cost.flat_fee'))}</span></div>
         <div class="cost-value" style="color:${pctColor}">${pct} ${t('panel.cost.used')}</div>

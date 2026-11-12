@@ -565,6 +565,7 @@ def _profile_to_public_dict(p, runtime=None, usage=None, in_use_now=False) -> di
         "state": state_value,
         "status_word": _STATUS_WORDS.get(state_value, state_value),
         "usage_5h_percent": runtime.last_usage_percent if runtime is not None else None,
+        "no_5h_window": bool(runtime.no_5h_window) if runtime is not None else False,
         "usage_5h_resets_at": runtime.resets_at.isoformat() if runtime is not None and runtime.resets_at else None,
         "usage_7d_percent": runtime.last_usage_percent_7d if runtime is not None else None,
         "usage_7d_resets_at": runtime.resets_at_7d.isoformat() if runtime is not None and runtime.resets_at_7d else None,
