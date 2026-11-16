@@ -2593,10 +2593,18 @@ function formatTokenCount(n) {
 }
 
 function formatUsageWeight(n) {
-  const value = Number(n) || 0;
-  if (value >= 1_000_000) return (value / 1_000_000).toFixed(1) + 'M';
-  if (value >= 1000) return (value / 1000).toFixed(1) + 'K';
-  return value.toFixed(2);
+  const value = Math.max(0, Number(n) || 0);
+  if (value > 0 && value < 0.005) return '<0.01';
+  return '$' + value.toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+function formatUsageMetric(n, usesCost) {
+  return usesCost
+    ? `${formatUsageWeight(n)} ${t('panel.usage.weight_unit')}`
+    : formatTokenCount(n);
 }
 
 function usageWeightForBucket(bucket) {
@@ -2606,7 +2614,10 @@ function usageWeightForBucket(bucket) {
 }
 
 function usageWeightTooltip(label, bucket) {
-  return `${label}: ${formatUsageWeight(usageWeightForBucket(bucket))} ${t('panel.usage.weight_unit')} · ` +
+  const usesCost = bucket.cost !== undefined;
+  const value = formatUsageMetric(usageWeightForBucket(bucket), usesCost);
+  if (!usesCost) return `${label}: ${value}`;
+  return `${label}: ${value} · ` +
     `${t('stats.tokens_in')}: ${formatTokenCount(bucket.input_tokens || 0)} · ` +
     `${t('stats.tokens_out')}: ${formatTokenCount(bucket.output_tokens || 0)} · ` +
     `${t('stats.cache_read')}: ${formatTokenCount(bucket.cache_read_input_tokens || 0)} · ` +
@@ -2647,7 +2658,8 @@ function chartBucketLabel(dateStr, granularity, bucketHours) {
 }
 
 function renderTokensChart(dailyTotals, granularity, bucketHours) {
-  const max = Math.max(1, ...dailyTotals.map((d) => usageWeightForBucket(d)));
+  const usesCost = dailyTotals.some((d) => d.cost !== undefined);
+  const max = Math.max(...dailyTotals.map((d) => usageWeightForBucket(d)), 0) || 1;
   const barsRow = document.getElementById('tokensBarsRow');
   if (barsRow) {
     setLiveHtml(barsRow, dailyTotals.map((d) => {
@@ -2679,7 +2691,7 @@ function renderTokensChart(dailyTotals, granularity, bucketHours) {
   }
   const total = dailyTotals.reduce((sum, d) => sum + usageWeightForBucket(d), 0);
   const totalChip = document.getElementById('tokensTotalChip');
-  if (totalChip) totalChip.textContent = formatUsageWeight(total);
+  if (totalChip) totalChip.textContent = formatUsageMetric(total, usesCost);
 }
 
 let _lastModelSplit = [];
@@ -2797,13 +2809,14 @@ function accountProfileValue(day, field, profileId) {
 }
 
 function accountUsageTooltip(name, cost, day, profileId) {
+  const usesCost = day.profiles_cost !== undefined;
   const raw = {
-    cost,
     input_tokens: accountProfileValue(day, 'profiles_input_tokens', profileId),
     output_tokens: accountProfileValue(day, 'profiles_output_tokens', profileId),
     cache_read_input_tokens: accountProfileValue(day, 'profiles_cache_read_input_tokens', profileId),
     cache_creation_input_tokens: accountProfileValue(day, 'profiles_cache_creation_input_tokens', profileId),
   };
+  raw[usesCost ? 'cost' : 'tokens'] = cost;
   return usageWeightTooltip(name, raw);
 }
 
@@ -2811,6 +2824,13 @@ function accountDayCosts(day) {
   // `profiles_cost` is new; the fallback lets this build display a response
   // from an older daemon using its unchanged legacy `profiles` field.
   return day.profiles_cost !== undefined ? (day.profiles_cost || {}) : (day.profiles || {});
+}
+
+function accountProfileIsUnpriced(day, profileId) {
+  if (day.profiles_unpriced !== undefined) {
+    return Number((day.profiles_unpriced || {})[profileId]) > 0;
+  }
+  return Number((day.profiles || {})[profileId]) > 0 && Number(day.unpriced_requests) > 0;
 }
 
 let _lastAccountUsage = null; // { dailyTotals, profileColors, profileNames } — re-render target on toggle click
@@ -2824,9 +2844,11 @@ function renderAccountUsageChart(dailyTotals, profileColors, profileNames) {
 
   const mode = currentMetricMode('account');
   const orderedIds = Object.keys(profileNames).sort();
-  const max = Math.max(1, ...dailyTotals.map((d) => Object.values(accountDayCosts(d))
-    .reduce((a, b) => a + (Number(b) || 0), 0)));
+  const usesCost = dailyTotals.some((d) => d.profiles_cost !== undefined);
+  const max = Math.max(...dailyTotals.map((d) => Object.values(accountDayCosts(d))
+    .reduce((a, b) => a + (Number(b) || 0), 0)), 0) || 1;
   const grandTotals = {};
+  const unpricedProfiles = new Set();
   setUnpricedUsageNote('accountUsageUnpricedNote', dailyTotals.reduce(
     (sum, d) => sum + (Number(d.unpriced_requests) || 0), 0));
 
@@ -2834,12 +2856,18 @@ function renderAccountUsageChart(dailyTotals, profileColors, profileNames) {
     const dayCosts = accountDayCosts(d);
     const dayTotal = Object.values(dayCosts).reduce((a, b) => a + (Number(b) || 0), 0);
     const pct = Math.round((dayTotal / max) * 100);
+    Object.entries(dayCosts).forEach(([pid, rawCost]) => {
+      const cost = Number(rawCost) || 0;
+      grandTotals[pid] = (grandTotals[pid] || 0) + cost;
+      if (usesCost && cost === 0 && accountProfileIsUnpriced(d, pid)) {
+        unpricedProfiles.add(pid);
+      }
+    });
     const segs = Object.entries(dayCosts)
       .filter(([, cost]) => Number(cost) > 0)
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([pid, rawCost]) => {
         const cost = Number(rawCost) || 0;
-        grandTotals[pid] = (grandTotals[pid] || 0) + cost;
         const share = dayTotal ? (cost / dayTotal) * 100 : 0;
         const color = accountColorFor(pid, profileColors, orderedIds);
         return `<div class="stack-bar-seg" style="height:${share}%;background:${color}" data-tooltip="${esc(accountUsageTooltip(profileNames[pid] || pid, cost, d, pid))}"></div>`;
@@ -2874,13 +2902,14 @@ function renderAccountUsageChart(dailyTotals, profileColors, profileNames) {
                   stroke-dasharray="${len.toFixed(1)} ${circ.toFixed(1)}" style="--ring-full:${circ.toFixed(1)}"
                   transform="rotate(${rotate.toFixed(1)} 24 24)"><title>${esc(accountUsageTooltip(profileNames[pid] || pid, cost, d, pid))}</title></circle>`;
       }).join('') : '';
-      const dayTooltip = usageWeightTooltip(label, {
-        cost: dayTotal,
+      const dayTooltipData = {
         input_tokens: Object.values(d.profiles_input_tokens || {}).reduce((a, b) => a + (Number(b) || 0), 0),
         output_tokens: Object.values(d.profiles_output_tokens || {}).reduce((a, b) => a + (Number(b) || 0), 0),
         cache_read_input_tokens: Object.values(d.profiles_cache_read_input_tokens || {}).reduce((a, b) => a + (Number(b) || 0), 0),
         cache_creation_input_tokens: Object.values(d.profiles_cache_creation_input_tokens || {}).reduce((a, b) => a + (Number(b) || 0), 0),
-      });
+      };
+      dayTooltipData[usesCost ? 'cost' : 'tokens'] = dayTotal;
+      const dayTooltip = usageWeightTooltip(label, dayTooltipData);
       return `<div class="ring-item" ${dayTotal ? `data-tooltip="${esc(dayTooltip)}"` : ''}>
         <svg width="48" height="48" viewBox="0 0 48 48">
           <circle cx="24" cy="24" r="${r}" fill="none" stroke="var(--track)" stroke-width="5"/>
@@ -2900,8 +2929,10 @@ function renderAccountUsageChart(dailyTotals, profileColors, profileNames) {
   setLiveHtml(legendEl, legendIds.map((pid) => {
     const color = accountColorFor(pid, profileColors, orderedIds);
     const name = esc(profileNames[pid] || pid);
-    const valueText = mode === 'tokens'
-      ? formatUsageWeight(grandTotals[pid])
+    const valueText = unpricedProfiles.has(pid) && grandTotals[pid] === 0
+      ? t('panel.usage.unpriced_profile')
+      : mode === 'tokens'
+      ? formatUsageMetric(grandTotals[pid], usesCost)
       : `${Math.round((grandTotals[pid] / totalAll) * 100)}%`;
     return `<div class="stack-legend-row"><span class="stack-legend-dot" style="background:${color}"></span>${name} · <span class="mono-num">${valueText}</span></div>`;
   }).join(''));
@@ -2912,12 +2943,24 @@ const RANGE_CAPTION_KEYS = {
   '1w': 'panel.usage.range_caption_1w', '1m': 'panel.usage.range_caption_1m',
   '1y': 'panel.usage.range_caption_1y',
 };
+const LEGACY_RANGE_CAPTION_KEYS = {
+  '1h': 'panel.usage.range_caption_legacy_1h', '1d': 'panel.usage.range_caption_legacy_1d',
+  '1w': 'panel.usage.range_caption_legacy_1w', '1m': 'panel.usage.range_caption_legacy_1m',
+  '1y': 'panel.usage.range_caption_legacy_1y',
+};
+
+function usageSummaryHasCostFields(summary) {
+  return summary.cost !== undefined ||
+    (summary.daily_totals || []).some((bucket) => bucket.cost !== undefined) ||
+    (summary.daily_totals_by_profile || []).some((bucket) => bucket.profiles_cost !== undefined);
+}
 
 let _usageRange = localStorage.getItem('cu-usage-range') || '1w';
 
 async function loadUsageSummary() {
   try {
     const summary = await api(`/api/usage/summary?range=${encodeURIComponent(_usageRange)}`);
+    const usesCost = usageSummaryHasCostFields(summary);
     applyMiniChartStyle('tokens', currentMiniChartStyle('tokens'));
     applyMiniChartStyle('model', currentMiniChartStyle('model'));
     applyMiniChartStyle('account', currentMiniChartStyle('account'));
@@ -2929,7 +2972,16 @@ async function loadUsageSummary() {
     renderHeatmap(summary.hourly_histogram);
     renderCostRow(_lastProfiles.length ? _lastProfiles : (await api('/api/profiles')).profiles, summary.cost_by_profile);
     const caption = document.getElementById('tokensSubCaption');
-    if (caption) caption.textContent = t(RANGE_CAPTION_KEYS[summary.range] || RANGE_CAPTION_KEYS['1w']);
+    if (caption) {
+      const captions = usesCost ? RANGE_CAPTION_KEYS : LEGACY_RANGE_CAPTION_KEYS;
+      caption.textContent = t(captions[summary.range] || captions['1w']);
+    }
+    const accountCaption = document.getElementById('accountUsageSubCaption');
+    if (accountCaption) {
+      accountCaption.textContent = t(usesCost
+        ? 'panel.usage_by_account_sub'
+        : 'panel.usage_by_account_sub_legacy');
+    }
     setUnpricedUsageNote('usageUnpricedNote', summary.unpriced_requests);
   } catch (e) {
     // Overview stays usable even if usage data can't be loaded.

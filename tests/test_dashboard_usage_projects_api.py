@@ -149,9 +149,37 @@ def test_overview_usage_charts_read_list_price_cost_fields():
     assert "dailyTotals.reduce((sum, d) => sum + usageWeightForBucket(d), 0)" in tokens_chart
     assert "accountDayCosts(d)" in account_chart
     assert "day.profiles_cost" in app_js
-    assert "formatUsageWeight(grandTotals[pid])" in account_chart
+    assert "formatUsageMetric(grandTotals[pid], usesCost)" in account_chart
     assert "profiles_cache_read_input_tokens" in account_chart
     assert "profiles_cache_creation_input_tokens" in account_chart
+
+
+def test_overview_usage_weight_format_has_currency_unit():
+    app_js = (daemon._STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert "`${formatUsageWeight(n)} ${t('panel.usage.weight_unit')}`" in app_js
+
+
+def test_overview_usage_weight_shows_small_nonzero_values():
+    app_js = (daemon._STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert "if (value > 0 && value < 0.005) return '<0.01';" in app_js
+
+
+def test_overview_usage_charts_scale_to_window_maximum():
+    app_js = (daemon._STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    tokens_chart = app_js.split("function renderTokensChart(", 1)[1].split("\nlet _lastModelSplit", 1)[0]
+    account_chart = app_js.split("function renderAccountUsageChart(", 1)[1].split("\nconst RANGE_CAPTION_KEYS", 1)[0]
+    assert "Math.max(1," not in tokens_chart and "Math.max(1," not in account_chart
+
+
+def test_overview_usage_fallback_restores_legacy_caption_and_formatting():
+    app_js = (daemon._STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert "LEGACY_RANGE_CAPTION_KEYS" in app_js and "panel.usage_by_account_sub_legacy" in app_js
+
+
+def test_overview_usage_legend_keeps_unpriced_profiles():
+    app_js = (daemon._STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    account_chart = app_js.split("function renderAccountUsageChart(", 1)[1].split("\nconst RANGE_CAPTION_KEYS", 1)[0]
+    assert "const unpricedProfiles = new Set();" in account_chart and "panel.usage.unpriced_profile" in account_chart
 
 
 def test_usage_summary_per_account_totals_omit_ids_with_no_current_profile(running_server):
@@ -168,6 +196,15 @@ def test_usage_summary_per_account_totals_omit_ids_with_no_current_profile(runni
     today = body["daily_totals_by_profile"][-1]
     assert p.id in today["profiles"]
     assert "d952512e251b2596" not in today["profiles"]
+
+
+def test_usage_summary_account_unpriced_count_omits_filtered_profile(running_server):
+    visible = profile_repo.create_profile(name="Visible", kind="api", credential="tok-long-enough-key")
+    usage_history.record(visible.id, None, "unknown-visible-model", {"input_tokens": 100, "output_tokens": 50})
+    usage_history.record("d952512e251b2596", None, "unknown-deleted-model", {"input_tokens": 100, "output_tokens": 50})
+
+    status, body = _request(f"{running_server}/api/usage/summary")
+    assert body["daily_totals_by_profile"][-1]["unpriced_requests"] == 1
 
 
 def test_usage_summary_days_param_is_bounded(running_server):

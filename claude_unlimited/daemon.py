@@ -1240,8 +1240,35 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 chart_totals = usage_history.daily_totals(ranged_events, days=days)
             profiles_by_id = {p.id: p for p in profile_repo.list_profiles()}
             by_profile_days = _qs_int(qs, "days", 7, minimum=1, maximum=31)
+            by_profile_events = usage_history.aggregated_in_last_days(by_profile_days)
             by_profile_totals = usage_history.daily_totals_by_profile(
-                usage_history.aggregated_in_last_days(by_profile_days), days=by_profile_days)
+                by_profile_events, days=by_profile_days)
+            visible_profile_events = [
+                event for event in by_profile_events if event.profile_id in profiles_by_id
+            ]
+            visible_unpriced_totals = usage_history.daily_totals(
+                visible_profile_events, days=by_profile_days)
+            visible_unpriced_by_date = {
+                bucket["date"]: bucket["unpriced_requests"]
+                for bucket in visible_unpriced_totals
+            }
+            visible_unpriced_profiles_by_date = {}
+            for event in visible_profile_events:
+                if event.cost_usd is not None:
+                    continue
+                estimated = pricing.estimate_cost_usd(event.model, {
+                    "input_tokens": event.input_tokens,
+                    "output_tokens": event.output_tokens,
+                    "cache_creation_input_tokens": event.cache_creation_input_tokens,
+                    "cache_read_input_tokens": event.cache_read_input_tokens,
+                })
+                if estimated is not None:
+                    continue
+                day = datetime.fromisoformat(event.timestamp).astimezone().date().isoformat()
+                profile_counts = visible_unpriced_profiles_by_date.setdefault(day, {})
+                profile_counts[event.profile_id] = (
+                    profile_counts.get(event.profile_id, 0) + event.merged_requests
+                )
             # usage_history is append-only, so it still carries entries for
             # a deleted Profile's id. Drop anything that isn't a current
             # Profile so the chart never shows a bare internal id.
@@ -1249,6 +1276,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 for field, values in bucket.items():
                     if field.startswith("profiles_") or field == "profiles":
                         bucket[field] = {pid: value for pid, value in values.items() if pid in profiles_by_id}
+                bucket["unpriced_requests"] = visible_unpriced_by_date.get(bucket["date"], 0)
+                bucket["profiles_unpriced"] = visible_unpriced_profiles_by_date.get(bucket["date"], {})
             chart_cost = round(sum(bucket.get("cost", 0.0) for bucket in chart_totals), 6)
             unpriced_requests = sum(bucket.get("unpriced_requests", 0) for bucket in chart_totals)
             self._send_json(200, {
