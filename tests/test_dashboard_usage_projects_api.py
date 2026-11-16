@@ -132,8 +132,26 @@ def test_usage_summary_includes_per_account_daily_totals(running_server):
     assert len(body["daily_totals_by_profile"]) == 7
     today = body["daily_totals_by_profile"][-1]
     assert today["profiles"][p.id] == 200
+    assert today["profiles_cost"][p.id] == pytest.approx(0.0012)
+    assert body["daily_totals"][-1]["cost"] == pytest.approx(0.0012)
+    assert body["cost"] == pytest.approx(0.0012)
     assert body["profile_names"][p.id] == "X"
     assert isinstance(body["profile_colors"], dict)
+
+
+def test_overview_usage_charts_read_list_price_cost_fields():
+    app_js = (daemon._STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    tokens_chart = app_js.split("function renderTokensChart(", 1)[1].split("\nlet _lastModelSplit", 1)[0]
+    account_chart = app_js.split("function renderAccountUsageChart(", 1)[1].split("\nconst RANGE_CAPTION_KEYS", 1)[0]
+
+    assert "usageWeightForBucket(d)" in tokens_chart
+    assert "bucket.cost !== undefined" in app_js
+    assert "dailyTotals.reduce((sum, d) => sum + usageWeightForBucket(d), 0)" in tokens_chart
+    assert "accountDayCosts(d)" in account_chart
+    assert "day.profiles_cost" in app_js
+    assert "formatUsageWeight(grandTotals[pid])" in account_chart
+    assert "profiles_cache_read_input_tokens" in account_chart
+    assert "profiles_cache_creation_input_tokens" in account_chart
 
 
 def test_usage_summary_per_account_totals_omit_ids_with_no_current_profile(running_server):

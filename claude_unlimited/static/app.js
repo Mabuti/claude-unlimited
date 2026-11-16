@@ -2579,7 +2579,7 @@ async function loadProjectUsage() {
   }
 }
 
-// ---- usage summary charts (tokens/day, model split, busiest hours, cost) ----
+// ---- usage summary charts (list-price usage weight, model split, busiest hours, cost) ----
 
 // Ordered so any two adjacent entries sit in different hue families;
 // same-family neighbors are hard to tell apart as adjacent donut slices.
@@ -2590,6 +2590,35 @@ function formatTokenCount(n) {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
   if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
   return String(n);
+}
+
+function formatUsageWeight(n) {
+  const value = Number(n) || 0;
+  if (value >= 1_000_000) return (value / 1_000_000).toFixed(1) + 'M';
+  if (value >= 1000) return (value / 1000).toFixed(1) + 'K';
+  return value.toFixed(2);
+}
+
+function usageWeightForBucket(bucket) {
+  // The fallback keeps a newer Dashboard usable against an older daemon; the
+  // current summary always supplies `cost`.
+  return bucket.cost !== undefined ? Number(bucket.cost) || 0 : Number(bucket.tokens) || 0;
+}
+
+function usageWeightTooltip(label, bucket) {
+  return `${label}: ${formatUsageWeight(usageWeightForBucket(bucket))} ${t('panel.usage.weight_unit')} · ` +
+    `${t('stats.tokens_in')}: ${formatTokenCount(bucket.input_tokens || 0)} · ` +
+    `${t('stats.tokens_out')}: ${formatTokenCount(bucket.output_tokens || 0)} · ` +
+    `${t('stats.cache_read')}: ${formatTokenCount(bucket.cache_read_input_tokens || 0)} · ` +
+    `${t('stats.cache_write')}: ${formatTokenCount(bucket.cache_creation_input_tokens || 0)}`;
+}
+
+function setUnpricedUsageNote(elementId, count) {
+  const el = document.getElementById(elementId);
+  if (!el) return;
+  const amount = Number(count) || 0;
+  el.style.display = amount ? '' : 'none';
+  el.textContent = amount ? t('panel.usage.unpriced_note').replace('{count}', String(amount)) : '';
 }
 
 const CHART_BUCKET_LABEL_OPTS = {
@@ -2618,14 +2647,15 @@ function chartBucketLabel(dateStr, granularity, bucketHours) {
 }
 
 function renderTokensChart(dailyTotals, granularity, bucketHours) {
-  const max = Math.max(1, ...dailyTotals.map((d) => d.tokens));
+  const max = Math.max(1, ...dailyTotals.map((d) => usageWeightForBucket(d)));
   const barsRow = document.getElementById('tokensBarsRow');
   if (barsRow) {
     setLiveHtml(barsRow, dailyTotals.map((d) => {
-      const pct = Math.round((d.tokens / max) * 100);
+      const cost = usageWeightForBucket(d);
+      const pct = Math.round((cost / max) * 100);
       const label = chartBucketLabel(d.date, granularity, bucketHours);
       return `<div class="bars-col">
-        <div class="bars-col-track"><div class="bars-col-fill" data-tooltip="${esc(label)}: ${esc(formatTokenCount(d.tokens))}" style="height:${pct}%"></div></div>
+        <div class="bars-col-track"><div class="bars-col-fill" data-tooltip="${esc(usageWeightTooltip(label, d))}" style="height:${pct}%"></div></div>
         <div class="bars-col-label">${esc(label)}</div>
       </div>`;
     }).join(''));
@@ -2634,9 +2664,9 @@ function renderTokensChart(dailyTotals, granularity, bucketHours) {
   if (ringsRow) {
     const circ = 2 * Math.PI * 19;
     setLiveHtml(ringsRow, dailyTotals.map((d) => {
-      const frac = d.tokens / max;
+      const frac = usageWeightForBucket(d) / max;
       const label = chartBucketLabel(d.date, granularity, bucketHours);
-      return `<div class="ring-item" data-tooltip="${esc(label)}: ${esc(formatTokenCount(d.tokens))}">
+      return `<div class="ring-item" data-tooltip="${esc(usageWeightTooltip(label, d))}">
         <svg width="48" height="48" viewBox="0 0 48 48">
           <circle cx="24" cy="24" r="19" fill="none" stroke="var(--track)" stroke-width="5"/>
           <circle cx="24" cy="24" r="19" fill="none" stroke="var(--accent)" stroke-width="5" stroke-linecap="round"
@@ -2647,9 +2677,9 @@ function renderTokensChart(dailyTotals, granularity, bucketHours) {
       </div>`;
     }).join(''));
   }
-  const total = dailyTotals.reduce((sum, d) => sum + d.tokens, 0);
+  const total = dailyTotals.reduce((sum, d) => sum + usageWeightForBucket(d), 0);
   const totalChip = document.getElementById('tokensTotalChip');
-  if (totalChip) totalChip.textContent = formatTokenCount(total);
+  if (totalChip) totalChip.textContent = formatUsageWeight(total);
 }
 
 let _lastModelSplit = [];
@@ -2762,6 +2792,27 @@ function accountColorFor(profileId, profileColors, orderedIds) {
   return TAG_COLORS[(idx < 0 ? 0 : idx) % TAG_COLORS.length];
 }
 
+function accountProfileValue(day, field, profileId) {
+  return Number((day[field] || {})[profileId]) || 0;
+}
+
+function accountUsageTooltip(name, cost, day, profileId) {
+  const raw = {
+    cost,
+    input_tokens: accountProfileValue(day, 'profiles_input_tokens', profileId),
+    output_tokens: accountProfileValue(day, 'profiles_output_tokens', profileId),
+    cache_read_input_tokens: accountProfileValue(day, 'profiles_cache_read_input_tokens', profileId),
+    cache_creation_input_tokens: accountProfileValue(day, 'profiles_cache_creation_input_tokens', profileId),
+  };
+  return usageWeightTooltip(name, raw);
+}
+
+function accountDayCosts(day) {
+  // `profiles_cost` is new; the fallback lets this build display a response
+  // from an older daemon using its unchanged legacy `profiles` field.
+  return day.profiles_cost !== undefined ? (day.profiles_cost || {}) : (day.profiles || {});
+}
+
 let _lastAccountUsage = null; // { dailyTotals, profileColors, profileNames } — re-render target on toggle click
 
 function renderAccountUsageChart(dailyTotals, profileColors, profileNames) {
@@ -2773,21 +2824,25 @@ function renderAccountUsageChart(dailyTotals, profileColors, profileNames) {
 
   const mode = currentMetricMode('account');
   const orderedIds = Object.keys(profileNames).sort();
-  const max = Math.max(1, ...dailyTotals.map((d) => Object.values(d.profiles).reduce((a, b) => a + b, 0)));
+  const max = Math.max(1, ...dailyTotals.map((d) => Object.values(accountDayCosts(d))
+    .reduce((a, b) => a + (Number(b) || 0), 0)));
   const grandTotals = {};
+  setUnpricedUsageNote('accountUsageUnpricedNote', dailyTotals.reduce(
+    (sum, d) => sum + (Number(d.unpriced_requests) || 0), 0));
 
   setLiveHtml(barsRow, dailyTotals.map((d) => {
-    const dayTotal = Object.values(d.profiles).reduce((a, b) => a + b, 0);
+    const dayCosts = accountDayCosts(d);
+    const dayTotal = Object.values(dayCosts).reduce((a, b) => a + (Number(b) || 0), 0);
     const pct = Math.round((dayTotal / max) * 100);
-    const segs = Object.entries(d.profiles)
+    const segs = Object.entries(dayCosts)
+      .filter(([, cost]) => Number(cost) > 0)
       .sort(([a], [b]) => a.localeCompare(b))
-      .map(([pid, tokens]) => {
-        grandTotals[pid] = (grandTotals[pid] || 0) + tokens;
-        const share = dayTotal ? (tokens / dayTotal) * 100 : 0;
+      .map(([pid, rawCost]) => {
+        const cost = Number(rawCost) || 0;
+        grandTotals[pid] = (grandTotals[pid] || 0) + cost;
+        const share = dayTotal ? (cost / dayTotal) * 100 : 0;
         const color = accountColorFor(pid, profileColors, orderedIds);
-        const name = esc(profileNames[pid] || pid);
-        const valueText = mode === 'tokens' ? formatTokenCount(tokens) : `${Math.round(share)}%`;
-        return `<div class="stack-bar-seg" style="height:${share}%;background:${color}" data-tooltip="${name}: ${valueText}"></div>`;
+        return `<div class="stack-bar-seg" style="height:${share}%;background:${color}" data-tooltip="${esc(accountUsageTooltip(profileNames[pid] || pid, cost, d, pid))}"></div>`;
       }).join('');
     const label = new Date(d.date + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'short' });
     return `<div class="stack-bars-col">
@@ -2802,22 +2857,31 @@ function renderAccountUsageChart(dailyTotals, profileColors, profileNames) {
   if (ringsRow) {
     const r = 19, circ = 2 * Math.PI * r;
     setLiveHtml(ringsRow, dailyTotals.map((d) => {
-      const dayTotal = Object.values(d.profiles).reduce((a, b) => a + b, 0);
+      const dayCosts = accountDayCosts(d);
+      const dayTotal = Object.values(dayCosts).reduce((a, b) => a + (Number(b) || 0), 0);
       const label = new Date(d.date + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'short' });
       let cum = 0;
-      const arcs = dayTotal ? Object.entries(d.profiles).sort(([a], [b]) => a.localeCompare(b)).map(([pid, tokens]) => {
+      const arcs = dayTotal ? Object.entries(dayCosts)
+        .filter(([, cost]) => Number(cost) > 0)
+        .sort(([a], [b]) => a.localeCompare(b)).map(([pid, rawCost]) => {
+        const cost = Number(rawCost) || 0;
         const color = accountColorFor(pid, profileColors, orderedIds);
-        const name = esc(profileNames[pid] || pid);
-        const sharePct = (tokens / dayTotal) * 100;
+        const sharePct = (cost / dayTotal) * 100;
         const len = (sharePct / 100) * circ;
         const rotate = -90 + (cum / 100) * 360;
         cum += sharePct;
-        const valueText = mode === 'tokens' ? esc(formatTokenCount(tokens)) : `${Math.round(sharePct)}%`;
         return `<circle cx="24" cy="24" r="${r}" fill="none" stroke="${color}" stroke-width="5"
                   stroke-dasharray="${len.toFixed(1)} ${circ.toFixed(1)}" style="--ring-full:${circ.toFixed(1)}"
-                  transform="rotate(${rotate.toFixed(1)} 24 24)"><title>${name}: ${valueText}</title></circle>`;
+                  transform="rotate(${rotate.toFixed(1)} 24 24)"><title>${esc(accountUsageTooltip(profileNames[pid] || pid, cost, d, pid))}</title></circle>`;
       }).join('') : '';
-      return `<div class="ring-item" ${dayTotal ? `data-tooltip="${esc(label)}: ${esc(formatTokenCount(dayTotal))}"` : ''}>
+      const dayTooltip = usageWeightTooltip(label, {
+        cost: dayTotal,
+        input_tokens: Object.values(d.profiles_input_tokens || {}).reduce((a, b) => a + (Number(b) || 0), 0),
+        output_tokens: Object.values(d.profiles_output_tokens || {}).reduce((a, b) => a + (Number(b) || 0), 0),
+        cache_read_input_tokens: Object.values(d.profiles_cache_read_input_tokens || {}).reduce((a, b) => a + (Number(b) || 0), 0),
+        cache_creation_input_tokens: Object.values(d.profiles_cache_creation_input_tokens || {}).reduce((a, b) => a + (Number(b) || 0), 0),
+      });
+      return `<div class="ring-item" ${dayTotal ? `data-tooltip="${esc(dayTooltip)}"` : ''}>
         <svg width="48" height="48" viewBox="0 0 48 48">
           <circle cx="24" cy="24" r="${r}" fill="none" stroke="var(--track)" stroke-width="5"/>
           ${arcs}
@@ -2837,7 +2901,7 @@ function renderAccountUsageChart(dailyTotals, profileColors, profileNames) {
     const color = accountColorFor(pid, profileColors, orderedIds);
     const name = esc(profileNames[pid] || pid);
     const valueText = mode === 'tokens'
-      ? formatTokenCount(grandTotals[pid])
+      ? formatUsageWeight(grandTotals[pid])
       : `${Math.round((grandTotals[pid] / totalAll) * 100)}%`;
     return `<div class="stack-legend-row"><span class="stack-legend-dot" style="background:${color}"></span>${name} · <span class="mono-num">${valueText}</span></div>`;
   }).join(''));
@@ -2866,6 +2930,7 @@ async function loadUsageSummary() {
     renderCostRow(_lastProfiles.length ? _lastProfiles : (await api('/api/profiles')).profiles, summary.cost_by_profile);
     const caption = document.getElementById('tokensSubCaption');
     if (caption) caption.textContent = t(RANGE_CAPTION_KEYS[summary.range] || RANGE_CAPTION_KEYS['1w']);
+    setUnpricedUsageNote('usageUnpricedNote', summary.unpriced_requests);
   } catch (e) {
     // Overview stays usable even if usage data can't be loaded.
   }

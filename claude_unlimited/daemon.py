@@ -1246,13 +1246,22 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             # a deleted Profile's id. Drop anything that isn't a current
             # Profile so the chart never shows a bare internal id.
             for bucket in by_profile_totals:
-                bucket["profiles"] = {pid: tok for pid, tok in bucket["profiles"].items() if pid in profiles_by_id}
+                for field, values in bucket.items():
+                    if field.startswith("profiles_") or field == "profiles":
+                        bucket[field] = {pid: value for pid, value in values.items() if pid in profiles_by_id}
+            chart_cost = round(sum(bucket.get("cost", 0.0) for bucket in chart_totals), 6)
+            unpriced_requests = sum(bucket.get("unpriced_requests", 0) for bucket in chart_totals)
             self._send_json(200, {
                 "range": range_key,
                 "granularity": granularity,
                 "bucket_hours": bucket_hours if granularity == "hour" else None,
                 "daily_totals": chart_totals,
                 "daily_totals_by_profile": by_profile_totals,
+                # New cost fields sit beside the legacy token fields so an
+                # older Dashboard build can continue rendering its token
+                # charts while this build uses list-price usage weight.
+                "cost": chart_cost,
+                "unpriced_requests": unpriced_requests,
                 "profile_colors": {pid: p.tag_color for pid, p in profiles_by_id.items() if p.tag_color},
                 "profile_names": {pid: p.name for pid, p in profiles_by_id.items()},
                 "model_split": usage_history.model_split(ranged_events),

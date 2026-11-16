@@ -131,6 +131,44 @@ def test_daily_totals_by_profile_splits_the_same_day_bucket_per_profile():
     assert today["profiles"] == {"a": 150, "b": 30}
 
 
+def test_daily_totals_cost_split_ranks_cache_heavy_profile_without_changing_tokens():
+    now = datetime.now(timezone.utc)
+    events = [
+        _event_at(now, profile_id="uncached", input_tokens=49_000_000,
+                  output_tokens=0, cost_usd=83.0),
+        _event_at(now, profile_id="cached", input_tokens=0, output_tokens=0,
+                  cache_read_input_tokens=700_000_000, cost_usd=646.0),
+    ]
+
+    daily = usage_history.daily_totals(events, days=7)[-1]
+    by_profile = usage_history.daily_totals_by_profile(events, days=7)[-1]
+
+    assert daily["tokens"] == 49_000_000
+    assert daily["cost"] == pytest.approx(729.0)
+    assert by_profile["profiles"] == {"uncached": 49_000_000, "cached": 0}
+    assert by_profile["profiles_cost"] == {"uncached": 83.0, "cached": 646.0}
+    assert max(by_profile["profiles_cost"], key=by_profile["profiles_cost"].get) == "cached"
+    assert by_profile["profiles_cache_read_input_tokens"] == {"uncached": 0, "cached": 700_000_000}
+
+
+def test_daily_totals_null_cost_is_repriced_or_counted_unpriced():
+    now = datetime.now(timezone.utc)
+    events = [
+        _event_at(now, profile_id="known", model="claude-sonnet-5",
+                  input_tokens=1_000_000, output_tokens=0, cost_usd=None),
+        _event_at(now, profile_id="unknown", model="model-without-a-price",
+                  input_tokens=1_000_000, output_tokens=0, cost_usd=None),
+    ]
+
+    daily = usage_history.daily_totals(events, days=7)[-1]
+    by_profile = usage_history.daily_totals_by_profile(events, days=7)[-1]
+
+    assert daily["cost"] == pytest.approx(2.0)
+    assert daily["unpriced_requests"] == 1
+    assert by_profile["profiles_cost"]["known"] == pytest.approx(2.0)
+    assert by_profile["profiles_cost"]["unknown"] == 0.0
+
+
 def test_daily_totals_by_profile_omits_profiles_with_no_tokens_that_day():
     now = datetime.now(timezone.utc)
     totals = usage_history.daily_totals_by_profile([_event_at(now, profile_id="a", input_tokens=10, output_tokens=0)], days=7)

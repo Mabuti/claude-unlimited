@@ -436,36 +436,118 @@ def filter_events_since(events: list[UsageEvent], range_key: str) -> list[UsageE
     return [e for e in events if datetime.fromisoformat(e.timestamp) >= cutoff]
 
 
+def _new_usage_bucket() -> dict:
+    return {
+        "tokens": 0,
+        "cost": 0.0,
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "unpriced_requests": 0,
+    }
+
+
+def _event_list_price_cost(event: UsageEvent) -> tuple[float, int]:
+    """Return an event's list-price weight and unpriced request count.
+
+    Most rows carry the estimate calculated when the request was recorded.
+    Older rows can have a NULL cost, so retry the existing pricing helper from
+    their stored usage. If the model is still unknown, the chart gives it zero
+    weight and surfaces its request count separately rather than inventing a
+    price.
+    """
+    if event.cost_usd is not None:
+        return float(event.cost_usd), 0
+    estimated = pricing.estimate_cost_usd(event.model, {
+        "input_tokens": event.input_tokens,
+        "output_tokens": event.output_tokens,
+        "cache_creation_input_tokens": event.cache_creation_input_tokens,
+        "cache_read_input_tokens": event.cache_read_input_tokens,
+    })
+    if estimated is None:
+        return 0.0, event.merged_requests
+    return estimated, 0
+
+
+def _add_usage_event(bucket: dict, event: UsageEvent) -> None:
+    bucket["input_tokens"] += event.input_tokens
+    bucket["output_tokens"] += event.output_tokens
+    bucket["cache_creation_input_tokens"] += event.cache_creation_input_tokens
+    bucket["cache_read_input_tokens"] += event.cache_read_input_tokens
+    # Keep this legacy measure unchanged: it deliberately excludes cache
+    # reads and writes.
+    bucket["tokens"] += event.input_tokens + event.output_tokens
+    bucket["requests"] += event.merged_requests
+    cost, unpriced = _event_list_price_cost(event)
+    bucket["cost"] += cost
+    bucket["unpriced_requests"] += unpriced
+
+
+def _finish_usage_bucket(day, bucket: dict) -> dict:
+    return {
+        "date": day.isoformat(),
+        "tokens": bucket["tokens"],
+        "cost": round(bucket["cost"], 6),
+        "requests": bucket["requests"],
+        "input_tokens": bucket["input_tokens"],
+        "output_tokens": bucket["output_tokens"],
+        "cache_creation_input_tokens": bucket["cache_creation_input_tokens"],
+        "cache_read_input_tokens": bucket["cache_read_input_tokens"],
+        "unpriced_requests": bucket["unpriced_requests"],
+    }
+
+
 def daily_totals(events: list[UsageEvent], days: int = 7) -> list[dict]:
-    """Last `days` local calendar days including today, oldest first."""
+    """Last `days` local calendar days including today, oldest first.
+
+    `tokens` remains the original input-plus-output field for old clients;
+    `cost` is the list-price usage weight used by the Overview chart.
+    """
     today = datetime.now().astimezone().date()
-    buckets = {today - timedelta(days=i): 0 for i in range(days)}
-    calls = {day: 0 for day in buckets}
+    buckets = {today - timedelta(days=i): _new_usage_bucket() for i in range(days)}
     for e in events:
         day = _local(e.timestamp).date()
-        if day in buckets:
-            buckets[day] += e.input_tokens + e.output_tokens
-            calls[day] += e.merged_requests
+        bucket = buckets.get(day)
+        if bucket is not None:
+            _add_usage_event(bucket, e)
     ordered_days = sorted(buckets.keys())
-    return [{"date": d.isoformat(), "tokens": buckets[d], "requests": calls[d]}
-            for d in ordered_days]
+    return [_finish_usage_bucket(d, buckets[d]) for d in ordered_days]
 
 
 def daily_totals_by_profile(events: list[UsageEvent], days: int = 7) -> list[dict]:
     """Same rolling local-calendar-day window as daily_totals(), split by
-    profile_id per day instead of summed. `profiles` lists only ids that
-    posted tokens that day, so the frontend never renders a zero-height
-    segment for an unused Profile."""
+    profile_id per day instead of summed. `profiles` retains the old
+    input-plus-output values; `profiles_cost` is the list-price split used by
+    the Overview chart. Raw token fields remain available for tooltips."""
     today = datetime.now().astimezone().date()
-    buckets: dict[date, dict[str, int]] = {today - timedelta(days=i): {} for i in range(days)}
+    buckets: dict[date, dict[str, dict]] = {today - timedelta(days=i): {} for i in range(days)}
     for e in events:
         day = _local(e.timestamp).date()
         bucket = buckets.get(day)
         if bucket is None:
             continue
-        bucket[e.profile_id] = bucket.get(e.profile_id, 0) + e.input_tokens + e.output_tokens
+        profile_bucket = bucket.setdefault(e.profile_id, _new_usage_bucket())
+        _add_usage_event(profile_bucket, e)
     ordered_days = sorted(buckets.keys())
-    return [{"date": d.isoformat(), "profiles": buckets[d]} for d in ordered_days]
+    result = []
+    for day in ordered_days:
+        profile_buckets = buckets[day]
+        result.append({
+            "date": day.isoformat(),
+            "cost": round(sum(p["cost"] for p in profile_buckets.values()), 6),
+            "profiles": {pid: p["tokens"] for pid, p in profile_buckets.items()},
+            "profiles_cost": {pid: round(p["cost"], 6) for pid, p in profile_buckets.items()},
+            "profiles_input_tokens": {pid: p["input_tokens"] for pid, p in profile_buckets.items()},
+            "profiles_output_tokens": {pid: p["output_tokens"] for pid, p in profile_buckets.items()},
+            "profiles_cache_creation_input_tokens": {
+                pid: p["cache_creation_input_tokens"] for pid, p in profile_buckets.items()},
+            "profiles_cache_read_input_tokens": {
+                pid: p["cache_read_input_tokens"] for pid, p in profile_buckets.items()},
+            "unpriced_requests": sum(p["unpriced_requests"] for p in profile_buckets.values()),
+        })
+    return result
 
 
 def series_by_kind(events: list[UsageEvent], buckets: list[dict],
@@ -531,7 +613,7 @@ def hourly_totals(events: list[UsageEvent], hours: int = 24, bucket_hours: int =
     # a full window. Anchoring to the rounded hour would shrink the
     # guaranteed lookback and drop events right at the edge.
     oldest_lower_bound = now - timedelta(hours=bucket_hours * bucket_count)
-    buckets = {s: 0 for s in starts}
+    buckets = {s: _new_usage_bucket() for s in starts}
     for e in events:
         # Compared as the exact timestamp; truncating to the hour first
         # would lose events on the bucket edges.
@@ -540,10 +622,10 @@ def hourly_totals(events: list[UsageEvent], hours: int = 24, bucket_hours: int =
             upper = s + timedelta(hours=bucket_hours)
             lower = oldest_lower_bound if i == len(starts) - 1 else s
             if lower <= t < upper:
-                buckets[s] += e.input_tokens + e.output_tokens
+                _add_usage_event(buckets[s], e)
                 break
     ordered = sorted(buckets.keys())
-    return [{"date": d.isoformat(), "tokens": buckets[d]} for d in ordered]
+    return [_finish_usage_bucket(d, buckets[d]) for d in ordered]
 
 
 def weekly_totals(events: list[UsageEvent], weeks: int = 5) -> list[dict]:
@@ -553,15 +635,15 @@ def weekly_totals(events: list[UsageEvent], weeks: int = 5) -> list[dict]:
     bar chart. `date` is each bucket's first day."""
     today = datetime.now().astimezone().date()
     starts = [today - timedelta(days=7 * i + 6) for i in range(weeks)]
-    buckets = {s: 0 for s in starts}
+    buckets = {s: _new_usage_bucket() for s in starts}
     for e in events:
         day = _local(e.timestamp).date()
         for s in starts:
             if s <= day <= s + timedelta(days=6):
-                buckets[s] += e.input_tokens + e.output_tokens
+                _add_usage_event(buckets[s], e)
                 break
     ordered = sorted(buckets.keys())
-    return [{"date": d.isoformat(), "tokens": buckets[d]} for d in ordered]
+    return [_finish_usage_bucket(d, buckets[d]) for d in ordered]
 
 
 def _shift_month(d: date, months_back: int) -> date:
@@ -576,14 +658,14 @@ def monthly_totals(events: list[UsageEvent], months: int = 12) -> list[dict]:
     30-day window, since a year view reads as "Jan, Feb, Mar..."."""
     today = datetime.now().astimezone().date()
     starts = [_shift_month(today, i) for i in range(months)]
-    buckets = {s: 0 for s in starts}
+    buckets = {s: _new_usage_bucket() for s in starts}
     for e in events:
         day = _local(e.timestamp).date()
         month_start = date(day.year, day.month, 1)
         if month_start in buckets:
-            buckets[month_start] += e.input_tokens + e.output_tokens
+            _add_usage_event(buckets[month_start], e)
     ordered = sorted(buckets.keys())
-    return [{"date": d.isoformat(), "tokens": buckets[d]} for d in ordered]
+    return [_finish_usage_bucket(d, buckets[d]) for d in ordered]
 
 
 def eco_totals(events: list[UsageEvent]) -> dict:
