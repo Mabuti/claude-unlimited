@@ -51,7 +51,10 @@ from .router import (
     observe,
     record_credits,
     recover_expired_cooldowns,
+    release_time,
     routing_percent,
+    state_from_routing_usage,
+    uses_weekly_gate,
 )
 from .upstream import UpstreamResponse
 from .upstream import send as real_send
@@ -65,27 +68,40 @@ _MAX_TRUTHFUL_RETRY_AFTER_SECONDS = 1800
 _MAX_TRANSIENT_FAILOVERS_PER_REQUEST = 1
 
 
+def _profile_return_time(runtime: ProfileRuntime) -> Optional[datetime]:
+    """Known return deadline, including usage holds that outlast a cooldown."""
+    if runtime.state == ProfileState.COOLDOWN:
+        if runtime.cooldown_until is None:
+            return None
+        if uses_weekly_gate(runtime.kind, runtime.no_5h_window):
+            used = routing_percent(runtime)
+            if used is not None and used >= runtime.switch_threshold:
+                release = release_time(runtime)
+                return max(runtime.cooldown_until, release) if release is not None else None
+        return runtime.cooldown_until
+    if runtime.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING):
+        return release_time(runtime)
+    return None
+
+
 def _pool_retry_after_seconds(pool: PoolSnapshot, now: datetime) -> Optional[int]:
     """Best-effort Retry-After for a no_eligible_profile response: the
-    soonest deadline already sitting on the snapshot -- a COOLDOWN
-    Profile's cooldown_until, or a DRAINING/EXHAUSTED Profile's resets_at.
+    soonest return deadline already sitting on the snapshot, accounting
+    for both cooldowns and usage holds.
     Nothing here is a new signal; it is exactly what choose() and
     recover_expired_cooldowns() already track, read back so a client (or
     Claude Code's own retry loop) gets a concrete number instead of
     guessing when to come back. None when no Profile carries a known
     deadline (e.g. the pool is empty, or everything left is
     AUTH_INVALID/DISABLED) -- callers must not invent a value in that
-    case."""
+    case. A known cooldown is dropped (no Retry-After) when its Profile is
+    usage-held but the holding window's reset is unknown; the cooldown alone
+    is not a truthful return promise."""
     deadlines = []
     for p in pool.profiles:
-        if p.state == ProfileState.COOLDOWN and p.cooldown_until is not None:
-            deadlines.append(p.cooldown_until)
-        elif p.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING):
-            reset = p.resets_at
-            if reset is None and p.no_5h_window:
-                reset = p.resets_at_7d
-            if reset is not None:
-                deadlines.append(reset)
+        reset = _profile_return_time(p)
+        if reset is not None:
+            deadlines.append(reset)
     if not deadlines:
         return None
     soonest = min(deadlines)
@@ -99,6 +115,18 @@ def _pool_retry_after_seconds(pool: PoolSnapshot, now: datetime) -> Optional[int
     if seconds > _MAX_TRUTHFUL_RETRY_AFTER_SECONDS:
         return None
     return max(1, seconds)
+
+
+def _approaching_threshold_message(profile: Profile, runtime: ProfileRuntime, percent: float) -> str:
+    window_label = ""
+    if uses_weekly_gate(runtime.kind, runtime.no_5h_window):
+        primary, weekly = runtime.last_usage_percent, runtime.last_usage_percent_7d
+        # Name the window with the higher stored percent; ties choose 5-hour.
+        window = "weekly" if weekly is not None and (primary is None or weekly > primary) else "5-hour"
+        window_label = f"{window} window: "
+    return (f"{profile.name} is approaching its switch threshold "
+            f"({window_label}{percent:.0f}% / {runtime.switch_threshold:.0f}%).")
+
 
 # How long an idle branch keeps its account pin. A pin is only a routing
 # preference, so outliving Anthropic's prompt cache costs nothing; expiring too
@@ -928,7 +956,8 @@ def _client_wants_streaming(parsed: Optional[dict]) -> bool:
     return parsed.get("stream") is True
 
 
-def _restorable_state_fields(persisted: Optional[dict], now: datetime) -> dict:
+def _restorable_state_fields(persisted: Optional[dict], now: datetime, *,
+                             kind: str = "", no_5h_window: bool = False) -> dict:
     """State worth carrying across a restart, so the Dashboard looks the same
     the moment the daemon comes back rather than claiming every Profile is
     healthy until something proves otherwise.
@@ -939,9 +968,11 @@ def _restorable_state_fields(persisted: Optional[dict], now: datetime) -> dict:
         restarting, and it clears the moment the credential is actually
         replaced (see _sync_snapshot's credential_refreshed branch).
       * COOLDOWN persists only while its own deadline is still in the future.
+      * EXHAUSTED from a provider refusal persists only for an OAuth profile
+        with a 5-hour window, while its ``resets_at`` deadline is in the
+        future; other kinds re-derive it, including token-budget exhaustion.
       * Everything else is re-derived. ELIGIBLE/DRAINING follow from the usage
-        numbers that are restored alongside, EXHAUSTED from a token budget
-        that is recomputed anyway, and DISABLED from configuration.
+        numbers that are restored alongside, and DISABLED from configuration.
 
     Never raises: a malformed or missing entry means "nothing to restore",
     exactly like a first run."""
@@ -953,18 +984,29 @@ def _restorable_state_fields(persisted: Optional[dict], now: datetime) -> dict:
         if isinstance(value, str) and value:
             fields[label_key] = value
 
+    def _parse_deadline(raw: object) -> Optional[datetime]:
+        if not isinstance(raw, str):
+            return None
+        try:
+            deadline = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        return deadline if deadline.tzinfo is not None else deadline.replace(tzinfo=timezone.utc)
+
     state = persisted.get("state")
     if state == ProfileState.AUTH_INVALID.value:
         fields["state"] = ProfileState.AUTH_INVALID
     elif state == ProfileState.COOLDOWN.value:
-        raw = persisted.get("cooldown_until")
-        try:
-            deadline = datetime.fromisoformat(raw) if isinstance(raw, str) else None
-        except ValueError:
-            deadline = None
+        deadline = _parse_deadline(persisted.get("cooldown_until"))
         if deadline is not None and deadline > now:
             fields["state"] = ProfileState.COOLDOWN
             fields["cooldown_until"] = deadline
+    elif (state == ProfileState.EXHAUSTED.value
+          and uses_weekly_gate(kind, no_5h_window)):
+        deadline = _parse_deadline(persisted.get("resets_at"))
+        if deadline is not None and deadline > now:
+            fields["state"] = ProfileState.EXHAUSTED
+            fields["resets_at"] = deadline
     return fields
 
 
@@ -1197,18 +1239,29 @@ def _capacity_exhaustion(snapshot, pool) -> tuple[bool, Optional[datetime]]:
     runtimes = [rt for rt in snapshot.profiles if rt.profile_id in enabled]
     if not runtimes or not all(_out_of_capacity(rt) for rt in runtimes):
         return False, None
-    deadlines = [d for rt in runtimes
-                 for d in (rt.resets_at,
-                           rt.resets_at_7d if rt.no_5h_window else None,
-                           rt.cooldown_until)
-                 if d is not None]
+    deadlines = []
+    for rt in runtimes:
+        if uses_weekly_gate(rt.kind, rt.no_5h_window):
+            resets = (_profile_return_time(rt),)
+        else:
+            resets = (rt.resets_at,
+                      rt.resets_at_7d if rt.no_5h_window else None,
+                      rt.cooldown_until)
+        deadlines.extend(d for d in resets if d is not None)
     return True, min(deadlines) if deadlines else None
 
 
-def _exhaustion_message(resets_at: Optional[datetime]) -> str:
+def _exhaustion_message(resets_at: Optional[datetime], now: datetime) -> str:
     if resets_at is None:
         return MESSAGE_ALL_EXHAUSTED
-    return f"{MESSAGE_ALL_EXHAUSTED} The first one resets at {resets_at.astimezone():%H:%M}."
+    local_reset = resets_at.astimezone()
+    days_away = (local_reset.date() - now.astimezone().date()).days
+    reset_text = local_reset.strftime("%H:%M")
+    if days_away != 0:
+        reset_text += f" on {local_reset:%A}"
+        if abs(days_away) > 6:
+            reset_text += f", {local_reset:%Y-%m-%d}"
+    return f"{MESSAGE_ALL_EXHAUSTED} The first one resets at {reset_text}."
 
 
 @dataclass(frozen=True)
@@ -1242,12 +1295,14 @@ class Gateway:
     `self._last_active.pop(previous_profile_id, None)`.
 
     Rotation STATE is mostly re-derived across a restart: ELIGIBLE versus
-    DRAINING follows from valid usage restored alongside it, and EXHAUSTED is
-    re-established from the current token budget. AUTH_INVALID is preserved
-    because restarting cannot repair a rejected credential; COOLDOWN is
-    preserved only while its own deadline is still in the future. What IS
-    persisted (via runtime_state.py) is the last-observed usage numbers,
-    whether the account reported no 5h window, and which Profile was current.
+    DRAINING follows from valid usage restored alongside it. EXHAUSTED from a
+    provider refusal is preserved while its refusal deadline is still in the
+    future; token-budget exhaustion is re-established from the current token
+    budget. AUTH_INVALID is preserved because restarting cannot repair a
+    rejected credential; COOLDOWN is preserved only while its own deadline is
+    still in the future. What IS persisted (via runtime_state.py) is the
+    last-observed usage numbers, whether the account reported no 5h window,
+    and which Profile was current.
     Valid, unexpired usage numbers are restored so both the Dashboard and
     Rotation retain the last known window after every restart/update/service
     bounce. A number whose reset time has already passed by load time is
@@ -1512,9 +1567,13 @@ class Gateway:
                 # an AUTH_INVALID Profile) — otherwise a rate-limited account
                 # re-pokes the token endpoint the instant the daemon comes back.
                 self._restore_refresh_backoff(p.id, persisted, now_utc)
+                restored_usage = _restorable_usage_fields(persisted, now=now_utc)
                 restored = {
-                    **_restorable_usage_fields(persisted, now=now_utc),
-                    **_restorable_state_fields(persisted, now=now_utc),
+                    **restored_usage,
+                    **_restorable_state_fields(
+                        persisted, now=now_utc, kind=p.kind,
+                        no_5h_window=restored_usage.get("no_5h_window", False),
+                    ),
                 }
                 # Configuration always wins over a restored state: a Profile
                 # disabled while the daemon was down must come back disabled.
@@ -1524,7 +1583,7 @@ class Gateway:
                 restored_state = restored.pop("state", state)
                 restored_runtime = ProfileRuntime(
                     profile_id=p.id, priority=p.priority, switch_threshold=p.switch_threshold,
-                    automatic=p.automatic,
+                    automatic=p.automatic, kind=p.kind,
                     state=restored_state,
                     credential_seen=p.credential_updated_at,
                     may_spend_credits=_may_spend_credits(p, pool.settings),
@@ -1534,11 +1593,9 @@ class Gateway:
                     leave_on_fable_limit=_leave_on_fable_limit(p, pool.settings),
                     **restored,
                 )
-                restored_usage = routing_percent(restored_runtime)
-                if (restored_runtime.state == ProfileState.ELIGIBLE
-                        and restored_usage is not None
-                        and restored_usage >= p.switch_threshold):
-                    restored_runtime.state = ProfileState.DRAINING
+                if restored_runtime.state == ProfileState.ELIGIBLE:
+                    restored_runtime.state = state_from_routing_usage(
+                        restored_runtime, p.switch_threshold)
                 self._runtime[p.id] = restored_runtime
                 state = restored_runtime.state
                 # A Profile this Gateway has just seen for the first time may
@@ -1563,7 +1620,11 @@ class Gateway:
                 if not p.enabled:
                     new_state = ProfileState.DISABLED
                 elif rt.state == ProfileState.DISABLED and p.enabled:
-                    new_state = ProfileState.ELIGIBLE
+                    new_state = (
+                        state_from_routing_usage(rt, p.switch_threshold)
+                        if uses_weekly_gate(p.kind, rt.no_5h_window)
+                        else ProfileState.ELIGIBLE
+                    )
                 elif rt.state == ProfileState.AUTH_INVALID and credential_refreshed:
                     # A stuck AUTH_INVALID Profile is filtered out of choose()'s
                     # candidates and has no time-based recovery (unlike
@@ -1623,7 +1684,7 @@ class Gateway:
                     new_state = ProfileState.EXHAUSTED
                 self._runtime[p.id] = ProfileRuntime(
                     profile_id=p.id, priority=p.priority, switch_threshold=p.switch_threshold,
-                    automatic=p.automatic, state=new_state,
+                    automatic=p.automatic, state=new_state, kind=p.kind,
                     last_usage_percent=rt.last_usage_percent, cooldown_until=rt.cooldown_until,
                     resets_at=rt.resets_at,
                     no_5h_window=rt.no_5h_window,
@@ -1866,7 +1927,7 @@ class Gateway:
                         self._exhaustion_announced = True
                         if exhausted:
                             text = "All Profiles are out of capacity — requests rejected"
-                            note = _exhaustion_message(resets_at)
+                            note = _exhaustion_message(resets_at, now)
                         else:
                             text = "No eligible Profile available — requests rejected"
                             note = "No eligible Profile is available — requests are being rejected."
@@ -1917,7 +1978,7 @@ class Gateway:
                         error_headers["retry-after"] = str(retry_after_seconds)
                     return GatewayResult(status=429, headers=error_headers, body_chunks=None, profile_id=None,
                                           error=("all_profiles_exhausted" if exhausted else "no_eligible_profile"),
-                                          error_detail=_exhaustion_message(resets_at) if exhausted else None)
+                                          error_detail=_exhaustion_message(resets_at, now) if exhausted else None)
 
                 profile = pool.get(decision.profile_id)
                 attempted.add(profile.id)
@@ -2162,8 +2223,7 @@ class Gateway:
                         self._warned_approaching.add(profile.id)
                         notifications.notify_if_enabled(
                             "approaching_threshold", "Claude Unlimited",
-                            f"{profile.name} is approaching its switch threshold "
-                            f"({percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
+                            _approaching_threshold_message(profile, new_rt, percent), pool.settings)
                     elif not near_threshold:
                         self._warned_approaching.discard(profile.id)
 
@@ -2539,8 +2599,7 @@ class Gateway:
                     self._warned_approaching.add(profile.id)
                     notifications.notify_if_enabled(
                         "approaching_threshold", "Claude Unlimited",
-                        f"{profile.name} is approaching its switch threshold "
-                        f"({percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
+                        _approaching_threshold_message(profile, new_rt, percent), pool.settings)
                 elif not near_threshold:
                     self._warned_approaching.discard(profile.id)
 
@@ -2931,8 +2990,7 @@ class Gateway:
                         self._warned_approaching.add(profile.id)
                         notifications.notify_if_enabled(
                             "approaching_threshold", "Claude Unlimited",
-                            f"{profile.name} is approaching its switch threshold "
-                            f"({percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
+                            _approaching_threshold_message(profile, new_rt, percent), pool.settings)
                     elif not near_threshold:
                         self._warned_approaching.discard(profile.id)
 
@@ -4829,7 +4887,7 @@ class Gateway:
                 # unconditional recovery one.
                 rt = ProfileRuntime(profile_id=p.id, priority=p.priority,
                                     switch_threshold=p.switch_threshold, automatic=p.automatic,
-                                    state=ProfileState.ELIGIBLE)
+                                    state=ProfileState.ELIGIBLE, kind=p.kind)
             if rt.state == ProfileState.DISABLED or not p.enabled:
                 continue
             recovered = None

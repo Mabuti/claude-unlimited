@@ -35,7 +35,7 @@ class UsageSnapshot:
     percent: Optional[float]
     resets_at: Optional[datetime]
     confidence: str  # "measured" | "estimated"
-    percent_7d: Optional[float] = None  # the unified-7d sibling; drives Rotation only when `percent` is None
+    percent_7d: Optional[float] = None  # the unified-7d sibling; routing policy lives in router.routing_percent()
     resets_at_7d: Optional[datetime] = None
     # What the two window slots above represent. Anthropic may report only a
     # 7d window (for example, on Max), while a codex-kind Profile may report a
@@ -129,16 +129,20 @@ def classify(status_code: int, headers: dict[str, str], now: datetime) -> Observ
         # Profile can have 5h headroom while the weekly cap is what rejected
         # the request. Collapsing them would misclassify quota exhaustion as
         # a bare rate-limit, and the Router would cooldown-and-retry the same
-        # Profile instead of rotating away. Each window reports its own reset
-        # time.
+        # Profile instead of rotating away. Each rejected window reports its
+        # own reset time; when both reject, the later parsed reset is the
+        # deadline that must be honored. If only one reset parses, use it; if
+        # neither parses, preserve the existing None result.
         status_5h = headers.get("anthropic-ratelimit-unified-5h-status")
         status_7d = headers.get("anthropic-ratelimit-unified-7d-status")
+        rejected_resets = []
         if status_5h == "rejected":
-            resets_at = _parse_reset(headers.get("anthropic-ratelimit-unified-5h-reset"))
-            return QuotaExhausted(resets_at=resets_at)
+            rejected_resets.append(_parse_reset(headers.get("anthropic-ratelimit-unified-5h-reset")))
         if status_7d == "rejected":
-            resets_at = _parse_reset(headers.get("anthropic-ratelimit-unified-7d-reset"))
-            return QuotaExhausted(resets_at=resets_at)
+            rejected_resets.append(_parse_reset(headers.get("anthropic-ratelimit-unified-7d-reset")))
+        if rejected_resets:
+            parsed_resets = [reset for reset in rejected_resets if reset is not None]
+            return QuotaExhausted(resets_at=max(parsed_resets, default=None))
         retry_after = _parse_float(headers.get("retry-after"))
         if retry_after is None and status_5h is None and status_7d is None \
                 and headers.get("x-should-retry", "").strip().lower() == "true":

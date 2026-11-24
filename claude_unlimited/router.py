@@ -8,8 +8,14 @@ is what keeps them deterministically testable.
 Rotation rules:
   - Sticky: stay on the current Profile until its switch_threshold is crossed
     or it returns quota-exhausted.
-  - Never rotate on a bare short rate-limit; that Profile gets a cooldown,
-    not a state change away from ELIGIBLE.
+  - An OAuth account with a 5-hour window is held by the higher of its 5-hour
+    and 7-day usage figures, against the same switch_threshold. release_time()
+    uses the latest reset of the holding windows, also honoring the stored
+    refusal reset while EXHAUSTED; an unknown required reset means no known
+    release time.
+  - A bare short rate-limit sets a cooldown; cooldown recovery keeps a usage
+    hold only for OAuth accounts that have a 5-hour window. Kinds outside that
+    gate recover as ELIGIBLE without reading usage.
   - Tie-break among equally-eligible Profiles: lowest priority number wins;
     among equal priority, whichever has the freshest (or no) usage snapshot.
 """
@@ -61,13 +67,16 @@ class ProfileRuntime:
     automatic: bool
     state: ProfileState = ProfileState.ELIGIBLE
     last_usage_percent: Optional[float] = None
-    # True only when the provider explicitly reported no usable 5h window in
-    # the latest UsageSnapshot. A missing/stale 5h sample is not enough to let
-    # the 7d reading drive routing.
+    # True only when the provider reported a 7d figure without a 5h figure.
+    # A missing/stale stored 5h sample alone does not set this flag.
     no_5h_window: bool = False
     cooldown_until: Optional[datetime] = None
+    # After a provider refusal, this holds the refusal deadline, which may be
+    # the 7-day reset even though existing payloads publish it as 5-hour reset.
     resets_at: Optional[datetime] = None
-    last_usage_percent_7d: Optional[float] = None  # drives Rotation only when no_5h_window; otherwise display-only
+    # Drives rotation for OAuth accounts with a 5-hour window when it is higher
+    # than 5-hour usage; for other kinds, only a no-5h profile uses it.
+    last_usage_percent_7d: Optional[float] = None
     resets_at_7d: Optional[datetime] = None
     window_label: Optional[str] = None  # None means "assume 5h"; see observation.UsageSnapshot
     window_label_7d: Optional[str] = None  # None means "assume 7d" (Anthropic) or "no second window" (codex); the Dashboard tells them apart by whether last_usage_percent_7d is also None
@@ -105,6 +114,11 @@ class ProfileRuntime:
     # 0 by a successful UsageSnapshot, or by an observation that does carry a
     # retry_after_seconds.
     consecutive_unretryable_failures: int = 0
+    # Keep default for direct Router callers; values are "oauth", "codex", or
+    # "api", or "" for direct Router callers with no kind. Gateway always
+    # passes Profile.kind so the gated behavior cannot silently turn off for
+    # constructed runtimes.
+    kind: str = ""
 
 
 @dataclass
@@ -148,15 +162,25 @@ class RequestFit:
 def routing_percent(profile_or_runtime: ProfileRuntime) -> Optional[float]:
     """The usage percentage that drives routing for one runtime profile.
 
-    A normal Claude account routes on its 5-hour window. A Max account can
-    have no 5-hour window at all, in which case its 7-day reading is the only
-    honest routing signal. The 7-day value never overrides a readable 5-hour
-    value.
+    Only an OAuth-kind account with a 5h window is limited by either usage
+    window (the higher-of-both gate).
+    The same switch_threshold applies to both windows, so an account stays held
+    while its weekly figure remains at or above the threshold, including after
+    a refusal reset.
+    Other profiles retain their primary-window routing and no-5h fallback.
     """
     primary = profile_or_runtime.last_usage_percent
+    if uses_weekly_gate(profile_or_runtime.kind, profile_or_runtime.no_5h_window):
+        return max((value for value in (primary, profile_or_runtime.last_usage_percent_7d)
+                    if value is not None), default=None)
     if primary is not None:
         return primary
     return profile_or_runtime.last_usage_percent_7d if profile_or_runtime.no_5h_window else None
+
+
+def uses_weekly_gate(kind: str, no_5h_window: bool) -> bool:
+    """Whether an OAuth profile routes on the higher of its two windows."""
+    return kind == "oauth" and not no_5h_window
 
 
 def fits(p: ProfileRuntime, fit: Optional[RequestFit]) -> bool:
@@ -211,6 +235,16 @@ def must_leave(p: ProfileRuntime, now: datetime) -> bool:
     limit is spent. With the switch off, a spent Fable bucket changes nothing —
     the account routes exactly as it always has."""
     return bool(p.leave_on_fable_limit) and fable_spent(p, now)
+
+
+def _weekly_limit_blocks_drained_fallback(p: ProfileRuntime, now: datetime) -> bool:
+    # Use 100, the provider's own limit, rather than switch_threshold: only an
+    # account certain to be refused belongs out of last-resort fallback; one
+    # above the threshold but below 100 can still serve.
+    return (uses_weekly_gate(p.kind, p.no_5h_window)
+            and p.last_usage_percent_7d is not None
+            and p.last_usage_percent_7d >= 100
+            and (p.resets_at_7d is None or now < p.resets_at_7d))
 
 
 def choose(pool: PoolSnapshot, now: datetime, fit: Optional[RequestFit] = None,
@@ -282,12 +316,15 @@ def choose(pool: PoolSnapshot, now: datetime, fit: Optional[RequestFit] = None,
     # (rotated) apart from "we had nothing better" (drained_fallback).
     # EXHAUSTED/COOLDOWN/AUTH_INVALID/DISABLED stay unselectable: those mean
     # the account itself refused or can't be used, not "getting close to a
-    # soft threshold."
+    # soft threshold." The weekly-limit exception above is deliberate: a
+    # DRAINING account certain to be refused is omitted, while one above
+    # switch_threshold but below the provider's 100% limit can still serve.
     draining_candidates = [
         p
         for p in pool.profiles
         if p.state == ProfileState.DRAINING and (p.automatic or p.profile_id == pool.current_profile_id)
         and p.profile_id not in exclude and fits(p, fit)
+        and not _weekly_limit_blocks_drained_fallback(p, now)
     ]
     if draining_candidates:
         draining_candidates.sort(key=lambda p: (p.priority, _reset_sort_key(p)))
@@ -318,10 +355,10 @@ def choose_for_new_branch(pool: PoolSnapshot, now: datetime,
          it falls through to priority.
       2. priority band — decides the order WITHIN a round, so the user's
          preference still says who is used first, second, third.
-      3. least-utilized first (5h usage, or 7d when 5h is absent) — accounts are limited
-         by usage windows, not request count. A profile with no observation
-         yet sorts as 0.0, so a fresh account is preferred over a part-spent
-         one at the same priority.
+      3. least-utilized first, using routing_percent() for the profile's
+         window policy — accounts are limited by usage windows, not request
+         count. A profile with no observation yet sorts as 0.0, so a fresh
+         account is preferred over a part-spent one at the same priority.
       4. `_reset_sort_key` — the same last resort choose() uses.
 
     A depleted account can't be pulled in by this: candidates are ELIGIBLE
@@ -387,11 +424,16 @@ def _apply(p: ProfileRuntime, observation: Observation, now: datetime) -> Profil
             no_5h_window = True
         elif observation.percent is not None:
             no_5h_window = False
+        percent_7d, resets_at_7d = observation.percent_7d, observation.resets_at_7d
+        if (uses_weekly_gate(p.kind, p.no_5h_window)
+                and observation.percent is not None and percent_7d is None
+                and p.resets_at_7d is not None and now < p.resets_at_7d):
+            # A success can carry only 5h headers; keep the still-live week.
+            percent_7d, resets_at_7d = p.last_usage_percent_7d, p.resets_at_7d
         updated = _replace(p, last_usage_percent=observation.percent, resets_at=observation.resets_at,
                            no_5h_window=no_5h_window,
-                           last_usage_percent_7d=observation.percent_7d, resets_at_7d=observation.resets_at_7d)
-        used = routing_percent(updated)
-        state = ProfileState.DRAINING if used is not None and used >= p.switch_threshold else ProfileState.ELIGIBLE
+                           last_usage_percent_7d=percent_7d, resets_at_7d=resets_at_7d)
+        state = state_from_routing_usage(updated, p.switch_threshold)
         if state is ProfileState.DRAINING and _credits_can_serve(p):
             # Same reasoning as the QuotaExhausted branch: a credit-funded
             # account is not draining towards unavailability, so the switch
@@ -416,6 +458,9 @@ def _apply(p: ProfileRuntime, observation: Observation, now: datetime) -> Profil
             # reads to say the requests are being paid for.
             return _replace(p, state=ProfileState.ELIGIBLE, resets_at=observation.resets_at,
                              last_usage_percent=100.0)
+        # After a provider refusal, resets_at holds the refusal deadline, which
+        # may be the 7-day reset; existing payloads still publish this field as
+        # the 5-hour reset.
         return _replace(p, state=ProfileState.EXHAUSTED, resets_at=observation.resets_at)
 
     if isinstance(observation, ShortRateLimit):
@@ -472,6 +517,14 @@ def _credits_can_serve(p: ProfileRuntime) -> bool:
     return bool(p.may_spend_credits and p.credits_has)
 
 
+def state_from_routing_usage(p: ProfileRuntime, switch_threshold: float) -> ProfileState:
+    """Return the state implied by stored routing usage, without credits."""
+    used = routing_percent(p)
+    return (ProfileState.DRAINING
+            if used is not None and used >= switch_threshold
+            else ProfileState.ELIGIBLE)
+
+
 def spending_on_credits(p: ProfileRuntime) -> bool:
     """True when this Profile is being served from paid credits rather than
     its plan window — i.e. the window is at or past the point where it would
@@ -484,8 +537,10 @@ def spending_on_credits(p: ProfileRuntime) -> bool:
 
 
 def recover_expired_cooldowns(pool: PoolSnapshot, now: datetime) -> PoolSnapshot:
-    """Moves any COOLDOWN/EXHAUSTED profile whose deadline has passed back to
-    ELIGIBLE. Call this before choose() on each request boundary."""
+    """Expire samples and recover deadlines. Cooldown recovery keeps a usage
+    hold only for OAuth accounts that have a 5-hour window; other profiles
+    recover without that usage hold. Call this before choose() on each request
+    boundary."""
 
     new_profiles = []
     for p in pool.profiles:
@@ -501,34 +556,35 @@ def recover_expired_cooldowns(pool: PoolSnapshot, now: datetime) -> PoolSnapshot
 
         if p.state == ProfileState.COOLDOWN:
             if p.cooldown_until is not None and now >= p.cooldown_until:
-                new_profiles.append(_replace(refreshed, state=ProfileState.ELIGIBLE, cooldown_until=None))
+                state = (state_from_routing_usage(refreshed, p.switch_threshold)
+                         if uses_weekly_gate(p.kind, p.no_5h_window)
+                         else ProfileState.ELIGIBLE)
+                new_profiles.append(_replace(refreshed, state=state, cooldown_until=None))
             else:
                 new_profiles.append(refreshed)
             continue
 
         if p.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING):
-            # A 5h reset refills ordinary Team/Pro accounts. A 7d reset is the
-            # equivalent refill only for an account that reported no 5h
-            # window; for a normal account it is display data and must not
-            # change quota state.
             # A no-5h account may use its 7d reset as the refill deadline, but
             # an older 7d reset must not override a newer QuotaExhausted
             # refusal reset stored in resets_at.
             weekly_refill = (p.no_5h_window and secondary_expired
                              and (p.resets_at is None or primary_expired))
             refill_expired = primary_expired or weekly_refill
+            if uses_weekly_gate(p.kind, p.no_5h_window) and p.state == ProfileState.DRAINING:
+                refill_expired = refill_expired or secondary_expired
             if refill_expired:
-                used = routing_percent(refreshed)
-                state = (ProfileState.DRAINING
-                         if used is not None and used >= p.switch_threshold
-                         else ProfileState.ELIGIBLE)
+                # EXHAUSTED first waits for the stored refusal reset. Both
+                # states then follow routing_percent(), including any live
+                # weekly hold on an OAuth account with a 5h window.
+                state = state_from_routing_usage(refreshed, p.switch_threshold)
                 new_profiles.append(_replace(refreshed, state=state))
             else:
                 new_profiles.append(refreshed)
             continue
 
-        # Expired 7d data is independent display state. Clearing it here must
-        # not alter an account whose 5h window is still live.
+        # For the remaining states, expire each sample independently without
+        # changing state; routing_percent() defines which windows routing uses.
         new_profiles.append(refreshed)
     return PoolSnapshot(profiles=new_profiles, current_profile_id=pool.current_profile_id)
 
@@ -539,13 +595,36 @@ def _find(pool: PoolSnapshot, profile_id: Optional[str]) -> Optional[ProfileRunt
     return next((p for p in pool.profiles if p.profile_id == profile_id), None)
 
 
+def release_time(p: ProfileRuntime) -> Optional[datetime]:
+    """Return the latest reset of a stored usage window at or above threshold.
+
+    While EXHAUSTED, also honor the stored refusal reset; an unknown required
+    reset means there is no known release time.
+    For kinds outside the weekly gate, return resets_at, or the 7-day reset
+    when the profile has no 5-hour window.
+    """
+    if uses_weekly_gate(p.kind, p.no_5h_window):
+        if p.state == ProfileState.EXHAUSTED and p.resets_at is None:
+            return None
+        resets = [reset for used, reset in (
+            (p.last_usage_percent, p.resets_at),
+            (p.last_usage_percent_7d, p.resets_at_7d),
+        ) if used is not None and used >= p.switch_threshold]
+        if p.state == ProfileState.EXHAUSTED:
+            resets.append(p.resets_at)
+        if resets:
+            return None if any(reset is None for reset in resets) else max(resets)
+    reset = p.resets_at
+    if reset is None and p.no_5h_window:
+        reset = p.resets_at_7d
+    return reset
+
+
 def _reset_sort_key(p: ProfileRuntime) -> tuple:
     # Profiles with a known, sooner reset are preferred (spend the one that's
     # about to refill anyway); profiles with no reset info sort last within
     # their priority band, not first.
-    reset = p.resets_at
-    if reset is None and p.no_5h_window:
-        reset = p.resets_at_7d
+    reset = release_time(p)
     return (0, reset) if reset is not None else (1, None)
 
 

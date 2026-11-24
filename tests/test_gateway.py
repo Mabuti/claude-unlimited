@@ -111,7 +111,8 @@ def test_7d_only_usage_survives_gateway_restart(pool_env):
     assert runtime.state == gateway_module.ProfileState.DRAINING
 
 
-def test_legacy_7d_only_usage_without_flag_restores_as_eligible(pool_env):
+def test_legacy_7d_only_usage_without_flag_restores_as_draining(pool_env):
+    """An unexpired weekly hold survives restoration without a window flag."""
     save_pool(Pool(profiles=[
         Profile(id="a", name="team-profile", kind="oauth", priority=1,
                 automatic=True, enabled=True, switch_threshold=95.0),
@@ -132,10 +133,40 @@ def test_legacy_7d_only_usage_without_flag_restores_as_eligible(pool_env):
     assert restored.last_usage_percent is None
     assert restored.last_usage_percent_7d == 99.0
     assert restored.no_5h_window is False
+    assert restored.state == gateway_module.ProfileState.DRAINING
+
+
+@pytest.mark.parametrize("percent, reset, expected_percent", [
+    (94.0, "2100-01-01T00:00:00+00:00", 94.0),
+    (99.0, "2020-01-01T00:00:00+00:00", None),
+], ids=["below-threshold", "expired"])
+def test_legacy_7d_without_flag_restores_as_eligible_without_a_hold(
+        pool_env, percent, reset, expected_percent):
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="team-profile", kind="oauth", priority=1,
+                automatic=True, enabled=True, switch_threshold=95.0),
+    ]))
+    (pool_env / "runtime_state.json").write_text(json.dumps({
+        "current_profile_id": "a",
+        "profiles": {
+            "a": {
+                "last_usage_percent": None,
+                "last_usage_percent_7d": percent,
+                "resets_at_7d": reset,
+            },
+        },
+    }))
+
+    restored = Gateway(transport=lambda req: fake_response(200)).runtime_snapshot()["a"]
+
+    assert restored.last_usage_percent is None
+    assert restored.last_usage_percent_7d == expected_percent
+    assert restored.no_5h_window is False
     assert restored.state == gateway_module.ProfileState.ELIGIBLE
 
 
-def test_team_restart_drops_expired_5h_without_using_7d(pool_env):
+def test_team_restart_keeps_weekly_hold_after_expired_5h(pool_env):
+    """An expired 5h sample cannot release an unexpired weekly hold."""
     save_pool(Pool(profiles=[
         Profile(id="a", name="team-profile", kind="oauth", priority=1,
                 automatic=True, enabled=True, switch_threshold=95.0),
@@ -158,6 +189,38 @@ def test_team_restart_drops_expired_5h_without_using_7d(pool_env):
     assert restored.last_usage_percent is None
     assert restored.resets_at is None
     assert restored.last_usage_percent_7d == 99.0
+    assert restored.no_5h_window is False
+    assert restored.state == gateway_module.ProfileState.DRAINING
+
+
+@pytest.mark.parametrize("percent, reset, expected_percent", [
+    (94.0, "2100-01-01T00:00:00+00:00", 94.0),
+    (99.0, "2020-01-01T00:00:00+00:00", None),
+], ids=["below-threshold", "expired"])
+def test_team_restart_after_expired_5h_is_eligible_without_a_weekly_hold(
+        pool_env, percent, reset, expected_percent):
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="team-profile", kind="oauth", priority=1,
+                automatic=True, enabled=True, switch_threshold=95.0),
+    ]))
+    (pool_env / "runtime_state.json").write_text(json.dumps({
+        "current_profile_id": "a",
+        "profiles": {
+            "a": {
+                "last_usage_percent": 10.0,
+                "resets_at": "2020-01-01T00:00:00+00:00",
+                "last_usage_percent_7d": percent,
+                "resets_at_7d": reset,
+                "no_5h_window": False,
+            },
+        },
+    }))
+
+    restored = Gateway(transport=lambda req: fake_response(200)).runtime_snapshot()["a"]
+
+    assert restored.last_usage_percent is None
+    assert restored.resets_at is None
+    assert restored.last_usage_percent_7d == expected_percent
     assert restored.no_5h_window is False
     assert restored.state == gateway_module.ProfileState.ELIGIBLE
 

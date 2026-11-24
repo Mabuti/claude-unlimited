@@ -5,8 +5,10 @@ Valid, unexpired usage numbers are restored and may drive Rotation; quota
 state is mostly re-derived rather than persisted, with AUTH_INVALID and a
 future COOLDOWN restored when their persisted state is still valid.
 
-EXHAUSTED and DRAINING state are deliberately NOT persisted; ELIGIBLE versus
-DRAINING is re-derived from any valid usage number restored alongside them.
+EXHAUSTED and DRAINING state are generally re-derived; an unexpired provider
+refusal on a gated OAuth profile is restored by gateway. ELIGIBLE versus
+DRAINING is otherwise re-derived from any valid usage number restored
+alongside them.
 AUTH_INVALID is preserved because a restart cannot repair a rejected
 credential. COOLDOWN is preserved only while its cooldown_until deadline is
 still in the future. The last-observed usage numbers and the 5h-window

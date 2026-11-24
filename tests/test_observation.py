@@ -1,4 +1,6 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from claude_unlimited.observation import (
     AuthInvalid,
@@ -128,6 +130,43 @@ def test_429_5h_rejected_uses_5h_reset_not_7d():
     obs = classify(429, headers, NOW)
     assert isinstance(obs, QuotaExhausted)
     assert obs.resets_at == datetime.fromtimestamp(1787191800, tz=timezone.utc)
+
+
+@pytest.mark.parametrize("reset_5h, reset_7d, expected", [
+    (NOW + timedelta(hours=1), NOW + timedelta(days=6), NOW + timedelta(days=6)),
+    (NOW + timedelta(days=6), NOW + timedelta(hours=1), NOW + timedelta(days=6)),
+])
+def test_429_with_both_rejected_uses_the_later_reset(reset_5h, reset_7d, expected):
+    headers = {
+        "anthropic-ratelimit-unified-5h-status": "rejected",
+        "anthropic-ratelimit-unified-5h-reset": str(reset_5h.timestamp()),
+        "anthropic-ratelimit-unified-7d-status": "rejected",
+        "anthropic-ratelimit-unified-7d-reset": str(reset_7d.timestamp()),
+    }
+
+    obs = classify(429, headers, NOW)
+
+    assert isinstance(obs, QuotaExhausted)
+    assert obs.resets_at == expected
+
+
+@pytest.mark.parametrize("reset_5h, reset_7d, expected", [
+    ("not-a-reset", str((NOW + timedelta(days=6)).timestamp()), NOW + timedelta(days=6)),
+    (str((NOW + timedelta(hours=1)).timestamp()), "not-a-reset", NOW + timedelta(hours=1)),
+    ("not-a-reset", "also-not-a-reset", None),
+])
+def test_429_with_both_rejected_uses_any_reset_that_parses(reset_5h, reset_7d, expected):
+    headers = {
+        "anthropic-ratelimit-unified-5h-status": "rejected",
+        "anthropic-ratelimit-unified-5h-reset": reset_5h,
+        "anthropic-ratelimit-unified-7d-status": "rejected",
+        "anthropic-ratelimit-unified-7d-reset": reset_7d,
+    }
+
+    obs = classify(429, headers, NOW)
+
+    assert isinstance(obs, QuotaExhausted)
+    assert obs.resets_at == expected
 
 
 def test_529_is_provider_unavailable_not_quota_exhausted():
